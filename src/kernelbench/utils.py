@@ -246,6 +246,12 @@ SERVER_PRESETS = {
         "temperature": 0.7,
         "max_tokens": 4096,
     },
+    # Model id = "openrouter/" + slug from https://openrouter.ai/models (e.g. google/gemini-2.5-flash).
+    "openrouter": {
+        "model_name": "openrouter/google/gemini-2.5-flash",
+        "temperature": 0.7,
+        "max_tokens": 16384,
+    },
 }
 
 
