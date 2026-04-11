@@ -111,10 +111,15 @@ def query_server(
     # Local Server (SGLang, vLLM, Tokasaurus) - special handling
     if server_type == "local":
         url = f"http://{server_address}:{server_port}"
+        # vLLM / SGLang / Tokasaurus don't validate the API key value, but the
+        # OpenAI SDK >= 1.0 raises immediately if api_key=None and OPENAI_API_KEY
+        # is not set in the environment.  Fall back to a dummy token so local
+        # servers always receive the request.
+        api_key = SGLANG_KEY or os.environ.get("OPENAI_API_KEY") or "EMPTY"
         client = OpenAI(
-            api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0
+            api_key=api_key, base_url=f"{url}/v1", timeout=None, max_retries=0
         )
-        print(model_name)
+        print(f"[local server] querying {url} model={model_name}")
         if isinstance(prompt, str):
             response = client.completions.create(
                 model=(model_name if model_name and model_name != "default" else "default"),
@@ -161,6 +166,41 @@ def query_server(
         else:
             messages.extend(prompt)
     
+    max_retries = 8
+    base_delay = 15  # seconds; doubled on each retry
+    for attempt in range(max_retries):
+        try:
+            return _query_server_once(
+                model_name=model_name,
+                messages=messages,
+                max_tokens=max_tokens,
+                num_completions=num_completions,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                is_reasoning_model=is_reasoning_model,
+                reasoning_effort=reasoning_effort,
+                budget_tokens=budget_tokens,
+            )
+        except Exception as e:
+            is_rate_limit = "rate_limit" in str(e).lower() or "429" in str(e)
+            if is_rate_limit and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"[query_server] Rate limit hit (attempt {attempt+1}/{max_retries}). "
+                      f"Retrying in {delay}s...")
+                import time as _time; _time.sleep(delay)
+                continue
+            raise
+
+    # unreachable
+    raise RuntimeError("query_server: exceeded max retries")
+
+
+def _query_server_once(
+    model_name, messages, max_tokens, num_completions,
+    temperature, top_p, top_k, is_reasoning_model,
+    reasoning_effort, budget_tokens,
+):
     try:
         completion_kwargs = {
             "model": model_name,
@@ -182,10 +222,20 @@ def query_server(
         else:
             # Standard models support temperature and top_p
             completion_kwargs["temperature"] = temperature
-            completion_kwargs["top_p"] = top_p
-            
-            # top_k is not supported by OpenAI models
-            if "openai/" not in model_name.lower() and "gpt" not in model_name.lower():
+            # Anthropic does not allow top_p and temperature to be set simultaneously
+            is_anthropic = (
+                "anthropic" in model_name.lower()
+                or "claude" in model_name.lower()
+            )
+            if not is_anthropic:
+                completion_kwargs["top_p"] = top_p
+
+            # top_k is not supported by OpenAI or Anthropic models
+            if (
+                "openai/" not in model_name.lower()
+                and "gpt" not in model_name.lower()
+                and not is_anthropic
+            ):
                 completion_kwargs["top_k"] = top_k
         
         response = completion(**completion_kwargs)
