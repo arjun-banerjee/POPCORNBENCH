@@ -2,9 +2,11 @@
 Prompts for the KernelBench multi-turn agent.
 
 Three public builders:
-    build_system_prompt(max_turns, max_tool_calls, backend) -> str
+    build_system_prompt(max_turns, max_tool_calls, backend, tool_names) -> str
         The system prompt, passed as `instructions` to the Responses API.
-        Stable across turns within a run.
+        Stable across turns within a run.  When profiling / analysis tools
+        are present in *tool_names*, an optimization-workflow section is
+        appended that references only the tools actually available.
 
     build_problem_message(ref_arch_src, backend, precision) -> str
         The first user-role message: task statement, backend-specific output
@@ -73,18 +75,107 @@ and cause evaluation failure.
 """
 
 
+_PROFILING_TOOLS = {"profile_kernel", "disassemble_kernel", "ert_roofline"}
+
+
+def _build_optimization_workflow(tool_names: set[str]) -> str:
+    """Build an optimization-workflow prompt section that only mentions tools
+    the agent actually has access to."""
+    has_profile = "profile_kernel" in tool_names
+    has_disasm = "disassemble_kernel" in tool_names
+    has_ert = "ert_roofline" in tool_names
+    has_gpu_specs = "get_gpu_specs" in tool_names
+
+    # Step 1 — understand hardware
+    hw_parts: list[str] = []
+    if has_gpu_specs:
+        hw_parts.append("`get_gpu_specs`")
+    if has_ert:
+        hw_parts.append("`ert_roofline`")
+    if hw_parts:
+        hw_step = (
+            f"1. **Understand the hardware**: call {' and '.join(hw_parts)} "
+            "to know your bandwidth and compute ceilings.\n"
+        )
+    else:
+        hw_step = ""
+
+    # Step 3 — profile after correctness
+    profile_parts: list[str] = []
+    if has_profile:
+        profile_parts.append(
+            "`profile_kernel` (roofline analysis — shows whether you are "
+            "memory- or compute-bound, bandwidth/compute utilization)"
+        )
+    if has_disasm:
+        profile_parts.append(
+            "`disassemble_kernel` (SASS/PTX inspection — shows register "
+            "pressure, spills, instruction mix, tensor-core usage)"
+        )
+    if profile_parts:
+        tools_list = " and/or ".join(profile_parts)
+        profile_step = (
+            "3. **Profile before submitting**: once correct, call "
+            f"{tools_list} to identify the bottleneck.\n"
+        )
+        optimize_step = (
+            "4. **Optimize based on profiling data**: rewrite the kernel to "
+            "address the bottleneck — better tiling, shared-memory staging, "
+            "vectorized loads, operator fusion, etc. Then re-verify "
+            "correctness with `run_correctness`.\n"
+            "5. **Iterate steps 3–4** as budget allows. Each "
+            "profile → optimize cycle should target a specific bottleneck.\n"
+        )
+        submit_step = (
+            "6. **Submit only when you've exhausted your optimization ideas** "
+            "or are running low on turns/tool calls.\n"
+        )
+    else:
+        profile_step = ""
+        optimize_step = ""
+        submit_step = (
+            "3. **Submit** when you are confident the kernel is correct and "
+            "well-optimized.\n"
+        )
+
+    section = (
+        "\n## Optimization workflow\n\n"
+        "Correctness is step 1, not the finish line. Follow this loop:\n\n"
+        f"{hw_step}"
+        "2. **Write an initial kernel**, then `compile_kernel` → "
+        "`run_correctness`.\n"
+        f"{profile_step}"
+        f"{optimize_step}"
+        f"{submit_step}"
+        "\nDo NOT call `submit_kernel` the moment you have a correct kernel "
+        "— a correct but unoptimized kernel is a wasted submission."
+    )
+    return section
+
+
 def build_system_prompt(
     *,
     max_turns: int,
     max_tool_calls: int,
     backend: str,
+    tool_names: list[str] | None = None,
 ) -> str:
-    """Build the agent's system prompt (the API's `instructions` parameter)."""
-    return _SYSTEM_PROMPT_TEMPLATE.format(
+    """Build the agent's system prompt (the API's `instructions` parameter).
+
+    When *tool_names* includes any profiling/analysis tools, an optimization-
+    workflow section is appended that references only the tools actually
+    available.
+    """
+    prompt = _SYSTEM_PROMPT_TEMPLATE.format(
         backend_display=_backend_display(backend),
         max_turns=max_turns,
         max_tool_calls=max_tool_calls,
     )
+    if tool_names is not None:
+        names = set(tool_names)
+        if names & _PROFILING_TOOLS:
+            prompt += _build_optimization_workflow(names)
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +295,20 @@ def build_problem_message(
 def build_turn_warning_message(
     turns_remaining: int,
     tool_calls_remaining: int,
+    has_profiling_tools: bool = False,
 ) -> str:
     """Build the soft warning injected as a user message near the session cap."""
     turn_word = "turn" if turns_remaining == 1 else "turns"
     call_word = "tool call" if tool_calls_remaining == 1 else "tool calls"
-    return (
+    msg = (
         f"Session warning: {turns_remaining} {turn_word} and "
         f"{tool_calls_remaining} {call_word} remain. "
-        "Submit your best kernel soon."
     )
+    if has_profiling_tools:
+        msg += (
+            "If you haven't profiled yet, do so now and make one final "
+            "optimization pass before submitting."
+        )
+    else:
+        msg += "Submit your best kernel soon."
+    return msg
