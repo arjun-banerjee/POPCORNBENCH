@@ -730,6 +730,60 @@ def register_and_format_exception(
     return metadata
 
 
+def _compare_outputs(output, output_new, tolerance):
+    """
+    Compare model outputs that may be single tensors or tuples/lists of tensors.
+    Returns (match: bool, mismatch_details: dict).
+    """
+    if isinstance(output, (tuple, list)):
+        if not isinstance(output_new, (tuple, list)):
+            return False, {
+                "error": f"Output type mismatch: expected {type(output).__name__}, got {type(output_new).__name__}"
+            }
+        if len(output) != len(output_new):
+            return False, {
+                "error": f"Output count mismatch: expected {len(output)} elements, got {len(output_new)}"
+            }
+        all_match = True
+        details = {}
+        for i, (o, o_new) in enumerate(zip(output, output_new)):
+            match_i, details_i = _compare_outputs(o, o_new, tolerance)
+            if not match_i:
+                all_match = False
+                details[f"element_{i}"] = details_i
+        return all_match, details
+
+    if isinstance(output, torch.Tensor):
+        if not isinstance(output_new, torch.Tensor):
+            return False, {
+                "error": f"Type mismatch: expected Tensor, got {type(output_new).__name__}"
+            }
+        if output.shape != output_new.shape:
+            return False, {
+                "shape_mismatch": f"Expected {output.shape}, got {output_new.shape}"
+            }
+        if output.dtype == torch.bool or output_new.dtype == torch.bool:
+            if torch.equal(output, output_new):
+                return True, {}
+            diff_count = (output != output_new).sum().item()
+            return False, {"bool_mismatch_count": diff_count}
+        out_f = output.float()
+        out_new_f = output_new.float()
+        if torch.allclose(out_f, out_new_f, atol=tolerance, rtol=tolerance):
+            return True, {}
+        max_diff = torch.max(torch.abs(out_f - out_new_f)).item()
+        avg_diff = torch.mean(torch.abs(out_f - out_new_f)).item()
+        return False, {
+            "max_difference": f"{max_diff:.6f}",
+            "avg_difference": f"{avg_diff:.6f}",
+        }
+
+    # Scalar or other non-tensor type
+    if output == output_new:
+        return True, {}
+    return False, {"value_mismatch": f"Expected {output}, got {output_new}"}
+
+
 def run_and_check_correctness(
     original_model_instance: nn.Module,
     new_model_instance: nn.Module,
@@ -780,47 +834,56 @@ def run_and_check_correctness(
      
             model_new = new_model_instance.to(device=device, dtype=precision)
 
+            # Re-seed so both forwards see the same RNG stream
+            # (critical for stochastic kernels like MCMC, sampling, etc.)
+            forward_seed = (trial_seed + 1) % (2**32)
+            set_seed(forward_seed)
             output = model(*inputs)
             torch.cuda.synchronize(device=device)
-            # ensure all GPU operations are completed before checking results
 
             try:
+                set_seed(forward_seed)
                 output_new = model_new(*inputs)
                 torch.cuda.synchronize(device=device)
-                if output.shape != output_new.shape:
-                    metadata = register_and_format_exception(
-                        "correctness_issue",
-                        f"Output shape mismatch: Expected {output.shape}, got {output_new.shape}",
-                        metadata,
-                    )
-                    metadata["correctness_issue_name"] = "correctness_issue"
-                    if verbose:
-                        print(
-                            f"[FAIL] trial {trial}: Output shape mismatch: Expected {output.shape}, got {output_new.shape}"
-                        )
-                    return KernelExecResult(
-                        compiled=True, correctness=False, metadata=metadata
-                    )
 
-                # in torchbench, they use both precisions for atol and rtol
-                # kernelbench v0 and v0.1 uses fp32, atol = rtol = 1e-02
-                # now we will return the tolerance from get_tolerance_for_precision
                 tolerance = get_tolerance_for_precision(precision)
-                # check output value difference
-                if not torch.allclose(
-                    output, output_new, atol=tolerance, rtol=tolerance
-                ):  # fail
-                    max_diff = torch.max(torch.abs(output - output_new)).item()
-                    avg_diff = torch.mean(torch.abs(output - output_new)).item()
-                    metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
-                    metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
-                    metadata["correctness_issue"] = "Output mismatch"
-                    if verbose:
-                        print(f"[FAIL] trial {trial}: Output mismatch")
-                else:  # pass
+                match, mismatch_details = _compare_outputs(
+                    output, output_new, tolerance
+                )
+
+                if match:
                     pass_count += 1
                     if verbose:
                         print(f"[PASS] trial {trial}: New Model matches Model")
+                else:
+                    if "shape_mismatch" in str(mismatch_details):
+                        metadata = register_and_format_exception(
+                            "correctness_issue",
+                            f"Output shape mismatch: {mismatch_details}",
+                            metadata,
+                        )
+                        metadata["correctness_issue_name"] = "correctness_issue"
+                        if verbose:
+                            print(
+                                f"[FAIL] trial {trial}: Output shape mismatch: {mismatch_details}"
+                            )
+                        return KernelExecResult(
+                            compiled=True, correctness=False, metadata=metadata
+                        )
+
+                    for key, val in mismatch_details.items():
+                        if isinstance(val, dict):
+                            for sub_key, sub_val in val.items():
+                                metadata.setdefault(sub_key, []).append(
+                                    str(sub_val)
+                                )
+                        else:
+                            metadata.setdefault(key, []).append(str(val))
+                    metadata["correctness_issue"] = "Output mismatch"
+                    if verbose:
+                        print(
+                            f"[FAIL] trial {trial}: Output mismatch: {mismatch_details}"
+                        )
 
             except Exception as e:
                 print("[Error] Exception happens during correctness check")
