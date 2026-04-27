@@ -292,6 +292,109 @@ def check_tilelang_impl(code: str) -> Tuple[bool, str]:
     return (False, "")
 
 
+# <========= NKI (Neuron Kernel Interface) CHECKS =========>
+# AWS Trainium/Inferentia kernel language using neuronxcc.nki
+NKI_JIT_PATTERN = r"@nki\.jit"
+NKI_OPS_PATTERN = r"\bnl\.\w+"
+
+def check_nki_impl(code: str) -> Tuple[bool, str]:
+    """
+    Check for valid NKI kernel implementation.
+
+    Requirements:
+    - Must have @nki.jit decorator
+    - Must have nl.* operations (nl.load, nl.store, nl.add, etc.)
+    """
+    code = _strip_comments(code)
+    if not re.search(NKI_JIT_PATTERN, code):
+        return (True, "Missing @nki.jit decorator")
+    if not re.search(NKI_OPS_PATTERN, code):
+        return (True, "No nl.* operations found in NKI kernel")
+    return (False, "")
+
+
+# <========= HELION CHECKS =========>
+# Helion is a Python-native GPU kernel language built on Triton
+HELION_KERNEL_PATTERN = r"@helion\.kernel"
+HELION_LANG_PATTERN = r"\bhl\.\w+"
+
+def check_helion_impl(code: str) -> Tuple[bool, str]:
+    """
+    Check for valid Helion kernel implementation.
+
+    Requirements:
+    - Must have @helion.kernel decorator
+    - Must have hl.* operations (hl.tile, etc.)
+    """
+    code = _strip_comments(code)
+    if not re.search(HELION_KERNEL_PATTERN, code):
+        return (True, "Missing @helion.kernel decorator")
+    if not re.search(HELION_LANG_PATTERN, code):
+        return (True, "No hl.* operations found in Helion kernel")
+    return (False, "")
+
+
+# <========= MOJO CHECKS =========>
+# Mojo GPU kernels use fn declarations with GPU layout types
+MOJO_FN_PATTERN = r"\bfn\s+\w+.*LayoutTensor|from\s+gpu\s+import"
+MOJO_GPU_PATTERN = r"thread_idx|block_idx|block_dim"
+
+def check_mojo_impl(code: str) -> Tuple[bool, str]:
+    """
+    Check for valid Mojo GPU kernel implementation.
+
+    Requirements:
+    - Must contain Mojo fn declarations or GPU imports
+    - Must reference GPU threading primitives (thread_idx, block_idx, etc.)
+    """
+    code = _strip_comments(code)
+    if not re.search(MOJO_FN_PATTERN, code):
+        return (True, "Missing Mojo fn declaration or GPU imports")
+    return (False, "")
+
+
+# <========= PALLAS (JAX) CHECKS =========>
+# JAX Pallas kernels use pallas_call and pl.BlockSpec
+PALLAS_CALL_PATTERN = r"pl\.pallas_call|pallas\.pallas_call"
+PALLAS_SPEC_PATTERN = r"pl\.BlockSpec|pallas\.BlockSpec"
+
+def check_pallas_impl(code: str) -> Tuple[bool, str]:
+    """
+    Check for valid JAX Pallas kernel implementation.
+
+    Requirements:
+    - Must have pl.pallas_call invocation
+    - Must have pl.BlockSpec for memory tiling
+    """
+    code = _strip_comments(code)
+    if not re.search(PALLAS_CALL_PATTERN, code):
+        return (True, "Missing pl.pallas_call invocation")
+    if not re.search(PALLAS_SPEC_PATTERN, code):
+        return (True, "Missing pl.BlockSpec for memory tiling")
+    return (False, "")
+
+
+# <========= NUMBA CUDA CHECKS =========>
+# Numba CUDA kernels use @cuda.jit decorator and cuda.grid
+NUMBA_JIT_PATTERN = r"@cuda\.jit"
+NUMBA_GRID_PATTERN = r"cuda\.grid\s*\("
+
+def check_numba_impl(code: str) -> Tuple[bool, str]:
+    """
+    Check for valid Numba CUDA kernel implementation.
+
+    Requirements:
+    - Must have @cuda.jit decorator
+    - Must have cuda.grid() for thread indexing
+    """
+    code = _strip_comments(code)
+    if not re.search(NUMBA_JIT_PATTERN, code):
+        return (True, "Missing @cuda.jit decorator")
+    if not re.search(NUMBA_GRID_PATTERN, code):
+        return (True, "Missing cuda.grid() for thread indexing")
+    return (False, "")
+
+
 # =============================================================================
 # TIMING MANIPULATION CHECKS - Reward Hacking Patterns
 # From adversarial hack PR and DeepReinforce blog
@@ -583,6 +686,11 @@ CHECK_FUNCTIONS: Dict[str, Union[Callable[[str], Tuple[bool, str]], Callable[[st
     "tk_impl": check_tk_impl,
     "cute_impl": check_cute_impl,
     "tilelang_impl": check_tilelang_impl,
+    "nki_impl": check_nki_impl,
+    "helion_impl": check_helion_impl,
+    "mojo_impl": check_mojo_impl,
+    "pallas_impl": check_pallas_impl,
+    "numba_impl": check_numba_impl,
 }
 
 # Checks that require additional parameters beyond just code
@@ -608,6 +716,11 @@ BACKEND_IMPL_CHECK = {
     "cute": "cute_impl",
     "cutlass": "cute_impl",  # alias
     "tilelang": "tilelang_impl",
+    "nki": "nki_impl",
+    "helion": "helion_impl",
+    "mojo": "mojo_impl",
+    "pallas": "pallas_impl",
+    "numba": "numba_impl",
 }
 
 # These are optional checks (by user's decision) - flagged as warnings
