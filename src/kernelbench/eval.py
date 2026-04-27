@@ -436,9 +436,13 @@ def eval_kernel_against_ref(
     # HIP is AMD-only
     if backend_lower == "hip" and vendor != "amd":
         raise ValueError(f"HIP backend requires AMD GPU, got {vendor}")
-    # cuda/cute/thunderkittens are NVIDIA-only (triton/tilelang work on both)
+    # cuda/cute/thunderkittens are NVIDIA-only (triton/tilelang/helion/numba work on both or NVIDIA)
     if backend_lower in ["cuda", "cute", "thunderkittens"] and vendor == "amd":
         raise ValueError(f"{backend} backend requires NVIDIA GPU, got AMD")
+    # NKI targets AWS Trainium/Inferentia — cannot run on standard CUDA/AMD GPUs
+    if backend_lower == "nki":
+        import warnings
+        warnings.warn("NKI backend targets AWS Trainium/Inferentia. Compilation check only on non-Neuron hardware.")
     
     if backend_lower == "tilelang":
         assert precision == torch.float16 or precision == torch.bfloat16, "TileLang only supports fp16 or bfloat16"
@@ -455,7 +459,8 @@ def eval_kernel_against_ref(
     
     # Backends that use tempfile approach and need CUDA_VISIBLE_DEVICES
     # TileLang, Triton, and CuTe all use tempfile for proper module loading
-    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute"]
+    # Helion, NKI, Pallas, Numba, and Mojo also need tempfile for JIT decorators / imports
+    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute", "helion", "nki", "pallas", "numba", "mojo"]
     
     metadata = {}  # for storing result metadata
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
@@ -511,9 +516,10 @@ def eval_kernel_against_ref(
         # add hash for later to distinguish between multi-turn kernels
         
         backend_lower = backend.lower()
-        if backend_lower in ["triton", "tilelang", "cute"]:
-            # Use tempfile approach for triton, tilelang, and cute
-            # These DSLs require proper module import for JIT decorators to work
+        tempfile_backends = ["triton", "tilelang", "cute", "helion", "nki", "pallas", "numba", "mojo"]
+        if backend_lower in tempfile_backends:
+            # Use tempfile approach for DSLs that require proper module import
+            # for JIT decorators / special imports to work
             ModelNew, tempfile = load_custom_model_with_tempfile(
                 custom_model_src, entry_point="ModelNew"
             )
