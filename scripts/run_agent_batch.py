@@ -234,16 +234,11 @@ def run_agent_worker(
         if config.save_trajectory:
             trajectory.save(traj_path)
 
-        # Also save the final submitted kernel as a .py file for compatibility
-        # with eval_from_generations.py (in case someone wants to re-evaluate)
-        submitted_kernel = _extract_final_kernel(trajectory)
-        if submitted_kernel:
-            kernel_path = os.path.join(
-                run_dir,
-                f"level_{config.level}_problem_{work.problem_id}_sample_0_kernel.py",
-            )
-            with open(kernel_path, "w") as f:
-                f.write(submitted_kernel)
+        kernel_path = os.path.join(
+            run_dir,
+            f"level_{config.level}_problem_{work.problem_id}_kernel.py",
+        )
+        trajectory.save_kernel(kernel_path)
 
         return _summary_from_dict(trajectory.to_dict(), config.level)
 
@@ -252,14 +247,6 @@ def run_agent_worker(
         print(f"[Worker] ERROR on problem {work.problem_id}: {e}")
         traceback.print_exc()
         return None
-
-
-def _extract_final_kernel(trajectory) -> Optional[str]:
-    """Pull the last submitted kernel code from the trajectory."""
-    for turn in reversed(trajectory.turns):
-        if turn.submitted_kernel:
-            return turn.submitted_kernel
-    return None
 
 
 def _summary_from_dict(d: dict, level: int) -> dict:

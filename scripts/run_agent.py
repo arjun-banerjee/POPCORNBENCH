@@ -216,15 +216,25 @@ def main(config: AgentConfig):
             print(f"  Kernel runtime:    {r.runtime:.2f} μs")
     print("=" * 60)
 
-    # ---- Save trajectory ----
+    # ---- Save trajectory + kernel source ----
     if config.save_trajectory:
+        run_dir = os.path.join(config.runs_dir, config.run_name)
         traj_path = os.path.join(
-            config.runs_dir,
-            config.run_name,
+            run_dir,
             f"level_{config.level}_problem_{config.problem_id}_trajectory.json",
         )
         trajectory.save(traj_path)
         print(f"[run_agent] Trajectory saved to: {traj_path}")
+
+        kernel_path = os.path.join(
+            run_dir,
+            f"level_{config.level}_problem_{config.problem_id}_kernel.py",
+        )
+        saved = trajectory.save_kernel(kernel_path)
+        if saved:
+            print(f"[run_agent] Kernel source saved to: {kernel_path}")
+        else:
+            print("[run_agent] No kernel was submitted; .py file not written.")
 
 
 if __name__ == "__main__":

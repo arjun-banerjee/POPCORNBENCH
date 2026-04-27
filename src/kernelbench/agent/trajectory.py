@@ -208,6 +208,28 @@ class KernelTrajectory:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
+    def get_submitted_kernel(self) -> str | None:
+        """Return the final submitted kernel source, or None."""
+        for turn in reversed(self.turns):
+            if turn.submitted_kernel:
+                return turn.submitted_kernel
+        return None
+
+    def save_kernel(self, path: str) -> str | None:
+        """Extract the final submitted kernel and write it to *path*.
+
+        Returns the path written, or None if no kernel was submitted.
+        """
+        import os
+
+        kernel_src = self.get_submitted_kernel()
+        if kernel_src is None:
+            return None
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(kernel_src)
+        return path
+
     @classmethod
     def load(cls, path: str) -> dict[str, Any]:
         """Load a previously saved trajectory as a raw dict for inspection."""
