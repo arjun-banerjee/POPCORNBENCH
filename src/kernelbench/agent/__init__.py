@@ -6,6 +6,7 @@ Public API:
     from kernelbench.agent.trajectory import KernelTrajectory, KernelTurn, ToolCall
     from kernelbench.agent.tools import TOOL_REGISTRY, ALL_TOOLS
     from kernelbench.agent.nsight_parser import parse_nsight_metrics, ProfileSummary
+    from kernelbench.agent.sass_parser import parse_disassembly, DisassemblySummary
 """
 
 from .agent import KernelAgent

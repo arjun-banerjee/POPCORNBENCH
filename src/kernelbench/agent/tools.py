@@ -597,8 +597,144 @@ class SubmitKernelTool(Tool):
 
 
 # ---------------------------------------------------------------------------
+# 7. DisassembleKernelTool
+# ---------------------------------------------------------------------------
+
+
+class DisassembleKernelTool(Tool):
+    """
+    Disassemble compiled CUDA binary to inspect SASS, PTX, register usage,
+    and instruction mix via cuobjdump and nvdisasm.
+    """
+
+    name = "disassemble_kernel"
+    description = (
+        "Disassemble the compiled CUDA kernel to inspect its native GPU "
+        "assembly (SASS), PTX intermediate representation, and per-kernel "
+        "resource usage (registers, shared memory, spills). Use this when "
+        "you have a correct kernel and want to understand the compiler's "
+        "code generation — register pressure, instruction mix (memory vs "
+        "compute vs control), tensor-core usage, and register spills. "
+        "Requires cuobjdump and nvdisasm (shipped with CUDA Toolkit)."
+    )
+    input_schema = _KERNEL_CODE_SCHEMA
+
+    def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        from kernelbench.sass import (
+            check_cuobjdump_available,
+            check_nvdisasm_available,
+            disassemble_kernelbench_model,
+        )
+        from kernelbench.agent.sass_parser import parse_disassembly
+
+        if not check_cuobjdump_available():
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                output="disassemble_kernel FAILED: cuobjdump not found in PATH.",
+                metadata={"available": False},
+            )
+
+        nvdisasm_ok = check_nvdisasm_available()
+
+        try:
+            disasm_result = disassemble_kernelbench_model(
+                custom_model_src=kernel_code,
+                device=ctx.device,
+                backend=ctx.backend,
+                precision=ctx.torch_precision,
+                build_dir=ctx.build_dir,
+                include_ptx=True,
+                include_nvdisasm=nvdisasm_ok,
+                include_life_range=nvdisasm_ok,
+                verbose=ctx.verbose,
+            )
+        except Exception as e:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                output=f"disassemble_kernel FAILED: {type(e).__name__}: {e}",
+                metadata={"error": str(e)},
+            )
+
+        device_name = torch.cuda.get_device_name(ctx.device)
+        summary = parse_disassembly(disasm_result, device_name)
+
+        return ToolResult(
+            tool_name=self.name,
+            success=True,
+            output=(
+                f"disassemble_kernel PASSED: disassembly analysis complete.\n"
+                f"{summary.format_for_llm()}"
+            ),
+            metadata={
+                "max_registers": summary.max_registers,
+                "has_register_spills": summary.has_register_spills,
+                "has_tensor_core_ops": summary.has_tensor_core_ops,
+                "instruction_mix": summary.instruction_mix,
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. ErtRooflineTool
+# ---------------------------------------------------------------------------
+
+
+class ErtRooflineTool(Tool):
+    """
+    Run empirical roofline micro-benchmarks to measure actual peak bandwidth
+    and compute throughput for the current GPU.
+    """
+
+    name = "ert_roofline"
+    description = (
+        "Run the Empirical Roofline Tool — micro-benchmarks that measure "
+        "the actual (not theoretical) peak memory bandwidth and compute "
+        "throughput of the current GPU. Returns measured bandwidth at each "
+        "memory hierarchy level (L1, L2, DRAM/HBM) and peak TFLOPS "
+        "(FP32, FP16/tensor-core). Also computes the ridge point — the "
+        "arithmetic intensity where the roofline transitions from memory- "
+        "to compute-bound. Results are cached per GPU so subsequent calls "
+        "are instant. No arguments needed."
+    )
+    input_schema = {"type": "object", "properties": {}, "required": []}
+
+    def execute(self, ctx: ToolContext, **_) -> ToolResult:
+        from kernelbench.ert import run_ert_benchmarks
+
+        try:
+            model = run_ert_benchmarks(
+                device=ctx.device,
+                use_cache=True,
+                verbose=ctx.verbose,
+            )
+        except Exception as e:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                output=f"ert_roofline FAILED: {type(e).__name__}: {e}",
+                metadata={"error": str(e)},
+            )
+
+        return ToolResult(
+            tool_name=self.name,
+            success=True,
+            output=(
+                f"ert_roofline PASSED: empirical roofline benchmarks complete.\n"
+                f"{model.format_for_llm()}"
+            ),
+            metadata=model.to_dict(),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
+
+# Tools that require special hardware/software access and are excluded from
+# the default tool set.
+_OPT_IN_TOOLS = {"profile_kernel", "disassemble_kernel", "ert_roofline"}
 
 ALL_TOOLS: list[Tool] = [
     CompileKernelTool(),
@@ -607,6 +743,8 @@ ALL_TOOLS: list[Tool] = [
     GetGpuSpecsTool(),
     StaticCheckTool(),
     SubmitKernelTool(),
+    DisassembleKernelTool(),
+    ErtRooflineTool(),
 ]
 
 TOOL_REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
@@ -616,13 +754,14 @@ def get_tools(tool_names: list[str] | None = None) -> list[Tool]:
     """
     Return the list of Tool instances for the given names.
 
-    - tool_names=None → default set (all tools except profile_kernel, which
-      requires ncu + hardware-counter permissions).
+    - tool_names=None → default set (all tools except opt-in tools that
+      require special hardware/software: profile_kernel, disassemble_kernel,
+      ert_roofline).
     - submit_kernel is always included regardless of the list — without it
       the agent has no way to record a final evaluation result.
     """
     if tool_names is None:
-        selected = [t for t in ALL_TOOLS if t.name != "profile_kernel"]
+        selected = [t for t in ALL_TOOLS if t.name not in _OPT_IN_TOOLS]
     else:
         wanted = set(tool_names)
         wanted.add("submit_kernel")
