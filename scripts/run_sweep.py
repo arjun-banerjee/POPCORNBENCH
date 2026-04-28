@@ -154,11 +154,15 @@ def run_one(
     traj_path = os.path.join(
         model_dir, f"level_{work.level}_problem_{work.problem_id}_trajectory.json"
     )
+    # Skip if a *finished* trajectory already exists. In-progress snapshots
+    # (outcome == "in_progress", finished_at == None) get re-run — they're
+    # leftovers from a killed sweep, not real completions.
     if os.path.exists(traj_path):
         try:
             with open(traj_path) as f:
                 d = json.load(f)
-            return _summary_from_dict(d, work.level, model_name, work.variant)
+            if d.get("finished_at") and d.get("outcome") != "in_progress":
+                return _summary_from_dict(d, work.level, model_name, work.variant)
         except Exception:
             pass
 
@@ -224,6 +228,7 @@ def run_one(
             turn_delay_s=float(agent_cfg.get("turn_delay_s", 0.0)),
             verbose=False,
             api_kind=api_kind,
+            save_path=traj_path,
         )
 
         # Wrap submit_kernel.execute with a per-GPU perf lock so timing is

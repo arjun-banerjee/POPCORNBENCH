@@ -132,6 +132,9 @@ header .page-wrap { padding-top: 36px; padding-bottom: 24px; }
 .outcome-error { color: var(--r); }
 .outcome-skipped { opacity: 0.45; }
 .outcome-unknown { opacity: 0.4; }
+.outcome-in_progress { color: var(--g); font-style: italic; }
+.outcome-in_progress::after { content: " ●"; animation: blink 1.4s infinite; }
+@keyframes blink { 0%,50%,100% { opacity: 1; } 25%,75% { opacity: 0.25; } }
 
 .card-row { display: flex; gap: 8px; align-items: baseline; }
 .card-runtime { font-size: 11px; opacity: 0.55; font-style: italic; }

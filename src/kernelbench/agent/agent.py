@@ -127,6 +127,7 @@ class KernelAgent:
         turn_delay_s: float = 0.0,
         verbose: bool = False,
         api_kind: str = "openai",
+        save_path: str | None = None,
     ) -> None:
         self.problem_id = problem_id
         self.level = level
@@ -144,6 +145,7 @@ class KernelAgent:
         self.turn_delay_s = turn_delay_s
         self.verbose = verbose
         self.api_kind = api_kind
+        self.save_path = save_path
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,9 +187,40 @@ class KernelAgent:
     def _tag(self) -> str:
         return f"[L{self.level}/P{self.problem_id}/{self.model}]"
 
+    def _install_autosave(self, trajectory: KernelTrajectory) -> None:
+        """Wrap trajectory.add_turn / finish so they flush to save_path after
+        every mutation. Mid-run snapshots have outcome='in_progress'; the wrapped
+        finish() overwrites that with the final outcome.
+        """
+        if not self.save_path:
+            return
+        path = self.save_path
+        orig_add = trajectory.add_turn
+        orig_finish = trajectory.finish
+
+        def _save():
+            try:
+                trajectory.save(path)
+            except Exception as e:
+                print(f"[Agent] mid-run save failed: {e}", flush=True)
+
+        def add_turn(turn):
+            orig_add(turn)
+            if trajectory.finished_at is None:
+                trajectory.outcome = "in_progress"
+            _save()
+
+        def finish(result):
+            orig_finish(result)
+            _save()
+
+        trajectory.add_turn = add_turn  # type: ignore[assignment]
+        trajectory.finish = finish      # type: ignore[assignment]
+
     def _run_responses(self) -> KernelTrajectory:
         """Original Responses-API loop."""
         tag = self._tag()
+        # NOTE: install_autosave is called below, after construction.
         trajectory = KernelTrajectory(
             problem_id=self.problem_id,
             level=self.level,
@@ -200,6 +233,13 @@ class KernelAgent:
             max_tool_calls=self.max_tool_calls,
             tools_enabled=self.tool_names_enabled,
         )
+        self._install_autosave(trajectory)
+        if self.save_path:
+            trajectory.outcome = "in_progress"
+            try:
+                trajectory.save(self.save_path)
+            except Exception as e:
+                print(f"[Agent] initial save failed: {e}", flush=True)
 
         instructions = build_system_prompt(
             max_turns=self.max_turns,
@@ -571,6 +611,13 @@ class KernelAgent:
             max_tool_calls=self.max_tool_calls,
             tools_enabled=self.tool_names_enabled,
         )
+        self._install_autosave(trajectory)
+        if self.save_path:
+            trajectory.outcome = "in_progress"
+            try:
+                trajectory.save(self.save_path)
+            except Exception as e:
+                print(f"[Agent] initial save failed: {e}", flush=True)
 
         instructions = build_system_prompt(
             max_turns=self.max_turns,
