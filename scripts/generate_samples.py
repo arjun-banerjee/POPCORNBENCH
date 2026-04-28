@@ -12,6 +12,7 @@ from kernelbench.eval import eval_kernel_against_ref
 from kernelbench.prompt_constructor_toml import (
     get_prompt_for_backend,
     get_custom_prompt,
+    get_hardware_translation_prompt,
     get_translation_prompt,
 )
 from kernelbench.utils import (
@@ -105,6 +106,13 @@ class GenerationConfig(Config):
         self.source_backend = None
         self.source_kernel_dir = None  # optional override
 
+        # Hardware translation mode: re-optimize kernels from one GPU arch to
+        # another (same DSL). Set prompt_option=hardware_translation and provide
+        # source_hardware_gpu_name (the GPU the source kernels were tuned for)
+        # plus hardware_gpu_name (the target GPU). Source kernels are loaded from
+        # source_kernel_dir or _translation_sources/{backend}/.
+        self.source_hardware_gpu_name = None
+
         self.check_kernel = True  # [experimental] optional static checker catching potential hacking patterns
 
     def greedy(self):
@@ -190,6 +198,28 @@ def generate_sample_single(
             precision=config.precision,
             include_hardware=config.include_hardware_info,
             gpu_name=config.hardware_gpu_name,
+        )
+    elif config.prompt_option == "hardware_translation":
+        if not config.source_hardware_gpu_name:
+            raise ValueError(
+                "prompt_option=hardware_translation requires source_hardware_gpu_name "
+                "(the GPU the source kernels were optimized for, e.g. 'H100')."
+            )
+        if not config.hardware_gpu_name:
+            raise ValueError(
+                "prompt_option=hardware_translation requires hardware_gpu_name "
+                "(the target GPU to re-optimize for, e.g. 'A100')."
+            )
+        if not config.source_backend:
+            config.source_backend = config.backend
+        source_kernel_src = _resolve_source_kernel_src(config, problem, ref_arch_src)
+        custom_prompt = get_hardware_translation_prompt(
+            ref_arch_src=ref_arch_src,
+            source_kernel_src=source_kernel_src,
+            backend=config.backend,
+            source_gpu_name=config.source_hardware_gpu_name,
+            target_gpu_name=config.hardware_gpu_name,
+            precision=config.precision,
         )
     else:
         custom_prompt = get_prompt_for_backend(
@@ -354,7 +384,7 @@ def main(config: GenerationConfig):
         config.precision = "bf16"
 
     config.prompt_option = str(config.prompt_option).lower()
-    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "translation"}
+    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "translation", "hardware_translation"}
     if not config.custom_prompt_key:
         if config.prompt_option not in valid_prompt_options:
             raise ValueError(
