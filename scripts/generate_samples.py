@@ -9,7 +9,11 @@ from pydra import Config, REQUIRED
 
 from kernelbench.dataset import construct_kernelbench_dataset
 from kernelbench.eval import eval_kernel_against_ref
-from kernelbench.prompt_constructor_toml import get_prompt_for_backend, get_custom_prompt
+from kernelbench.prompt_constructor_toml import (
+    get_prompt_for_backend,
+    get_custom_prompt,
+    get_translation_prompt,
+)
 from kernelbench.utils import (
     create_inference_server_from_presets,
     extract_first_code,
@@ -86,12 +90,20 @@ class GenerationConfig(Config):
         self.log_generated_kernel = False  # save full LLM reply before code extraction
 
         self.backend = "cuda"
-        
+
         self.precision = "fp32"
-        self.prompt_option = "one_shot"  # zero_shot, one_shot, few_shot
+        self.prompt_option = "one_shot"  # zero_shot, one_shot, few_shot, translation
         self.include_hardware_info = False
         self.hardware_gpu_name = None
         self.custom_prompt_key = None
+
+        # Translation mode: source DSL identifier (e.g., "cuda", "triton",
+        # "pytorch"). When set, source kernels are loaded from
+        # KernelBench/level{L}/_translation_sources/{source_backend}/{problem_filename}
+        # (override with source_kernel_dir). For source_backend="pytorch" the
+        # PyTorch reference itself is used.
+        self.source_backend = None
+        self.source_kernel_dir = None  # optional override
 
         self.check_kernel = True  # [experimental] optional static checker catching potential hacking patterns
 
@@ -107,6 +119,38 @@ class GenerationConfig(Config):
 class WorkArgs:
     problem_id: int  # logically indexed
     sample_id: int
+
+
+def _resolve_source_kernel_src(
+    config: GenerationConfig, problem, ref_arch_src: str
+) -> str:
+    """Look up the source-DSL implementation for this problem when in
+    translation mode. Returns the file contents as a string."""
+    source_backend = str(config.source_backend).lower()
+    if source_backend == "pytorch":
+        return ref_arch_src
+
+    # Determine the source-kernel directory
+    if config.source_kernel_dir:
+        src_dir = config.source_kernel_dir
+        if not os.path.isabs(src_dir):
+            src_dir = os.path.join(REPO_TOP_DIR, src_dir)
+    else:
+        src_dir = os.path.join(
+            REPO_TOP_DIR,
+            "KernelBench",
+            f"level{config.level}",
+            "_translation_sources",
+            source_backend,
+        )
+    candidate = os.path.join(src_dir, problem.name)
+    if not os.path.exists(candidate):
+        raise FileNotFoundError(
+            f"No source kernel for problem '{problem.name}' under {src_dir}. "
+            "Run scripts/build_translation_dataset.py to populate this directory."
+        )
+    with open(candidate, "r") as f:
+        return f.read()
 
 
 def generate_sample_single(
@@ -127,6 +171,22 @@ def generate_sample_single(
             ref_arch_src=ref_arch_src,
             backend=config.backend,
             option=config.prompt_option,
+            precision=config.precision,
+            include_hardware=config.include_hardware_info,
+            gpu_name=config.hardware_gpu_name,
+        )
+    elif config.prompt_option == "translation":
+        if not config.source_backend:
+            raise ValueError(
+                "prompt_option=translation requires source_backend (e.g., 'cuda', 'triton', 'pytorch')."
+            )
+        source_kernel_src = _resolve_source_kernel_src(config, problem, ref_arch_src)
+        custom_prompt = get_translation_prompt(
+            ref_arch_src=ref_arch_src,
+            source_kernel_src=source_kernel_src,
+            source_backend=str(config.source_backend).lower(),
+            target_backend=config.backend,
+            option="translation",
             precision=config.precision,
             include_hardware=config.include_hardware_info,
             gpu_name=config.hardware_gpu_name,
@@ -278,7 +338,10 @@ def main(config: GenerationConfig):
         include_hardware = include_hardware.lower() in ["true", "1", "yes"]
     config.include_hardware_info = include_hardware
 
-    supported_backends = {"cuda", "triton", "cute", "tilelang", "thunderkittens"}
+    supported_backends = {
+        "cuda", "triton", "cute", "tilelang", "thunderkittens",
+        "helion", "hip", "nki", "pallas", "numba", "mojo",
+    }
     backend = config.backend.lower()
     if backend not in supported_backends:
         raise ValueError(
@@ -291,7 +354,7 @@ def main(config: GenerationConfig):
         config.precision = "bf16"
 
     config.prompt_option = str(config.prompt_option).lower()
-    valid_prompt_options = {"zero_shot", "one_shot", "few_shot"}
+    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "translation"}
     if not config.custom_prompt_key:
         if config.prompt_option not in valid_prompt_options:
             raise ValueError(

@@ -10,6 +10,7 @@ from kernelbench.prompt_constructor_toml import (
     get_annotated_compile_prompt,
     get_custom_prompt,
     get_prompt_for_backend,
+    get_translation_prompt,
 )
 from kernelbench.utils import (
     create_inference_server_from_presets,
@@ -81,10 +82,18 @@ class EvalConfig(Config):
         self.timing_method = "cuda_event"  # see timing.py
 
         # Prompt construction
-        self.prompt_option = "one_shot"  # choices: zero_shot, one_shot, few_shot
+        self.prompt_option = "one_shot"  # choices: zero_shot, one_shot, few_shot, annotated_compile, translation
         self.include_hardware_info = False
         self.hardware_gpu_name = None
         self.custom_prompt_key = None
+
+        # Translation mode (set both to enable):
+        # source_backend: source DSL identifier (e.g., "cuda", "triton", "pytorch").
+        # source_kernel_path: path to the source-DSL implementation. May be a
+        #   relative path under KernelBench/ or absolute. Ignored when
+        #   source_backend == "pytorch" (the PyTorch reference is used).
+        self.source_backend = None
+        self.source_kernel_path = None
 
         self.check_kernel = True  # [experimental] optional static checker catching potential hacking patterns
 
@@ -179,13 +188,16 @@ def main(config: EvalConfig):
 
     # Use appropriate prompt constructor based on backend
     prompt_option = str(config.prompt_option).lower()
-    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "annotated_compile"}
+    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "annotated_compile", "translation"}
     include_hardware = config.include_hardware_info
     if isinstance(include_hardware, str):
         include_hardware = include_hardware.lower() in ["true", "1", "yes"]
     config.include_hardware_info = include_hardware
 
-    supported_backends = {"cuda", "hip", "triton", "tilelang", "cute", "thunderkittens"}
+    supported_backends = {
+        "cuda", "hip", "triton", "tilelang", "cute", "thunderkittens",
+        "helion", "nki", "pallas", "numba", "mojo",
+    }
     backend = config.backend.lower()
     if backend not in supported_backends:
         raise ValueError(
@@ -210,12 +222,48 @@ def main(config: EvalConfig):
                 "include_hardware_info is True but hardware_gpu_name is not provided."
             )
 
+    # Resolve source kernel for translation mode (if requested)
+    source_backend = None
+    source_kernel_src = None
+    if config.source_backend or prompt_option == "translation":
+        if not config.source_backend:
+            raise ValueError(
+                "prompt_option=translation requires source_backend (e.g., 'cuda', 'triton', 'pytorch')."
+            )
+        source_backend = str(config.source_backend).lower()
+        if source_backend == "pytorch":
+            source_kernel_src = ref_arch_src
+        else:
+            if not config.source_kernel_path:
+                raise ValueError(
+                    f"source_backend={source_backend} requires source_kernel_path "
+                    "(relative to repo root or absolute)."
+                )
+            src_path = config.source_kernel_path
+            if not os.path.isabs(src_path):
+                src_path = os.path.join(REPO_TOP_DIR, src_path)
+            if not os.path.exists(src_path):
+                raise FileNotFoundError(f"source_kernel_path not found: {src_path}")
+            with open(src_path, "r") as f:
+                source_kernel_src = f.read()
+
     if custom_prompt_key:
         custom_prompt = get_custom_prompt(
             custom_prompt_key,
             ref_arch_src=ref_arch_src,
             backend=backend,
             option=prompt_option,
+            precision=config.precision,
+            include_hardware=include_hardware,
+            gpu_name=config.hardware_gpu_name,
+        )
+    elif prompt_option == "translation":
+        custom_prompt = get_translation_prompt(
+            ref_arch_src=ref_arch_src,
+            source_kernel_src=source_kernel_src,
+            source_backend=source_backend,
+            target_backend=backend,
+            option="translation",
             precision=config.precision,
             include_hardware=include_hardware,
             gpu_name=config.hardware_gpu_name,
@@ -288,6 +336,8 @@ def main(config: EvalConfig):
         num_perf_trials=100,
         backend=config.backend,
         precision=get_torch_dtype_from_string(config.precision),
+        source_kernel_src=source_kernel_src,
+        source_backend=source_backend,
     )
 
     print(

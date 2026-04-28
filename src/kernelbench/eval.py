@@ -120,6 +120,14 @@ class KernelExecResult(BaseModel):
     ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
 
+    # Translation mode: timing of the source-DSL implementation that the
+    # candidate was translated from. Only populated when source_kernel_src and
+    # source_backend are passed to eval_kernel_against_ref.
+    source_runtime: float = -1.0
+    source_runtime_stats: dict = {}
+    source_backend: Optional[str] = None
+    speedup_vs_source: float = -1.0
+
 
 def load_original_model_and_inputs(
     model_original_src: str, context: dict
@@ -406,6 +414,12 @@ def eval_kernel_against_ref(
     ),  # have to run on GPU
     backend: str = "cuda",  # can be 'cuda', 'triton', 'tilelang', or 'cute'
     precision: torch.dtype = torch.float32,
+
+    # Translation mode: when both are provided, also compile + time the source
+    # kernel and report speedup_vs_source on the result. The source kernel must
+    # implement ModelNew using the same Model interface as the PyTorch reference.
+    source_kernel_src: Optional[str] = None,
+    source_backend: Optional[str] = None,
 
     # Guard against potential reward hacking [optional but ongoing enhancement]
     check_for_excessive_speedup: bool = True,
@@ -700,6 +714,90 @@ def eval_kernel_against_ref(
             print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
             print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
 
+
+    # Translation mode: also time the source-DSL implementation so the result
+    # carries speedup_vs_source alongside the existing speedup_vs_pytorch.
+    # Skipped if the candidate failed correctness or wasn't timed.
+    if (
+        measure_performance
+        and source_kernel_src is not None
+        and source_backend is not None
+        and kernel_exec_result is not None
+        and kernel_exec_result.correctness
+        and kernel_exec_result.runtime > 0
+    ):
+        source_tempfile = None
+        try:
+            source_backend_lower = source_backend.lower()
+            source_uses_tempfile = source_backend_lower in [
+                "triton", "tilelang", "cute", "helion", "nki", "pallas", "numba", "mojo",
+            ]
+            if source_uses_tempfile:
+                SourceModel, source_tempfile = load_custom_model_with_tempfile(
+                    source_kernel_src, entry_point="ModelNew"
+                )
+            elif source_backend_lower == "pytorch":
+                # The "pytorch source" is the reference Model itself; time the
+                # already-loaded original_model rather than recompiling.
+                SourceModel = None
+            else:
+                SourceModel = load_custom_model(source_kernel_src, {}, build_dir)
+
+            if SourceModel is None and source_backend_lower != "pytorch":
+                raise RuntimeError(
+                    "Source kernel failed to load (ModelNew not found or syntax error)"
+                )
+
+            with torch.no_grad():
+                set_seed(seed_num)
+                if source_backend_lower == "pytorch":
+                    source_model = original_model
+                else:
+                    source_model = SourceModel(*init_inputs)
+                    source_model = source_model.to(device=device, dtype=precision)
+                torch.cuda.synchronize(device=device)
+
+            set_seed(seed_num)
+            source_inputs = get_inputs()
+            source_inputs = [
+                _process_input_tensor(x, device, source_backend_lower, precision)
+                for x in source_inputs
+            ]
+
+            timing_fn = timing.get_timing_function(timing_method)
+            source_elapsed = timing_fn(
+                source_model,
+                source_inputs,
+                num_trials=num_perf_trials,
+                verbose=verbose,
+                device=device,
+            )
+            source_stats = timing.get_timing_stats(source_elapsed, device=device)
+            kernel_exec_result.source_backend = source_backend_lower
+            kernel_exec_result.source_runtime = source_stats["mean"]
+            kernel_exec_result.source_runtime_stats = source_stats
+            if kernel_exec_result.runtime > 0:
+                kernel_exec_result.speedup_vs_source = (
+                    source_stats["mean"] / kernel_exec_result.runtime
+                )
+            if verbose:
+                print(
+                    f"[Eval] Source ({source_backend_lower}) runtime: "
+                    f"{source_stats['mean']:.3f}, speedup_vs_source: "
+                    f"{kernel_exec_result.speedup_vs_source:.2f}x"
+                )
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Failed to time source kernel ({source_backend}): {e}")
+            kernel_exec_result.metadata["source_kernel_error"] = str(e)
+            kernel_exec_result.metadata["source_kernel_error_name"] = get_error_name(e)
+        finally:
+            if source_tempfile is not None:
+                try:
+                    source_tempfile.close()
+                    os.remove(source_tempfile.name)
+                except OSError:
+                    pass
 
     graceful_eval_cleanup(context, device, tempfile)
     return kernel_exec_result

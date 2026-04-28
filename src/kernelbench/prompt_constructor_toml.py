@@ -173,6 +173,17 @@ def render_prompt_by_option(
         raise KeyError(f"Unknown option: {option}")
 
     component_sequence = list(components_override or option_data["components"])
+    # In translation mode, when the source IS the PyTorch reference, the
+    # source_kernel_block already contains the same code as arch_block — drop
+    # the duplicate to keep prompts clean.
+    if (
+        components_override is None
+        and option == "translation"
+        and context.get("source_backend") == "pytorch"
+        and "arch_block" in component_sequence
+        and "source_kernel_block" in component_sequence
+    ):
+        component_sequence.remove("arch_block")
     if include_hardware:
         if components_override is None:
             insert_idx = component_sequence.index("arch_block") if "arch_block" in component_sequence else len(component_sequence)
@@ -201,6 +212,34 @@ def render_prompt_by_option(
         "problem_statement": problem_statement,
         "instruction": instruction,
     }
+
+    # Translation-mode formatting: derive the source backend's display string
+    # and pre-format the translation problem statement and instruction so they
+    # interpolate {source_backend_display} once (not on every component pass).
+    source_backend = context.get("source_backend")
+    if source_backend:
+        try:
+            source_backend_data = cfg.data["backends"][source_backend]
+        except KeyError as exc:
+            raise KeyError(f"Unknown source_backend: {source_backend}") from exc
+        source_backend_display = source_backend_data.get(
+            "source_display", source_backend_data.get("backend_display", source_backend.upper())
+        )
+        translation_problem_statement = shared.get("translation_problem_statement", "").format(
+            backend_display=backend_display,
+            source_backend_display=source_backend_display,
+        )
+        translation_instruction = shared.get("translation_instruction", "").format(
+            backend_display=backend_display,
+            source_backend_display=source_backend_display,
+        )
+        context.update(
+            {
+                "source_backend_display": source_backend_display,
+                "translation_problem_statement": translation_problem_statement,
+                "translation_instruction": translation_instruction,
+            }
+        )
     
     # Load precision details if provided
     if precision:
@@ -215,7 +254,7 @@ def render_prompt_by_option(
         precision_data = cfg.data["precision"].get(default_precision, {})
         context["precision_display"] = precision_data.get("precision_display", "FP32 (32-bit floating point)")
     
-    # Load example files if requested. Supports loading one shot or few shot examples. 
+    # Load example files if requested. Supports loading one shot or few shot examples.
     requires_example = option_data.get("requires_example")
     if requires_example:
         example_entry_template = cfg.compose_blocks(["templates.common.example_entry_template"]).strip()
@@ -276,6 +315,64 @@ def render_prompt_by_option(
                 render_example_entry(input_code, output_code, "Example:")
             )
 
+        elif requires_example == "translation":
+            if not source_backend:
+                raise ValueError(
+                    "Translation prompt requires source_backend in context. "
+                    "Use get_translation_prompt or pass it explicitly."
+                )
+            translation_entry_template = cfg.compose_blocks(
+                ["templates.common.example_entry_template_translation"]
+            ).strip()
+            intro_translation = cfg.compose_blocks(
+                ["templates.common.example_intro_translation"]
+            ).strip().format(
+                backend_display=backend_display,
+                source_backend_display=context["source_backend_display"],
+            )
+            examples_intro = intro_translation
+
+            def render_translation_entry(input_code: str, output_code: str, example_label: str) -> str:
+                return translation_entry_template.format(
+                    example_label=example_label,
+                    input_code=input_code,
+                    output_code=output_code,
+                    backend_display=backend_display,
+                    source_backend_display=context["source_backend_display"],
+                )
+
+            translation_examples_table = cfg.data.get("translation_examples", {})
+            pair_key = f"{source_backend}__{backend}"
+            example_pairs = translation_examples_table.get(pair_key)
+
+            if example_pairs:
+                for i, (input_path, output_path) in enumerate(example_pairs, 1):
+                    input_code = read_file(resolve_path(input_path))
+                    output_code = read_file(resolve_path(output_path))
+                    label = "Example:" if len(example_pairs) == 1 else f"Example {i}:"
+                    examples_entries.append(
+                        render_translation_entry(input_code, output_code, label)
+                    )
+            else:
+                # Fallback: pair the source backend's add example with the target's
+                # add example. For pytorch source, use the shared model_ex_add.py.
+                if source_backend == "pytorch":
+                    src_path = shared.get("few_shot_example_arch")
+                else:
+                    src_path = source_backend_data.get("one_shot_new_arch")
+                tgt_path = backend_data.get("one_shot_new_arch")
+                if not src_path or not tgt_path:
+                    raise ValueError(
+                        f"No translation example registered for {pair_key} and "
+                        f"could not infer one (missing one_shot_new_arch on "
+                        f"{source_backend} or {backend})."
+                    )
+                input_code = read_file(resolve_path(src_path))
+                output_code = read_file(resolve_path(tgt_path))
+                examples_entries.append(
+                    render_translation_entry(input_code, output_code, "Example:")
+                )
+
         if not examples_entries:
             raise ValueError(f"No example entries could be constructed for option '{option}'.")
 
@@ -290,7 +387,7 @@ def render_prompt_by_option(
             )
         context = {**context, **_gpu_context_from_gpu_specs(resolve_path(gpu_specs_py), gpu_name)}
     
-    # Builds the prompt from the components in the toml file. 
+    # Builds the prompt from the components in the toml file.
     prompt_parts = []
     for component in component_sequence:
         if component == "problem_statement":
@@ -299,6 +396,13 @@ def render_prompt_by_option(
         elif component == "instruction":
             # Use the already-formatted instruction from context
             prompt_parts.append(context["instruction"])
+        elif component in ("translation_problem_statement", "translation_instruction"):
+            # Already pre-formatted (with source_backend_display) above
+            if component not in context:
+                raise ValueError(
+                    f"Component '{component}' requires source_backend in context."
+                )
+            prompt_parts.append(context[component])
         elif component.startswith("hardware_"):
             # Hardware components from templates.hardware
             template_key = f"templates.hardware.{component}"
@@ -385,6 +489,55 @@ def get_annotated_compile_prompt(
     )
 
 
+def get_translation_prompt(
+    *,
+    ref_arch_src: str,
+    source_kernel_src: str,
+    source_backend: str,
+    target_backend: str,
+    option: str = "translation",
+    precision: Optional[str] = None,
+    include_hardware: bool = False,
+    gpu_name: Optional[str] = None,
+) -> str:
+    """
+    Generate a translation prompt: rewrite an existing source-DSL kernel into
+    the target backend.
+
+    Args:
+        ref_arch_src: PyTorch reference architecture (used as the functional
+            contract; rendered via arch_block).
+        source_kernel_src: The existing implementation to translate. For
+            source_backend="pytorch", pass the same value as ref_arch_src.
+        source_backend: Source DSL identifier (e.g., "cuda", "triton",
+            "pytorch"). Must exist under [backends.X] in prompts.toml.
+        target_backend: Target DSL identifier (the backend the LLM should
+            produce). Must exist under [backends.X] in prompts.toml.
+        option: Prompt option name. Defaults to "translation".
+        precision, include_hardware, gpu_name: Same semantics as
+            get_prompt_for_backend.
+    """
+    if source_backend.lower() == target_backend.lower():
+        raise ValueError(
+            f"source_backend and target_backend are both '{source_backend}'; "
+            "translation requires distinct DSLs."
+        )
+    return render_prompt_by_option(
+        prompts_toml=PROMPTS_TOML,
+        backend=target_backend.lower(),
+        option=option.lower(),
+        context={
+            "ref_arch_src": ref_arch_src,
+            "source_kernel_src": source_kernel_src,
+            "source_backend": source_backend.lower(),
+        },
+        precision=precision,
+        include_hardware=include_hardware,
+        gpu_specs_py=GPU_SPECS_PY if include_hardware else None,
+        gpu_name=gpu_name,
+    )
+
+
 def get_custom_prompt(
     custom_key: str,
     *,
@@ -425,6 +578,7 @@ def get_custom_prompt(
 
 __all__ = [
     "get_prompt_for_backend",
+    "get_translation_prompt",
     "get_custom_prompt",
     "get_annotated_compile_prompt",
     "get_prompt_with_hardware",
@@ -487,6 +641,27 @@ def test_prompt():
         gpu_name="L40S",
     )
     log_prompt(hardware_prompt, os.path.join(scratch_dir), "hardware_prompt.txt")
+
+    # translation prompt: pytorch -> helion (no separate source kernel needed)
+    translation_pytorch_helion = get_translation_prompt(
+        ref_arch_src=ref_arch_src,
+        source_kernel_src=ref_arch_src,
+        source_backend="pytorch",
+        target_backend="helion",
+        precision="fp32",
+    )
+    log_prompt(translation_pytorch_helion, scratch_dir, "translation_pytorch_helion.txt")
+
+    # translation prompt: cuda -> triton (uses model_new_ex_add.py as the "CUDA" source kernel for demo)
+    cuda_source = read_file(os.path.join(REPO_TOP_PATH, "src/kernelbench/prompts/model_new_ex_add.py"))
+    translation_cuda_triton = get_translation_prompt(
+        ref_arch_src=ref_arch_src,
+        source_kernel_src=cuda_source,
+        source_backend="cuda",
+        target_backend="triton",
+        precision="fp32",
+    )
+    log_prompt(translation_cuda_triton, scratch_dir, "translation_cuda_triton.txt")
 
     # custom prompt defined in prompts.toml
     custom_prompt = get_custom_prompt(
