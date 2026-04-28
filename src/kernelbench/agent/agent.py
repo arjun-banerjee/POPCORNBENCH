@@ -51,6 +51,21 @@ from kernelbench.agent.prompt_templates import (
 )
 
 
+def _strip_status(obj: Any) -> None:
+    """Recursively pop `status` keys from a dumped Responses-API item.
+
+    Azure's /openai/v1/ preview 400s if `status` is echoed back inside the
+    `input` array; the public OpenAI API ignores it. Mutates in place.
+    """
+    if isinstance(obj, dict):
+        obj.pop("status", None)
+        for v in obj.values():
+            _strip_status(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _strip_status(v)
+
+
 class KernelAgent:
     """
     Multi-turn, tool-using agent for a single KernelBench problem.
@@ -272,9 +287,16 @@ class KernelAgent:
             # them to the API next turn and (b) store them in the trajectory.
             # model_dump() gives us plain dicts, which is what both consumers
             # want.
-            response_items: list[dict[str, Any]] = [
-                item.model_dump() for item in response.output
-            ]
+            #
+            # Azure's /openai/v1/ preview rejects the `status` field that the
+            # SDK echoes back on reasoning/function_call items
+            # (`Unknown parameter: 'input[N].status'`). The public OpenAI API
+            # tolerates it. Strip it on the way back in to keep both happy.
+            response_items: list[dict[str, Any]] = []
+            for item in response.output:
+                d = item.model_dump()
+                _strip_status(d)
+                response_items.append(d)
             input_items.extend(response_items)
 
             if self.verbose:
