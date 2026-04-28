@@ -9,6 +9,8 @@ Provides measurement functions for:
   5. Roofline / Occupancy (via Nsight or heuristics)
 """
 
+import os
+
 import torch
 import torch.nn as nn
 from typing import Any, Optional
@@ -124,41 +126,87 @@ def compute_kernel_launch_stats(
 # 3. SOL (Speed-of-Light) Score — via Nsight hardware counters
 # ─────────────────────────────────────────────────────────────────────────────
 
+_WORKER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "scripts", "_profile_worker.py",
+)
+
+
 def profile_kernel_with_nsight(
-    model: nn.Module,
-    inputs: list,
+    custom_model_src: str,
+    ref_model_src: str,
     device: torch.device,
+    backend: str = "cuda",
+    precision: str = "fp32",
+    build_dir: Optional[str] = None,
+    verbose: bool = False,
+    timeout: int = 300,
 ) -> Optional[dict]:
     """
-    Profile a model's forward pass with Nsight Compute and return a
-    ProfileSummary as a dict.  Returns None if Nsight is not available.
+    Profile a kernel via Nsight Compute in a **subprocess** and return a
+    parsed ProfileSummary as a plain dict.  Returns None if Nsight is
+    not available or profiling fails.
 
-    This uses the nsight-python in-process API.  The caller should guard
-    against exceptions — Nsight requires ncu in PATH and hardware-counter
-    access.
+    Nsight relaunches the application under ncu, so this MUST run in a
+    separate process (scripts/_profile_worker.py) to avoid restarting
+    the caller.
     """
+    import json
+    import subprocess
+    import sys
+    import tempfile as _tempfile
+
     try:
-        from kernelbench.profile import profile_with_nsight, NSIGHT_AVAILABLE, check_ncu_available
+        from kernelbench.profile import NSIGHT_AVAILABLE, check_ncu_available
         if not NSIGHT_AVAILABLE or not check_ncu_available():
             return None
 
         from kernelbench.agent.nsight_parser import ROOFLINE_METRICS, parse_nsight_metrics
 
-        def model_forward():
-            with torch.no_grad():
-                return model(*inputs)
+        request = {
+            "custom_model_src": custom_model_src,
+            "ref_model_src": ref_model_src,
+            "metrics": ROOFLINE_METRICS,
+            "num_trials": 1,
+            "seed": 42,
+            "device_index": device.index if device.index is not None else 0,
+            "backend": backend,
+            "precision": precision,
+            "build_dir": build_dir,
+            "verbose": verbose,
+        }
 
-        raw_metrics = profile_with_nsight(
-            model_forward,
-            metrics=ROOFLINE_METRICS,
-            num_trials=1,
+        with _tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            json.dump(request, tmp)
+            req_path = tmp.name
+
+        proc = subprocess.run(
+            [sys.executable, _WORKER_SCRIPT, req_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
-        if raw_metrics is None:
+
+        try:
+            os.unlink(req_path)
+        except OSError:
+            pass
+
+        if proc.returncode != 0:
+            if verbose:
+                stderr_tail = (proc.stderr or "").strip()[-500:]
+                print(f"[Nsight] Worker exited with code {proc.returncode}: {stderr_tail}")
             return None
 
-        kernel_breakdown = raw_metrics.pop("_kernel_breakdown", [])
+        raw_output = json.loads(proc.stdout.strip().splitlines()[-1])
+        if "error" in raw_output:
+            if verbose:
+                print(f"[Nsight] Worker error: {raw_output['error']}")
+            return None
+
+        kernel_breakdown = raw_output.pop("_kernel_breakdown", [])
         device_name = torch.cuda.get_device_name(device)
-        summary = parse_nsight_metrics(raw_metrics, device_name, kernel_breakdown=kernel_breakdown)
+        summary = parse_nsight_metrics(raw_output, device_name, kernel_breakdown=kernel_breakdown)
 
         return {
             "gpu_time_us": summary.gpu_time_us,
@@ -190,7 +238,13 @@ def profile_kernel_with_nsight(
             "st_sectors_per_request": summary.st_sectors_per_request,
             "warp_stalls": dict(summary.warp_stalls) if summary.warp_stalls else {},
         }
-    except Exception:
+    except subprocess.TimeoutExpired:
+        if verbose:
+            print(f"[Nsight] Profiling timed out ({timeout}s)")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"[Nsight] Profiling failed: {e}")
         return None
 
 

@@ -831,17 +831,20 @@ def eval_kernel_against_ref(
         nsight_profile = None
         try:
             if verbose:
-                print("[Eval] Attempting Nsight profiling for SOL / Roofline")
-            torch.cuda.synchronize(device=device)
-            set_seed(seed_num)
-            perf_inputs = get_inputs()
-            perf_inputs = [
-                _process_input_tensor(x, device, backend, precision)
-                for x in perf_inputs
-            ]
-            perf_model = custom_model.to(device=device, dtype=precision)
+                print(
+                    "[Eval] Attempting Nsight profiling for SOL / Roofline (subprocess)"
+                )
+            precision_str = {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(
+                precision, "fp32"
+            )
             nsight_profile = extended_metrics.profile_kernel_with_nsight(
-                perf_model, perf_inputs, device
+                custom_model_src=custom_model_src,
+                ref_model_src=original_model_src,
+                device=device,
+                backend=backend,
+                precision=precision_str,
+                build_dir=build_dir,
+                verbose=verbose,
             )
             if nsight_profile and verbose:
                 print(
@@ -1348,4 +1351,3 @@ def check_metadata_serializable_all_types(metadata: dict):
 # fetch_kernel_from_database("kernelbench_prompt_v2_level_2", 1, 1, "http://localhost:9091")
 # print(fetch_ref_arch_from_level_problem_id("2", 1, with_name=True))
 # Note: fetch_baseline_time is available in kernelbench.timing module
-
