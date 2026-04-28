@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from pydantic import BaseModel
 
-from . import timing, dataset
+from . import timing, dataset, extended_metrics
 
 REPO_TOP_PATH = os.path.abspath(
     os.path.join(
@@ -119,6 +119,25 @@ class KernelExecResult(BaseModel):
     # could do eager for level 1 and compile for level 2 and 3
     ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
     ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
+
+    # ── Extended metrics (populated when measure_performance=True) ──
+    # GPU Memory Efficiency
+    memory_stats: dict = {}  # peak_memory_bytes, ref_peak_memory_bytes, memory_ratio
+
+    # Continuous Numerical Precision (populated even for correct kernels)
+    numerical_precision: dict = {}  # max_abs_error, mean_abs_error, max_rel_error, mean_rel_error
+
+    # Kernel Launch Count / Fusion Quality
+    kernel_launch_stats: dict = {}  # num_kernels, ref_num_kernels, fusion_ratio, kernel_breakdown
+
+    # SOL (Speed-of-Light) Score
+    sol_stats: dict = {}  # sol_score, arithmetic_intensity, achieved_bandwidth_gbps, achieved_gflops, bottleneck
+
+    # Energy Efficiency
+    energy_stats: dict = {}  # energy_mj, ref_energy_mj, energy_ratio, avg_power_w
+
+    # Roofline / Occupancy
+    roofline_stats: dict = {}  # roofline_efficiency, occupancy_pct, memory_throughput_pct, compute_throughput_pct
 
 
 def load_original_model_and_inputs(
@@ -610,6 +629,18 @@ def eval_kernel_against_ref(
             compiled=True, correctness=False, metadata=metadata
         )
 
+    # ── Collect continuous numerical precision metrics from correctness trials ──
+    if kernel_exec_result and kernel_exec_result.correctness:
+        accum = kernel_exec_result.metadata.get("_precision_metrics_accum")
+        if accum:
+            kernel_exec_result.numerical_precision = {
+                "max_abs_error": accum.get("max_abs_error", 0.0),
+                "mean_abs_error": accum.get("mean_abs_error", 0.0),
+                "max_rel_error": accum.get("max_rel_error", 0.0),
+                "mean_rel_error": accum.get("mean_rel_error", 0.0),
+            }
+        kernel_exec_result.metadata.pop("_precision_metrics_accum", None)
+
     # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
     if measure_performance:
         try:
@@ -620,13 +651,11 @@ def eval_kernel_against_ref(
                 torch.cuda.synchronize(device=device)
                 set_seed(seed_num)
                 inputs = get_inputs()
-                # Convert inputs for performance measurement
                 inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
                 
                 model_new = custom_model.to(device=device, dtype=precision)
                 torch.cuda.synchronize(device=device)
 
-                # support multiple timing backend
                 timing_fn = timing.get_timing_function(timing_method)
                 elapsed_times = timing_fn(
                     model_new,
@@ -642,22 +671,52 @@ def eval_kernel_against_ref(
                 kernel_exec_result.runtime = runtime_stats["mean"]
                 kernel_exec_result.runtime_stats = runtime_stats
 
+                # ── Extended Metric 1: GPU Memory Efficiency ──
+                try:
+                    if verbose:
+                        print("[Eval] Measuring GPU Memory Efficiency")
+                    custom_mem = extended_metrics.measure_memory(model_new, inputs, device)
+                    ref_mem = extended_metrics.measure_memory(original_model, inputs, device)
+                    kernel_exec_result.memory_stats = extended_metrics.compute_memory_stats(custom_mem, ref_mem)
+                except Exception as e:
+                    if verbose:
+                        print(f"[Eval] Memory measurement failed: {e}")
+                    kernel_exec_result.memory_stats = {"error": str(e)}
+
+                # ── Extended Metric 2: Kernel Launch Count / Fusion ──
+                try:
+                    if verbose:
+                        print("[Eval] Measuring Kernel Launch Count / Fusion")
+                    custom_launches = extended_metrics.measure_kernel_launches(model_new, inputs, device)
+                    ref_launches = extended_metrics.measure_kernel_launches(original_model, inputs, device)
+                    kernel_exec_result.kernel_launch_stats = extended_metrics.compute_kernel_launch_stats(custom_launches, ref_launches)
+                except Exception as e:
+                    if verbose:
+                        print(f"[Eval] Kernel launch measurement failed: {e}")
+                    kernel_exec_result.kernel_launch_stats = {"error": str(e)}
+
+                # ── Extended Metric 3: Energy Efficiency ──
+                try:
+                    if verbose:
+                        print("[Eval] Measuring Energy Efficiency")
+                    custom_energy = extended_metrics.measure_energy(model_new, inputs, device, num_trials=50)
+                    ref_energy = extended_metrics.measure_energy(original_model, inputs, device, num_trials=50)
+                    kernel_exec_result.energy_stats = extended_metrics.compute_energy_stats(custom_energy, ref_energy)
+                except Exception as e:
+                    if verbose:
+                        print(f"[Eval] Energy measurement failed: {e}")
+                    kernel_exec_result.energy_stats = {"error": str(e)}
+
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
             kernel_exec_result.metadata["error_during_performance"] = e
 
-    # To get base PyTorch time (eager, various compile modes)
-    # please use timing.measure_ref_program_time()   
-
-
     ###############################################################
-    # [Experimental] to be modularized
-    # Condition: custom kernel ModelNew is correct and we are able to time it correctly with kernel_exec_result
-    # We are working on preventing excessive speedup issues
+    # Excessive speedup check + reference timing + SOL/roofline
     ##############################################################
 
-    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
+    if measure_performance and check_for_excessive_speedup:
     
         if verbose:
             print("[Eval] Additional checks to flag excessive speedup")
@@ -665,18 +724,15 @@ def eval_kernel_against_ref(
         torch.cuda.synchronize(device=device)
         set_seed(seed_num)
         inputs = get_inputs()
-        # Convert inputs for performance measurement
         inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
         
         model_new = custom_model.to(device=device, dtype=precision)
         torch.cuda.synchronize(device=device)
 
-        # time PyTorch reference function
-        # same timing_fn as specified from before
         timing_fn = timing.get_timing_function(timing_method)
         reference_elapsed_times = timing_fn(
             original_model,
-            inputs, # ideally cloned for extra safety but handled already in correctness check
+            inputs,
             num_trials=num_perf_trials,
             verbose=verbose,
             device=device,
@@ -685,20 +741,49 @@ def eval_kernel_against_ref(
         kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
         kernel_exec_result.ref_runtime_stats = reference_runtime_stats
 
-        # Compute Effective Speedup
         effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
-
-        # TODO: integrate SoL estimation for each unique program on designated hardware
-        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
 
         if verbose:
             print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
 
         if effective_speedup > excessive_speedup_threshold:
             kernel_exec_result.metadata["excessive_speedup"] = True
-            
             print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
             print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+
+        # ── Extended Metrics 4 & 5: SOL Score + Roofline (Nsight with fallback) ──
+        nsight_profile = None
+        try:
+            if verbose:
+                print("[Eval] Attempting Nsight profiling for SOL / Roofline")
+            torch.cuda.synchronize(device=device)
+            set_seed(seed_num)
+            perf_inputs = get_inputs()
+            perf_inputs = [_process_input_tensor(x, device, backend, precision) for x in perf_inputs]
+            perf_model = custom_model.to(device=device, dtype=precision)
+            nsight_profile = extended_metrics.profile_kernel_with_nsight(perf_model, perf_inputs, device)
+            if nsight_profile and verbose:
+                print(f"[Eval] Nsight profiling succeeded: occupancy={nsight_profile.get('occupancy_pct')}%, "
+                      f"DRAM util={nsight_profile.get('dram_utilization_pct')}%")
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Nsight profiling failed (will use heuristic fallback): {e}")
+
+        if nsight_profile:
+            kernel_exec_result.sol_stats = extended_metrics.compute_sol_score_from_nsight(nsight_profile)
+            kernel_exec_result.roofline_stats = extended_metrics.compute_roofline_stats_from_nsight(nsight_profile)
+        else:
+            if verbose:
+                print("[Eval] Using heuristic fallback for SOL / Roofline")
+            kernel_exec_result.sol_stats = extended_metrics.compute_sol_score_heuristic(
+                runtime_ms=kernel_exec_result.runtime,
+                ref_runtime_ms=kernel_exec_result.ref_runtime,
+                device=device,
+            )
+            kernel_exec_result.roofline_stats = extended_metrics.compute_roofline_stats_heuristic(
+                runtime_ms=kernel_exec_result.runtime,
+                device=device,
+            )
 
 
     graceful_eval_cleanup(context, device, tempfile)
@@ -734,6 +819,7 @@ def _compare_outputs(output, output_new, tolerance):
     """
     Compare model outputs that may be single tensors or tuples/lists of tensors.
     Returns (match: bool, mismatch_details: dict).
+    Precision metrics are always populated in details under 'precision_metrics'.
     """
     if isinstance(output, (tuple, list)):
         if not isinstance(output_new, (tuple, list)):
@@ -746,11 +832,23 @@ def _compare_outputs(output, output_new, tolerance):
             }
         all_match = True
         details = {}
+        combined_precision = {"max_abs_error": 0.0, "mean_abs_error": 0.0, "max_rel_error": 0.0, "mean_rel_error": 0.0, "num_elements": 0}
         for i, (o, o_new) in enumerate(zip(output, output_new)):
             match_i, details_i = _compare_outputs(o, o_new, tolerance)
             if not match_i:
                 all_match = False
-                details[f"element_{i}"] = details_i
+                details[f"element_{i}"] = {k: v for k, v in details_i.items() if k != "precision_metrics"}
+            pm = details_i.get("precision_metrics")
+            if pm:
+                combined_precision["max_abs_error"] = max(combined_precision["max_abs_error"], pm.get("max_abs_error", 0.0))
+                combined_precision["max_rel_error"] = max(combined_precision["max_rel_error"], pm.get("max_rel_error", 0.0))
+                n_old = combined_precision["num_elements"]
+                n_new = pm.get("num_elements", 0)
+                if n_old + n_new > 0:
+                    combined_precision["mean_abs_error"] = (combined_precision["mean_abs_error"] * n_old + pm.get("mean_abs_error", 0.0) * n_new) / (n_old + n_new)
+                    combined_precision["mean_rel_error"] = (combined_precision["mean_rel_error"] * n_old + pm.get("mean_rel_error", 0.0) * n_new) / (n_old + n_new)
+                combined_precision["num_elements"] = n_old + n_new
+        details["precision_metrics"] = combined_precision
         return all_match, details
 
     if isinstance(output, torch.Tensor):
@@ -764,24 +862,37 @@ def _compare_outputs(output, output_new, tolerance):
             }
         if output.dtype == torch.bool or output_new.dtype == torch.bool:
             if torch.equal(output, output_new):
-                return True, {}
+                return True, {"precision_metrics": {"max_abs_error": 0.0, "mean_abs_error": 0.0, "max_rel_error": 0.0, "mean_rel_error": 0.0, "num_elements": output.numel()}}
             diff_count = (output != output_new).sum().item()
-            return False, {"bool_mismatch_count": diff_count}
+            return False, {"bool_mismatch_count": diff_count, "precision_metrics": {"max_abs_error": 1.0, "mean_abs_error": diff_count / max(output.numel(), 1), "max_rel_error": 1.0, "mean_rel_error": diff_count / max(output.numel(), 1), "num_elements": output.numel()}}
         out_f = output.float()
         out_new_f = output_new.float()
+        abs_diff = torch.abs(out_f - out_new_f)
+        max_diff = abs_diff.max().item()
+        avg_diff = abs_diff.mean().item()
+        denom = torch.abs(out_f).clamp(min=1e-12)
+        rel_diff = abs_diff / denom
+        max_rel = rel_diff.max().item()
+        mean_rel = rel_diff.mean().item()
+        precision_metrics = {
+            "max_abs_error": max_diff,
+            "mean_abs_error": avg_diff,
+            "max_rel_error": max_rel,
+            "mean_rel_error": mean_rel,
+            "num_elements": output.numel(),
+        }
         if torch.allclose(out_f, out_new_f, atol=tolerance, rtol=tolerance):
-            return True, {}
-        max_diff = torch.max(torch.abs(out_f - out_new_f)).item()
-        avg_diff = torch.mean(torch.abs(out_f - out_new_f)).item()
+            return True, {"precision_metrics": precision_metrics}
         return False, {
             "max_difference": f"{max_diff:.6f}",
             "avg_difference": f"{avg_diff:.6f}",
+            "precision_metrics": precision_metrics,
         }
 
     # Scalar or other non-tensor type
     if output == output_new:
-        return True, {}
-    return False, {"value_mismatch": f"Expected {output}, got {output_new}"}
+        return True, {"precision_metrics": {"max_abs_error": 0.0, "mean_abs_error": 0.0, "max_rel_error": 0.0, "mean_rel_error": 0.0, "num_elements": 1}}
+    return False, {"value_mismatch": f"Expected {output}, got {output_new}", "precision_metrics": {"max_abs_error": float("inf"), "mean_abs_error": float("inf"), "max_rel_error": float("inf"), "mean_rel_error": float("inf"), "num_elements": 1}}
 
 
 def run_and_check_correctness(
@@ -850,6 +961,21 @@ def run_and_check_correctness(
                 match, mismatch_details = _compare_outputs(
                     output, output_new, tolerance
                 )
+
+                pm = mismatch_details.get("precision_metrics")
+                if pm:
+                    existing_pm = metadata.get("_precision_metrics_accum")
+                    if existing_pm is None:
+                        metadata["_precision_metrics_accum"] = dict(pm)
+                    else:
+                        existing_pm["max_abs_error"] = max(existing_pm.get("max_abs_error", 0.0), pm.get("max_abs_error", 0.0))
+                        existing_pm["max_rel_error"] = max(existing_pm.get("max_rel_error", 0.0), pm.get("max_rel_error", 0.0))
+                        n_old = existing_pm.get("num_elements", 0)
+                        n_new = pm.get("num_elements", 0)
+                        if n_old + n_new > 0:
+                            existing_pm["mean_abs_error"] = (existing_pm.get("mean_abs_error", 0.0) * n_old + pm.get("mean_abs_error", 0.0) * n_new) / (n_old + n_new)
+                            existing_pm["mean_rel_error"] = (existing_pm.get("mean_rel_error", 0.0) * n_old + pm.get("mean_rel_error", 0.0) * n_new) / (n_old + n_new)
+                        existing_pm["num_elements"] = n_old + n_new
 
                 if match:
                     pass_count += 1

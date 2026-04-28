@@ -261,6 +261,29 @@ def analyze_greedy_eval(run_name, hardware, baseline, level,
             "averages": pass_at_k_results.get("averages", {})
         }
 
+    # ── Extended metrics analysis (if available in eval results) ──
+    from kernelbench.score import (
+        memory_efficiency_score,
+        energy_efficiency_score,
+        fusion_quality_score,
+        numerical_precision_score,
+        sol_score_aggregate,
+    )
+    correct_entries = [v for v in eval_results.values() if v.get("correctness")]
+    if correct_entries and any(v.get("memory_stats") for v in correct_entries):
+        ext_metrics = {}
+        ext_metrics["memory_efficiency"] = memory_efficiency_score(correct_entries)
+        ext_metrics["energy_efficiency"] = energy_efficiency_score(correct_entries)
+        ext_metrics["fusion_quality"] = fusion_quality_score(correct_entries)
+        ext_metrics["numerical_precision"] = numerical_precision_score(correct_entries)
+        ext_metrics["sol_score"] = sol_score_aggregate(correct_entries)
+        results["extended_metrics"] = ext_metrics
+
+        print("\nExtended Metrics:")
+        for name, vals in ext_metrics.items():
+            if vals.get("n", 0) > 0:
+                print(f"  {name}: {vals}")
+
     return results
 
 

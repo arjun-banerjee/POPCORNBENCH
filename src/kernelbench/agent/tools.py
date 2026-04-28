@@ -281,11 +281,19 @@ class RunCorrectnessTool(Tool):
         trials_str = result.metadata.get("correctness_trials", "?")
 
         if result.correctness:
+            lines = [f"run_correctness PASSED: {trials_str} trials all matched the reference."]
+            if result.numerical_precision:
+                np_stats = result.numerical_precision
+                lines.append(
+                    f"Numerical precision: max_abs_err={np_stats.get('max_abs_error', 0):.2e}  "
+                    f"mean_abs_err={np_stats.get('mean_abs_error', 0):.2e}  "
+                    f"max_rel_err={np_stats.get('max_rel_error', 0):.2e}"
+                )
             return ToolResult(
                 tool_name=self.name,
                 success=True,
-                output=f"run_correctness PASSED: {trials_str} trials all matched the reference.",
-                metadata={"compiled": True, "correctness": True},
+                output="\n".join(lines),
+                metadata={"compiled": True, "correctness": True, "numerical_precision": result.numerical_precision},
             )
 
         # Failure path: report the first failing trial and any numeric diffs.
@@ -660,6 +668,44 @@ class SubmitKernelTool(Tool):
                     f"median={_fmt(stats.get('median'))}μs  "
                     f"std={_fmt(stats.get('std'))}μs"
                 )
+
+        # ── Extended metrics summary ──
+        if result.numerical_precision:
+            np_stats = result.numerical_precision
+            lines.append(
+                f"Numerical precision: max_abs_err={np_stats.get('max_abs_error', '?'):.2e}  "
+                f"mean_abs_err={np_stats.get('mean_abs_error', '?'):.2e}  "
+                f"max_rel_err={np_stats.get('max_rel_error', '?'):.2e}"
+            )
+
+        if result.memory_stats and result.memory_stats.get("peak_memory_mb"):
+            mem = result.memory_stats
+            lines.append(
+                f"Memory: {mem.get('peak_memory_mb', '?')} MB peak "
+                f"(ref: {mem.get('ref_peak_memory_mb', '?')} MB, "
+                f"ratio: {mem.get('memory_ratio', '?')}x)"
+            )
+
+        if result.kernel_launch_stats and result.kernel_launch_stats.get("num_kernels", -1) > 0:
+            kl = result.kernel_launch_stats
+            lines.append(
+                f"Kernel launches: {kl.get('num_kernels', '?')} "
+                f"(ref: {kl.get('ref_num_kernels', '?')}, "
+                f"fusion ratio: {kl.get('fusion_ratio', '?')})"
+            )
+
+        if result.energy_stats and result.energy_stats.get("energy_per_run_mj", -1) > 0:
+            en = result.energy_stats
+            lines.append(
+                f"Energy: {en.get('energy_per_run_mj', '?')} mJ/run "
+                f"(ref: {en.get('ref_energy_per_run_mj', '?')} mJ, "
+                f"ratio: {en.get('energy_ratio', '?')}x)"
+            )
+
+        if result.sol_stats and result.sol_stats.get("sol_score", -1) >= 0:
+            sol = result.sol_stats
+            lines.append(f"SOL score: {sol.get('sol_score', '?')}")
+
         if result.metadata.get("excessive_speedup"):
             lines.append(
                 "Flagged for excessive speedup — this submission may have "
