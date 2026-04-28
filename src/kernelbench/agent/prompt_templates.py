@@ -448,7 +448,12 @@ Your submission is a complete Python file that defines a class called \
 
 Use `torch.utils.cpp_extension.load_inline` to compile and bind CUDA source at \
 module load time, then call the compiled extension from `ModelNew.forward`. Do \
-not submit raw CUDA C or a standalone .cu file."""
+not submit raw CUDA C or a standalone .cu file.
+
+DO NOT write your own `PYBIND11_MODULE(...)` block in `cpp_sources`. \
+`load_inline` auto-generates one from the `functions=[...]` argument; including \
+your own causes a duplicate-symbol redefinition error at compile time. List the \
+host-side wrapper function names in `functions=[...]` instead."""
 
 
 def _output_format_triton() -> str:
