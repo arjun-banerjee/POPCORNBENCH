@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 from pydantic import BaseModel
 
-from . import timing, dataset
+from . import timing, dataset, extended_metrics
 
 REPO_TOP_PATH = os.path.abspath(
     os.path.join(
@@ -39,7 +39,9 @@ def get_error_name(e: Exception) -> str:
     return f"{e.__class__.__module__}.{e.__class__.__name__}"
 
 
-def fetch_ref_arch_from_problem_id(problem_id: int, dataset: "BaseDataset", with_name=False) -> Union[str, tuple[str, str]]:
+def fetch_ref_arch_from_problem_id(
+    problem_id: int, dataset: "BaseDataset", with_name=False
+) -> Union[str, tuple[str, str]]:
     """
     Fetches the reference architecture for a given problem_id from the dataset.
     """
@@ -48,7 +50,7 @@ def fetch_ref_arch_from_problem_id(problem_id: int, dataset: "BaseDataset", with
 
     problem = dataset.get_problem_by_id(problem_id)
     ref_arch = problem.code
-    
+
     if not with_name:
         return ref_arch
     else:
@@ -67,6 +69,7 @@ def set_seed(seed: int):
     # NOTE: this only sets on current cuda device
     torch.cuda.manual_seed(seed)
 
+
 def get_torch_dtype_from_string(precision: str) -> torch.dtype:
     """
     Get the torch dtype for specific precision
@@ -77,13 +80,14 @@ def get_torch_dtype_from_string(precision: str) -> torch.dtype:
         return torch.float16
     elif precision == "bf16":
         return torch.bfloat16
-    else: # future, FP8, FP4, etc. support?
+    else:  # future, FP8, FP4, etc. support?
         raise ValueError(f"Invalid precision not supported: {precision}")
+
 
 def get_tolerance_for_precision(precision: str | torch.dtype) -> float:
     """
     Get the tolerance from a string representing the percision.
-    These tolerances are inspired by torchbench (PyTorch Benchmarking Suite): 
+    These tolerances are inspired by torchbench (PyTorch Benchmarking Suite):
     Reference:
     https://github.com/pytorch/benchmark/blob/cfd835c35d04513ced9a59bd074eeb21dc8187d7/torchbenchmark/util/env_check.py#L519
     """
@@ -93,23 +97,26 @@ def get_tolerance_for_precision(precision: str | torch.dtype) -> float:
     PRECISION_TOLERANCES = {
         # By default for fp32, 1e-4 is used according to torchbench.
         torch.float32: 1e-4,
-        # torchbench states for bf16 and fp16, use 1e-3 as tolerance and 1e-2 if it's too strict. 
+        # torchbench states for bf16 and fp16, use 1e-3 as tolerance and 1e-2 if it's too strict.
         # @todo: Let user configure own tolerance as an option
-        torch.float16: 1e-2, 
+        torch.float16: 1e-2,
         torch.bfloat16: 1e-2,
     }
-    assert precision in PRECISION_TOLERANCES, f"Invalid precision not supported: {precision}"
+    assert precision in PRECISION_TOLERANCES, (
+        f"Invalid precision not supported: {precision}"
+    )
     return PRECISION_TOLERANCES[precision]
-    
+
 
 class KernelExecResult(BaseModel):
     """
     Single Kernel Execution
     """
+
     # Execution
     compiled: bool = False
     correctness: bool = False
-    metadata: dict = {} # NOTE: to include warning if any
+    metadata: dict = {}  # NOTE: to include warning if any
 
     # Timing
     runtime: float = -1.0  # in us, only recorded if we decide to measure performance
@@ -117,8 +124,10 @@ class KernelExecResult(BaseModel):
 
     # new: added ref time either through fetching prev runs or through execution
     # could do eager for level 1 and compile for level 2 and 3
-    ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
-    ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
+    ref_runtime: float = (
+        -1.0
+    )  # in us, only recorded if we decide to measure performance
+    ref_runtime_stats: dict = {}  # only recorded if we decide to measure performance
 
     # Translation mode: timing of the source-DSL implementation that the
     # candidate was translated from. Only populated when source_kernel_src and
@@ -127,6 +136,25 @@ class KernelExecResult(BaseModel):
     source_runtime_stats: dict = {}
     source_backend: Optional[str] = None
     speedup_vs_source: float = -1.0
+
+    # ── Extended metrics (populated when measure_performance=True) ──
+    # GPU Memory Efficiency
+    memory_stats: dict = {}  # peak_memory_bytes, ref_peak_memory_bytes, memory_ratio
+
+    # Continuous Numerical Precision (populated even for correct kernels)
+    numerical_precision: dict = {}  # max_abs_error, mean_abs_error, max_rel_error, mean_rel_error
+
+    # Kernel Launch Count / Fusion Quality
+    kernel_launch_stats: dict = {}  # num_kernels, ref_num_kernels, fusion_ratio, kernel_breakdown
+
+    # SOL (Speed-of-Light) Score
+    sol_stats: dict = {}  # sol_score, arithmetic_intensity, achieved_bandwidth_gbps, achieved_gflops, bottleneck
+
+    # Energy Efficiency
+    energy_stats: dict = {}  # energy_mj, ref_energy_mj, energy_ratio, avg_power_w
+
+    # Roofline / Occupancy
+    roofline_stats: dict = {}  # roofline_efficiency, occupancy_pct, memory_throughput_pct, compute_throughput_pct
 
 
 def load_original_model_and_inputs(
@@ -200,7 +228,7 @@ def load_custom_model(
         context["BUILD_DIRECTORY"] = build_directory
         # Add import at the start of the source code
         model_custom_src = (
-            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
+            f"import os\nos.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
         ) + model_custom_src
 
     try:
@@ -346,7 +374,7 @@ def build_compile_cache_with_capturing(
     if build_dir:
         # Add import at the start of the source code
         custom_model_src = (
-            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
+            f"import os\nos.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
         ) + custom_model_src
 
     kernel_hash = hash(custom_model_src)
@@ -378,23 +406,23 @@ def build_compile_cache_with_capturing(
 def _process_input_tensor(input, device, backend="cuda", precision=torch.float32):
     """
     Helper function to move tensors to the correct device and apply backend-specific dtype casting.
-    
+
     Args:
         input: Input tensor or non-tensor value
         device: Target CUDA device
         backend: Backend type (e.g., 'cuda', 'triton', 'cute')
-        precision: torch.dtype 
+        precision: torch.dtype
     Returns:
         Processed tensor on correct device with correct dtype, or original value if not a tensor
     """
 
-    # sometimes things like init inputs are floats (like in the case of labels / targets, classification losses, etc.) 
+    # sometimes things like init inputs are floats (like in the case of labels / targets, classification losses, etc.)
     if not isinstance(input, torch.Tensor):
         return input
-    
+
     # cast to the desired percision dtype for activations
     input_tensor = input.to(dtype=precision)
-    
+
     # Default for all other backends and float types
     return input_tensor.to(device=device)
 
@@ -406,7 +434,7 @@ def eval_kernel_against_ref(
     num_correct_trials: int = 1,
     num_perf_trials: int = 10,
     measure_performance: bool = False,
-    timing_method: str = "cuda_event", # see timing.py
+    timing_method: str = "cuda_event",  # see timing.py
     verbose: bool = False,
     build_dir: os.PathLike = None,
     device: Union[torch.device, int] = (
@@ -414,21 +442,19 @@ def eval_kernel_against_ref(
     ),  # have to run on GPU
     backend: str = "cuda",  # can be 'cuda', 'triton', 'tilelang', or 'cute'
     precision: torch.dtype = torch.float32,
-
     # Translation mode: when both are provided, also compile + time the source
     # kernel and report speedup_vs_source on the result. The source kernel must
     # implement ModelNew using the same Model interface as the PyTorch reference.
     source_kernel_src: Optional[str] = None,
     source_backend: Optional[str] = None,
-
     # Guard against potential reward hacking [optional but ongoing enhancement]
     check_for_excessive_speedup: bool = True,
-    excessive_speedup_threshold: float = 10, # flag if the kernel is more than <excessive_speedup_threshold>x faster than the reference
+    excessive_speedup_threshold: float = 10,  # flag if the kernel is more than <excessive_speedup_threshold>x faster than the reference
 ) -> KernelExecResult:
     """
     Evaluate the custom kernel against the original model
 
-    NOTE: we are thinking about refactor this to be more modularized 
+    NOTE: we are thinking about refactor this to be more modularized
     and we can add more checks as our other ongiong PRs are working on
 
     num_correct_trials: number of trials to initialize different random inputs; correctness pass only if all trials pass
@@ -436,15 +462,16 @@ def eval_kernel_against_ref(
     device: GPU (cuda) device to run the evalutation on
     backend: str, one of 'cuda', 'triton', 'tilelang', or 'cute'
     precision: torch.dtype for computation (note: tilelang only supports fp16)
-    timing_method: str, method to time kernel, see timing.py for more details 
+    timing_method: str, method to time kernel, see timing.py for more details
 
     ONGOING EFFORT to refactor and modularize this, and adding more tests for eval.
     """
     # TODO: check device is busy
     assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
-    
+
     # Backend-GPU vendor validation
     from .utils import get_gpu_vendor
+
     vendor = get_gpu_vendor(device)
     backend_lower = backend.lower()
     # HIP is AMD-only
@@ -456,11 +483,16 @@ def eval_kernel_against_ref(
     # NKI targets AWS Trainium/Inferentia — cannot run on standard CUDA/AMD GPUs
     if backend_lower == "nki":
         import warnings
-        warnings.warn("NKI backend targets AWS Trainium/Inferentia. Compilation check only on non-Neuron hardware.")
-    
+
+        warnings.warn(
+            "NKI backend targets AWS Trainium/Inferentia. Compilation check only on non-Neuron hardware."
+        )
+
     if backend_lower == "tilelang":
-        assert precision == torch.float16 or precision == torch.bfloat16, "TileLang only supports fp16 or bfloat16"
-    
+        assert precision == torch.float16 or precision == torch.bfloat16, (
+            "TileLang only supports fp16 or bfloat16"
+        )
+
     torch.set_printoptions(
         precision=4,  # Decimal places
         threshold=10,  # Total number of elements before truncating
@@ -470,12 +502,21 @@ def eval_kernel_against_ref(
 
     # set CUDA device
     torch.cuda.set_device(device)
-    
+
     # Backends that use tempfile approach and need CUDA_VISIBLE_DEVICES
     # TileLang, Triton, and CuTe all use tempfile for proper module loading
     # Helion, NKI, Pallas, Numba, and Mojo also need tempfile for JIT decorators / imports
-    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute", "helion", "nki", "pallas", "numba", "mojo"]
-    
+    uses_tempfile = backend.lower() in [
+        "triton",
+        "tilelang",
+        "cute",
+        "helion",
+        "nki",
+        "pallas",
+        "numba",
+        "mojo",
+    ]
+
     metadata = {}  # for storing result metadata
     metadata["hardware"] = torch.cuda.get_device_name(device=device)
     metadata["device"] = str(device)  # for debugging
@@ -485,9 +526,9 @@ def eval_kernel_against_ref(
         if isinstance(device, int):
             device_num = device
         elif isinstance(device, torch.device):
-            assert (
-                device.type == "cuda"
-            ), "CUDA is not availible on device, cannot run Eval"
+            assert device.type == "cuda", (
+                "CUDA is not availible on device, cannot run Eval"
+            )
             device_num = device.index
         else:
             raise ValueError(
@@ -509,17 +550,19 @@ def eval_kernel_against_ref(
     )
     set_seed(seed_num)  # set seed for reproducible input
     init_inputs = get_init_inputs()
-    
+
     # Convert inputs to appropriate dtypes for GPU computation
-    init_inputs = [_process_input_tensor(x, device, backend, precision) for x in init_inputs]
-    
+    init_inputs = [
+        _process_input_tensor(x, device, backend, precision) for x in init_inputs
+    ]
+
     with torch.no_grad():
         set_seed(seed_num)  # set seed for reproducible weights
         original_model = Model(*init_inputs)
         assert hasattr(original_model, "forward")
         if verbose:
             print("[Eval] Original Model Loaded")
-    
+
     if verbose:
         print("[Eval] Loading and Compiling New Model with Custom CUDA Kernel")
 
@@ -528,9 +571,18 @@ def eval_kernel_against_ref(
         os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
         tempfile = None
         # add hash for later to distinguish between multi-turn kernels
-        
+
         backend_lower = backend.lower()
-        tempfile_backends = ["triton", "tilelang", "cute", "helion", "nki", "pallas", "numba", "mojo"]
+        tempfile_backends = [
+            "triton",
+            "tilelang",
+            "cute",
+            "helion",
+            "nki",
+            "pallas",
+            "numba",
+            "mojo",
+        ]
         if backend_lower in tempfile_backends:
             # Use tempfile approach for DSLs that require proper module import
             # for JIT decorators / special imports to work
@@ -569,11 +621,11 @@ def eval_kernel_against_ref(
             "Failed to load custom model: Syntax error or ModelNew not found in generated code. Record as compilation failure."
         )
         metadata["compilation_error_name"] = "SyntaxError"
-        metadata["compilation_error"] = "Syntax error in custom generated code or ModelNew not found"
+        metadata["compilation_error"] = (
+            "Syntax error in custom generated code or ModelNew not found"
+        )
         graceful_eval_cleanup(context, device, tempfile)
-        return KernelExecResult(
-            compiled=False, metadata=metadata
-        )  # skip further steps
+        return KernelExecResult(compiled=False, metadata=metadata)  # skip further steps
 
     # at this point we passed compilation
     try:
@@ -624,6 +676,18 @@ def eval_kernel_against_ref(
             compiled=True, correctness=False, metadata=metadata
         )
 
+    # ── Collect continuous numerical precision metrics from correctness trials ──
+    if kernel_exec_result and kernel_exec_result.correctness:
+        accum = kernel_exec_result.metadata.get("_precision_metrics_accum")
+        if accum:
+            kernel_exec_result.numerical_precision = {
+                "max_abs_error": accum.get("max_abs_error", 0.0),
+                "mean_abs_error": accum.get("mean_abs_error", 0.0),
+                "max_rel_error": accum.get("max_rel_error", 0.0),
+                "mean_rel_error": accum.get("mean_rel_error", 0.0),
+            }
+        kernel_exec_result.metadata.pop("_precision_metrics_accum", None)
+
     # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
     if measure_performance:
         try:
@@ -634,13 +698,13 @@ def eval_kernel_against_ref(
                 torch.cuda.synchronize(device=device)
                 set_seed(seed_num)
                 inputs = get_inputs()
-                # Convert inputs for performance measurement
-                inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
-                
+                inputs = [
+                    _process_input_tensor(x, device, backend, precision) for x in inputs
+                ]
+
                 model_new = custom_model.to(device=device, dtype=precision)
                 torch.cuda.synchronize(device=device)
 
-                # support multiple timing backend
                 timing_fn = timing.get_timing_function(timing_method)
                 elapsed_times = timing_fn(
                     model_new,
@@ -656,64 +720,161 @@ def eval_kernel_against_ref(
                 kernel_exec_result.runtime = runtime_stats["mean"]
                 kernel_exec_result.runtime_stats = runtime_stats
 
+                # ── Extended Metric 1: GPU Memory Efficiency ──
+                try:
+                    if verbose:
+                        print("[Eval] Measuring GPU Memory Efficiency")
+                    custom_mem = extended_metrics.measure_memory(
+                        model_new, inputs, device
+                    )
+                    ref_mem = extended_metrics.measure_memory(
+                        original_model, inputs, device
+                    )
+                    kernel_exec_result.memory_stats = (
+                        extended_metrics.compute_memory_stats(custom_mem, ref_mem)
+                    )
+                except Exception as e:
+                    if verbose:
+                        print(f"[Eval] Memory measurement failed: {e}")
+                    kernel_exec_result.memory_stats = {"error": str(e)}
+
+                # ── Extended Metric 2: Kernel Launch Count / Fusion ──
+                try:
+                    if verbose:
+                        print("[Eval] Measuring Kernel Launch Count / Fusion")
+                    custom_launches = extended_metrics.measure_kernel_launches(
+                        model_new, inputs, device
+                    )
+                    ref_launches = extended_metrics.measure_kernel_launches(
+                        original_model, inputs, device
+                    )
+                    kernel_exec_result.kernel_launch_stats = (
+                        extended_metrics.compute_kernel_launch_stats(
+                            custom_launches, ref_launches
+                        )
+                    )
+                except Exception as e:
+                    if verbose:
+                        print(f"[Eval] Kernel launch measurement failed: {e}")
+                    kernel_exec_result.kernel_launch_stats = {"error": str(e)}
+
+                # ── Extended Metric 3: Energy Efficiency ──
+                try:
+                    if verbose:
+                        print("[Eval] Measuring Energy Efficiency")
+                    custom_energy = extended_metrics.measure_energy(
+                        model_new, inputs, device, num_trials=50
+                    )
+                    ref_energy = extended_metrics.measure_energy(
+                        original_model, inputs, device, num_trials=50
+                    )
+                    kernel_exec_result.energy_stats = (
+                        extended_metrics.compute_energy_stats(custom_energy, ref_energy)
+                    )
+                except Exception as e:
+                    if verbose:
+                        print(f"[Eval] Energy measurement failed: {e}")
+                    kernel_exec_result.energy_stats = {"error": str(e)}
+
         except Exception as e:
             if verbose:
                 print(f"[Eval] Error in Measuring Performance: {e}")
             kernel_exec_result.metadata["error_during_performance"] = e
 
-    # To get base PyTorch time (eager, various compile modes)
-    # please use timing.measure_ref_program_time()   
-
-
     ###############################################################
-    # [Experimental] to be modularized
-    # Condition: custom kernel ModelNew is correct and we are able to time it correctly with kernel_exec_result
-    # We are working on preventing excessive speedup issues
+    # Excessive speedup check + reference timing + SOL/roofline
     ##############################################################
 
-    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
-    
+    if measure_performance and check_for_excessive_speedup:
         if verbose:
             print("[Eval] Additional checks to flag excessive speedup")
 
         torch.cuda.synchronize(device=device)
         set_seed(seed_num)
         inputs = get_inputs()
-        # Convert inputs for performance measurement
         inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
-        
+
         model_new = custom_model.to(device=device, dtype=precision)
         torch.cuda.synchronize(device=device)
 
-        # time PyTorch reference function
-        # same timing_fn as specified from before
         timing_fn = timing.get_timing_function(timing_method)
         reference_elapsed_times = timing_fn(
             original_model,
-            inputs, # ideally cloned for extra safety but handled already in correctness check
+            inputs,
             num_trials=num_perf_trials,
             verbose=verbose,
             device=device,
         )
-        reference_runtime_stats = timing.get_timing_stats(reference_elapsed_times, device=device)
+        reference_runtime_stats = timing.get_timing_stats(
+            reference_elapsed_times, device=device
+        )
         kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
         kernel_exec_result.ref_runtime_stats = reference_runtime_stats
 
-        # Compute Effective Speedup
         effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
 
-        # TODO: integrate SoL estimation for each unique program on designated hardware
-        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
-
         if verbose:
-            print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
+            print(
+                f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}"
+            )
 
         if effective_speedup > excessive_speedup_threshold:
             kernel_exec_result.metadata["excessive_speedup"] = True
-            
-            print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
-            print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+            print(
+                f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected"
+            )
+            print(
+                f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking."
+            )
 
+        # ── Extended Metrics 4 & 5: SOL Score + Roofline (Nsight with fallback) ──
+        nsight_profile = None
+        try:
+            if verbose:
+                print("[Eval] Attempting Nsight profiling for SOL / Roofline")
+            torch.cuda.synchronize(device=device)
+            set_seed(seed_num)
+            perf_inputs = get_inputs()
+            perf_inputs = [
+                _process_input_tensor(x, device, backend, precision)
+                for x in perf_inputs
+            ]
+            perf_model = custom_model.to(device=device, dtype=precision)
+            nsight_profile = extended_metrics.profile_kernel_with_nsight(
+                perf_model, perf_inputs, device
+            )
+            if nsight_profile and verbose:
+                print(
+                    f"[Eval] Nsight profiling succeeded: occupancy={nsight_profile.get('occupancy_pct')}%, "
+                    f"DRAM util={nsight_profile.get('dram_utilization_pct')}%"
+                )
+        except Exception as e:
+            if verbose:
+                print(
+                    f"[Eval] Nsight profiling failed (will use heuristic fallback): {e}"
+                )
+
+        if nsight_profile:
+            kernel_exec_result.sol_stats = (
+                extended_metrics.compute_sol_score_from_nsight(nsight_profile)
+            )
+            kernel_exec_result.roofline_stats = (
+                extended_metrics.compute_roofline_stats_from_nsight(nsight_profile)
+            )
+        else:
+            if verbose:
+                print("[Eval] Using heuristic fallback for SOL / Roofline")
+            kernel_exec_result.sol_stats = extended_metrics.compute_sol_score_heuristic(
+                runtime_ms=kernel_exec_result.runtime,
+                ref_runtime_ms=kernel_exec_result.ref_runtime,
+                device=device,
+            )
+            kernel_exec_result.roofline_stats = (
+                extended_metrics.compute_roofline_stats_heuristic(
+                    runtime_ms=kernel_exec_result.runtime,
+                    device=device,
+                )
+            )
 
     # Translation mode: also time the source-DSL implementation so the result
     # carries speedup_vs_source alongside the existing speedup_vs_pytorch.
@@ -730,7 +891,14 @@ def eval_kernel_against_ref(
         try:
             source_backend_lower = source_backend.lower()
             source_uses_tempfile = source_backend_lower in [
-                "triton", "tilelang", "cute", "helion", "nki", "pallas", "numba", "mojo",
+                "triton",
+                "tilelang",
+                "cute",
+                "helion",
+                "nki",
+                "pallas",
+                "numba",
+                "mojo",
             ]
             if source_uses_tempfile:
                 SourceModel, source_tempfile = load_custom_model_with_tempfile(
@@ -832,6 +1000,7 @@ def _compare_outputs(output, output_new, tolerance):
     """
     Compare model outputs that may be single tensors or tuples/lists of tensors.
     Returns (match: bool, mismatch_details: dict).
+    Precision metrics are always populated in details under 'precision_metrics'.
     """
     if isinstance(output, (tuple, list)):
         if not isinstance(output_new, (tuple, list)):
@@ -844,11 +1013,41 @@ def _compare_outputs(output, output_new, tolerance):
             }
         all_match = True
         details = {}
+        combined_precision = {
+            "max_abs_error": 0.0,
+            "mean_abs_error": 0.0,
+            "max_rel_error": 0.0,
+            "mean_rel_error": 0.0,
+            "num_elements": 0,
+        }
         for i, (o, o_new) in enumerate(zip(output, output_new)):
             match_i, details_i = _compare_outputs(o, o_new, tolerance)
             if not match_i:
                 all_match = False
-                details[f"element_{i}"] = details_i
+                details[f"element_{i}"] = {
+                    k: v for k, v in details_i.items() if k != "precision_metrics"
+                }
+            pm = details_i.get("precision_metrics")
+            if pm:
+                combined_precision["max_abs_error"] = max(
+                    combined_precision["max_abs_error"], pm.get("max_abs_error", 0.0)
+                )
+                combined_precision["max_rel_error"] = max(
+                    combined_precision["max_rel_error"], pm.get("max_rel_error", 0.0)
+                )
+                n_old = combined_precision["num_elements"]
+                n_new = pm.get("num_elements", 0)
+                if n_old + n_new > 0:
+                    combined_precision["mean_abs_error"] = (
+                        combined_precision["mean_abs_error"] * n_old
+                        + pm.get("mean_abs_error", 0.0) * n_new
+                    ) / (n_old + n_new)
+                    combined_precision["mean_rel_error"] = (
+                        combined_precision["mean_rel_error"] * n_old
+                        + pm.get("mean_rel_error", 0.0) * n_new
+                    ) / (n_old + n_new)
+                combined_precision["num_elements"] = n_old + n_new
+        details["precision_metrics"] = combined_precision
         return all_match, details
 
     if isinstance(output, torch.Tensor):
@@ -862,24 +1061,71 @@ def _compare_outputs(output, output_new, tolerance):
             }
         if output.dtype == torch.bool or output_new.dtype == torch.bool:
             if torch.equal(output, output_new):
-                return True, {}
+                return True, {
+                    "precision_metrics": {
+                        "max_abs_error": 0.0,
+                        "mean_abs_error": 0.0,
+                        "max_rel_error": 0.0,
+                        "mean_rel_error": 0.0,
+                        "num_elements": output.numel(),
+                    }
+                }
             diff_count = (output != output_new).sum().item()
-            return False, {"bool_mismatch_count": diff_count}
+            return False, {
+                "bool_mismatch_count": diff_count,
+                "precision_metrics": {
+                    "max_abs_error": 1.0,
+                    "mean_abs_error": diff_count / max(output.numel(), 1),
+                    "max_rel_error": 1.0,
+                    "mean_rel_error": diff_count / max(output.numel(), 1),
+                    "num_elements": output.numel(),
+                },
+            }
         out_f = output.float()
         out_new_f = output_new.float()
+        abs_diff = torch.abs(out_f - out_new_f)
+        max_diff = abs_diff.max().item()
+        avg_diff = abs_diff.mean().item()
+        denom = torch.abs(out_f).clamp(min=1e-12)
+        rel_diff = abs_diff / denom
+        max_rel = rel_diff.max().item()
+        mean_rel = rel_diff.mean().item()
+        precision_metrics = {
+            "max_abs_error": max_diff,
+            "mean_abs_error": avg_diff,
+            "max_rel_error": max_rel,
+            "mean_rel_error": mean_rel,
+            "num_elements": output.numel(),
+        }
         if torch.allclose(out_f, out_new_f, atol=tolerance, rtol=tolerance):
-            return True, {}
-        max_diff = torch.max(torch.abs(out_f - out_new_f)).item()
-        avg_diff = torch.mean(torch.abs(out_f - out_new_f)).item()
+            return True, {"precision_metrics": precision_metrics}
         return False, {
             "max_difference": f"{max_diff:.6f}",
             "avg_difference": f"{avg_diff:.6f}",
+            "precision_metrics": precision_metrics,
         }
 
     # Scalar or other non-tensor type
     if output == output_new:
-        return True, {}
-    return False, {"value_mismatch": f"Expected {output}, got {output_new}"}
+        return True, {
+            "precision_metrics": {
+                "max_abs_error": 0.0,
+                "mean_abs_error": 0.0,
+                "max_rel_error": 0.0,
+                "mean_rel_error": 0.0,
+                "num_elements": 1,
+            }
+        }
+    return False, {
+        "value_mismatch": f"Expected {output}, got {output_new}",
+        "precision_metrics": {
+            "max_abs_error": float("inf"),
+            "mean_abs_error": float("inf"),
+            "max_rel_error": float("inf"),
+            "mean_rel_error": float("inf"),
+            "num_elements": 1,
+        },
+    }
 
 
 def run_and_check_correctness(
@@ -888,11 +1134,11 @@ def run_and_check_correctness(
     get_inputs_fn: callable,
     metadata: dict,
     num_correct_trials: int,
-    verbose: bool =False,
-    seed: int =42,
-    device: Optional[torch.device] =None,
-    backend: str ="cuda",
-    precision: torch.dtype =torch.float32,
+    verbose: bool = False,
+    seed: int = 42,
+    device: Optional[torch.device] = None,
+    backend: str = "cuda",
+    precision: torch.dtype = torch.float32,
 ) -> KernelExecResult:
     """
     run the model and check correctness,
@@ -912,9 +1158,7 @@ def run_and_check_correctness(
     ]
 
     with torch.no_grad():
-
         for trial in range(num_correct_trials):
-
             trial_seed = correctness_trial_seeds[trial]
             if verbose:
                 print(f"[Eval] Generating Random Input with seed {trial_seed}")
@@ -922,14 +1166,16 @@ def run_and_check_correctness(
             set_seed(trial_seed)
             inputs = get_inputs_fn()
             # Convert inputs to appropriate dtypes for GPU computation
-            inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+            inputs = [
+                _process_input_tensor(x, device, backend, precision) for x in inputs
+            ]
 
             set_seed(trial_seed)
-    
+
             model = original_model_instance.to(device=device, dtype=precision)
 
             set_seed(trial_seed)
-     
+
             model_new = new_model_instance.to(device=device, dtype=precision)
 
             # Re-seed so both forwards see the same RNG stream
@@ -948,6 +1194,33 @@ def run_and_check_correctness(
                 match, mismatch_details = _compare_outputs(
                     output, output_new, tolerance
                 )
+
+                pm = mismatch_details.get("precision_metrics")
+                if pm:
+                    existing_pm = metadata.get("_precision_metrics_accum")
+                    if existing_pm is None:
+                        metadata["_precision_metrics_accum"] = dict(pm)
+                    else:
+                        existing_pm["max_abs_error"] = max(
+                            existing_pm.get("max_abs_error", 0.0),
+                            pm.get("max_abs_error", 0.0),
+                        )
+                        existing_pm["max_rel_error"] = max(
+                            existing_pm.get("max_rel_error", 0.0),
+                            pm.get("max_rel_error", 0.0),
+                        )
+                        n_old = existing_pm.get("num_elements", 0)
+                        n_new = pm.get("num_elements", 0)
+                        if n_old + n_new > 0:
+                            existing_pm["mean_abs_error"] = (
+                                existing_pm.get("mean_abs_error", 0.0) * n_old
+                                + pm.get("mean_abs_error", 0.0) * n_new
+                            ) / (n_old + n_new)
+                            existing_pm["mean_rel_error"] = (
+                                existing_pm.get("mean_rel_error", 0.0) * n_old
+                                + pm.get("mean_rel_error", 0.0) * n_new
+                            ) / (n_old + n_new)
+                        existing_pm["num_elements"] = n_old + n_new
 
                 if match:
                     pass_count += 1
@@ -972,9 +1245,7 @@ def run_and_check_correctness(
                     for key, val in mismatch_details.items():
                         if isinstance(val, dict):
                             for sub_key, sub_val in val.items():
-                                metadata.setdefault(sub_key, []).append(
-                                    str(sub_val)
-                                )
+                                metadata.setdefault(sub_key, []).append(str(sub_val))
                         else:
                             metadata.setdefault(key, []).append(str(val))
                     metadata["correctness_issue"] = "Output mismatch"
@@ -1077,3 +1348,4 @@ def check_metadata_serializable_all_types(metadata: dict):
 # fetch_kernel_from_database("kernelbench_prompt_v2_level_2", 1, 1, "http://localhost:9091")
 # print(fetch_ref_arch_from_level_problem_id("2", 1, with_name=True))
 # Note: fetch_baseline_time is available in kernelbench.timing module
+

@@ -265,6 +265,13 @@ def _summary_from_dict(d: dict, level: int) -> dict:
         "runtime_stats": fr.get("runtime_stats", {}),
         "ref_runtime": fr.get("ref_runtime", -1.0),
         "metadata": fr.get("metadata", {}),
+        # Extended metrics
+        "numerical_precision": fr.get("numerical_precision", {}),
+        "memory_stats": fr.get("memory_stats", {}),
+        "kernel_launch_stats": fr.get("kernel_launch_stats", {}),
+        "sol_stats": fr.get("sol_stats", {}),
+        "energy_stats": fr.get("energy_stats", {}),
+        "roofline_stats": fr.get("roofline_stats", {}),
     }
 
 
@@ -422,6 +429,22 @@ def _aggregate_results(run_dir: str, level: int, problem_ids):
     print(f"  Compiled:           {n_compiled}/{n}  ({100*n_compiled/n:.1f}%)" if n else "")
     print(f"  Correct:            {n_correct}/{n}  ({100*n_correct/n:.1f}%)" if n else "")
     print(f"  Avg turns used:     {avg_turns:.1f}")
+
+    # Extended metrics summary
+    correct_results = [r for r in all_results.values() if r.get("correctness")]
+    if correct_results:
+        mem_ratios = [r["memory_stats"].get("memory_ratio") for r in correct_results if r.get("memory_stats", {}).get("memory_ratio")]
+        if mem_ratios:
+            print(f"  Avg memory ratio:   {sum(mem_ratios)/len(mem_ratios):.2f}x  (< 1 = less memory than ref)")
+        energy_ratios = [r["energy_stats"].get("energy_ratio") for r in correct_results if r.get("energy_stats", {}).get("energy_ratio", -1) > 0]
+        if energy_ratios:
+            print(f"  Avg energy ratio:   {sum(energy_ratios)/len(energy_ratios):.2f}x  (> 1 = more efficient)")
+        fusion_ratios = [r["kernel_launch_stats"].get("fusion_ratio") for r in correct_results if r.get("kernel_launch_stats", {}).get("fusion_ratio")]
+        if fusion_ratios:
+            print(f"  Avg fusion ratio:   {sum(fusion_ratios)/len(fusion_ratios):.2f}x  (> 1 = better fused)")
+        max_abs_errs = [r["numerical_precision"].get("max_abs_error") for r in correct_results if r.get("numerical_precision", {}).get("max_abs_error") is not None]
+        if max_abs_errs:
+            print(f"  Avg max abs error:  {sum(max_abs_errs)/len(max_abs_errs):.2e}")
 
 
 if __name__ == "__main__":
