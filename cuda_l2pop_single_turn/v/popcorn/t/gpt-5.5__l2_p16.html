@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 16</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 16</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-correct">correct</span>
   <span style="font-size:13px;">16_HamiltonianMonteCarloStep.py</span>
@@ -108,5 +108,154 @@ Numerical precision: max_abs_err=0.00e+00  mean_abs_err=0.00e+00  max_rel_err=0.
 Memory: 1.51 MB peak (ref: 3.5 MB, ratio: 0.4315x)
 Kernel launches: 10 (ref: 116, fusion ratio: 11.6)
 SOL score: 0.0546
-Flagged for excessive speedup — this submission may have been rejected by automated review.</div></details></div></div>
+Flagged for excessive speedup — this submission may have been rejected by automated review.</div></details></div><details class="ref-source"><summary>final submitted kernel (150 lines, 4,720 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cpp_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;vector&gt;
+
+std::vector&lt;torch::Tensor&gt; hmc_forward_cuda(torch::Tensor q,
+                                            torch::Tensor p,
+                                            torch::Tensor u,
+                                            int64_t steps,
+                                            double eps);
+&quot;&quot;&quot;
+
+_cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;vector&gt;
+#include &lt;cmath&gt;
+
+__global__ void hmc_kernel(const float* __restrict__ q,
+                           const float* __restrict__ p0,
+                           const float* __restrict__ u,
+                           float* __restrict__ qout,
+                           bool* __restrict__ accout,
+                           int B, int D, int steps, float eps) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+    float* sq0 = smem;
+    float* sp0 = smem + blockDim.x;
+    float* sqf = smem + 2 * blockDim.x;
+    float* spf = smem + 3 * blockDim.x;
+    __shared__ bool s_acc;
+
+    float sum_q0 = 0.0f;
+    float sum_p0 = 0.0f;
+    float sum_qf = 0.0f;
+    float sum_pf = 0.0f;
+    int base = b * D;
+
+    for (int j = tid; j &lt; D; j += blockDim.x) {
+        float qv0 = q[base + j];
+        float pv0 = p0[base + j];
+        float qv = qv0;
+        float pv = pv0;
+
+        // Leapfrog for grad log prob = -q.  Written as separate mul/add
+        // operations (and compiled with fmad disabled) to closely match PyTorch.
+        pv = pv - (0.5f * eps) * qv;
+        for (int s = 0; s &lt; steps - 1; ++s) {
+            qv = qv + eps * pv;
+            pv = pv - eps * qv;
+        }
+        qv = qv + eps * pv;
+        pv = pv - (0.5f * eps) * qv;
+        pv = -pv;
+
+        qout[base + j] = qv;
+        sum_q0 += qv0 * qv0;
+        sum_p0 += pv0 * pv0;
+        sum_qf += qv * qv;
+        sum_pf += pv * pv;
+    }
+
+    sq0[tid] = sum_q0;
+    sp0[tid] = sum_p0;
+    sqf[tid] = sum_qf;
+    spf[tid] = sum_pf;
+    __syncthreads();
+
+    for (int off = blockDim.x &gt;&gt; 1; off &gt; 0; off &gt;&gt;= 1) {
+        if (tid &lt; off) {
+            sq0[tid] += sq0[tid + off];
+            sp0[tid] += sp0[tid + off];
+            sqf[tid] += sqf[tid + off];
+            spf[tid] += spf[tid + off];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float log_alpha = 0.5f * ((sq0[0] + sp0[0]) - (sqf[0] + spf[0]));
+        float uu = u[b];
+        if (uu &lt; 1.0e-10f) uu = 1.0e-10f;
+        bool a = logf(uu) &lt; log_alpha;
+        s_acc = a;
+        accout[b] = a;
+    }
+    __syncthreads();
+
+    if (!s_acc) {
+        for (int j = tid; j &lt; D; j += blockDim.x) {
+            qout[base + j] = q[base + j];
+        }
+    }
+}
+
+std::vector&lt;torch::Tensor&gt; hmc_forward_cuda(torch::Tensor q,
+                                            torch::Tensor p,
+                                            torch::Tensor u,
+                                            int64_t steps64,
+                                            double epsd) {
+    const int B = (int)q.size(0);
+    const int D = (int)q.size(1);
+    auto qout = torch::empty_like(q);
+    auto acc = torch::empty({B}, q.options().dtype(torch::kBool));
+
+    const int threads = 128;
+    const dim3 blocks(B);
+    const size_t shmem = 4 * threads * sizeof(float);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hmc_kernel&lt;&lt;&lt;blocks, threads, shmem, stream&gt;&gt;&gt;(
+        q.data_ptr&lt;float&gt;(), p.data_ptr&lt;float&gt;(), u.data_ptr&lt;float&gt;(),
+        qout.data_ptr&lt;float&gt;(), acc.data_ptr&lt;bool&gt;(), B, D, (int)steps64, (float)epsd);
+    return {qout, acc};
+}
+&quot;&quot;&quot;
+
+_hmc_ext = load_inline(
+    name=&quot;hmc_leapfrog_fused_ext_v1&quot;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&quot;hmc_forward_cuda&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;, &quot;--fmad=false&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim, num_leapfrog_steps=10, step_size=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_leapfrog_steps = num_leapfrog_steps
+        self.step_size = step_size
+        self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+
+    def forward(self, q: torch.Tensor) -&gt; tuple:
+        # Match the reference RNG consumption order exactly: first normal momenta,
+        # then uniforms for the Metropolis test.
+        if not q.is_contiguous():
+            q = q.contiguous()
+        p = torch.randn_like(q)
+        u = torch.rand((q.shape[0],), device=q.device)
+        return tuple(_hmc_ext.hmc_forward_cuda(q, p, u, self.num_leapfrog_steps, float(self.step_size)))
+</pre></details></div>
 </body></html>

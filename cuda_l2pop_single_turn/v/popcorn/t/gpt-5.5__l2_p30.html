@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 30</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 30</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-correct">correct</span>
   <span style="font-size:13px;">30_SelectiveScan_Mamba.py</span>
@@ -95,5 +95,133 @@ Memory: 133.6 MB peak (ref: 1765.86 MB, ratio: 0.0757x)
 Kernel launches: 28 (ref: 26681, fusion ratio: 952.8929)
 Energy: 574.68 mJ/run (ref: 10105.72 mJ, ratio: 17.585x)
 SOL score: 1.0
-Flagged for excessive speedup — this submission may have been rejected by automated review.</div></details></div></div>
+Flagged for excessive speedup — this submission may have been rejected by automated review.</div></details></div><details class="ref-source"><summary>final submitted kernel (129 lines, 4,812 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+
+_cpp_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor selective_scan_forward(torch::Tensor x,
+                                    torch::Tensor delta,
+                                    torch::Tensor B_t,
+                                    torch::Tensor C_t,
+                                    torch::Tensor A_log,
+                                    torch::Tensor D_param);
+&quot;&quot;&quot;
+
+_cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+// One warp computes one (batch, channel) recurrent stream.  The state dimension
+// is small (16 for the benchmark), so lanes hold individual state entries in
+// registers and scan through time without materializing dA/dB/h.
+__global__ void selective_scan_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ delta,
+                                      const float* __restrict__ B_t,
+                                      const float* __restrict__ C_t,
+                                      const float* __restrict__ A_log,
+                                      const float* __restrict__ D_param,
+                                      float* __restrict__ y,
+                                      int B, int L, int D, int N) {
+    int bd = blockIdx.x;
+    int b = bd / D;
+    int d = bd - b * D;
+    int lane = threadIdx.x; // blockDim.x == 32
+
+    float h = 0.0f;
+    float Aval = 0.0f;
+    if (lane &lt; N) {
+        Aval = -expf(A_log[d * N + lane]);
+    }
+    const float Dv = D_param[d];
+    const int base_x = (b * L) * D + d;
+    const int base_n = (b * L) * N;
+
+    #pragma unroll 1
+    for (int t = 0; t &lt; L; ++t) {
+        const float dt = delta[base_x + t * D];
+        const float xv = x[base_x + t * D];
+        float prod = 0.0f;
+        if (lane &lt; N) {
+            const int offn = base_n + t * N + lane;
+            const float bt = B_t[offn];
+            const float ct = C_t[offn];
+            const float e = expf(dt * Aval);
+            h = e * h + xv * dt * bt;
+            prod = h * ct;
+        }
+
+        // Sum the N&lt;=32 state contributions within the warp.
+        unsigned mask = 0xffffffffu;
+        prod += __shfl_down_sync(mask, prod, 16);
+        prod += __shfl_down_sync(mask, prod, 8);
+        prod += __shfl_down_sync(mask, prod, 4);
+        prod += __shfl_down_sync(mask, prod, 2);
+        prod += __shfl_down_sync(mask, prod, 1);
+
+        if (lane == 0) {
+            y[base_x + t * D] = prod + xv * Dv;
+        }
+    }
+}
+
+torch::Tensor selective_scan_forward(torch::Tensor x,
+                                    torch::Tensor delta,
+                                    torch::Tensor B_t,
+                                    torch::Tensor C_t,
+                                    torch::Tensor A_log,
+                                    torch::Tensor D_param) {
+    const int B = (int)x.size(0);
+    const int L = (int)x.size(1);
+    const int D = (int)x.size(2);
+    const int N = (int)A_log.size(1);
+    auto y = torch::empty_like(x);
+
+    dim3 block(32);
+    dim3 grid(B * D);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    selective_scan_kernel&lt;&lt;&lt;grid, block, 0, stream&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), delta.data_ptr&lt;float&gt;(), B_t.data_ptr&lt;float&gt;(), C_t.data_ptr&lt;float&gt;(),
+        A_log.data_ptr&lt;float&gt;(), D_param.data_ptr&lt;float&gt;(), y.data_ptr&lt;float&gt;(), B, L, D, N);
+    return y;
+}
+&quot;&quot;&quot;
+
+_ext = load_inline(
+    name=&quot;selective_scan_s6_inline_ext&quot;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&quot;selective_scan_forward&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, d_model: int, d_state: int):
+        super(ModelNew, self).__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.A_log = nn.Parameter(torch.randn(d_model, d_state))
+        self.proj_B = nn.Linear(d_model, d_state, bias=False)
+        self.proj_C = nn.Linear(d_model, d_state, bias=False)
+        self.proj_delta = nn.Linear(d_model, d_model, bias=True)
+        self.D = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        # Use cuBLAS for the dense projections, then a custom fused CUDA scan for
+        # the recurrent SSM portion, avoiding the huge dA/dB/x_db materializations
+        # and the Python-level loop in the reference implementation.
+        delta = F.softplus(F.linear(x, self.proj_delta.weight, self.proj_delta.bias))
+        B_t = F.linear(x, self.proj_B.weight, None)
+        C_t = F.linear(x, self.proj_C.weight, None)
+        return _ext.selective_scan_forward(x, delta, B_t, C_t, self.A_log, self.D)
+</pre></details></div>
 </body></html>

@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 50</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 50</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-error">error</span>
   <span style="font-size:13px;">50_HiddenMarkovForward.py</span>
@@ -114,5 +114,181 @@ Traceback (most recent call last):
     return forward_call(*args, **kwargs)
   File &quot;&lt;string&gt;&quot;, line 38, in forward
 IndexError: tensors used as indices must be long, int, byte or bool tensors
-</div></details></div></div>
+</div></details></div><details class="ref-source"><summary>final submitted kernel (177 lines, 5,904 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cpp_src = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor hmm_forward_cuda(torch::Tensor observations,
+                               torch::Tensor log_init,
+                               torch::Tensor log_trans,
+                               torch::Tensor log_emit);
+
+torch::Tensor hmm_forward(torch::Tensor observations,
+                          torch::Tensor log_init,
+                          torch::Tensor log_trans,
+                          torch::Tensor log_emit) {
+    return hmm_forward_cuda(observations, log_init, log_trans, log_emit);
+}
+&#x27;&#x27;&#x27;
+
+_cuda_src = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;c10/cuda/CUDAException.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+#define MAX_S 128
+
+__global__ void hmm_forward_kernel(const long long* __restrict__ obs,
+                                   const float* __restrict__ log_init,
+                                   const float* __restrict__ log_trans,
+                                   const float* __restrict__ log_emit,
+                                   float* __restrict__ out,
+                                   int B, int T, int S, int O) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float alpha[MAX_S];
+    __shared__ float next_alpha[MAX_S];
+    __shared__ float lse_trans[MAX_S];
+    __shared__ float lse_emit[MAX_S];
+    __shared__ float lse_pi_s;
+
+    if (S &gt; MAX_S) {
+        if (tid == 0) out[b] = NAN;
+        return;
+    }
+
+    // Normalize initial probabilities: logsumexp(log_init)
+    if (tid == 0) {
+        float m = -INFINITY;
+        for (int s = 0; s &lt; S; ++s) {
+            float v = log_init[s];
+            if (v &gt; m) m = v;
+        }
+        float sum = 0.0f;
+        for (int s = 0; s &lt; S; ++s) sum += expf(log_init[s] - m);
+        lse_pi_s = m + logf(sum);
+    }
+
+    // Per-row logsumexp for transition and emission matrices.
+    if (tid &lt; S) {
+        int s = tid;
+        float mt = -INFINITY;
+        for (int j = 0; j &lt; S; ++j) {
+            float v = log_trans[s * S + j];
+            if (v &gt; mt) mt = v;
+        }
+        float st = 0.0f;
+        for (int j = 0; j &lt; S; ++j) st += expf(log_trans[s * S + j] - mt);
+        lse_trans[s] = mt + logf(st);
+
+        float me = -INFINITY;
+        for (int o = 0; o &lt; O; ++o) {
+            float v = log_emit[s * O + o];
+            if (v &gt; me) me = v;
+        }
+        float se = 0.0f;
+        for (int o = 0; o &lt; O; ++o) se += expf(log_emit[s * O + o] - me);
+        lse_emit[s] = me + logf(se);
+    }
+    __syncthreads();
+
+    long long o0 = obs[b * T];
+    if (tid &lt; S) {
+        alpha[tid] = (log_init[tid] - lse_pi_s) + (log_emit[tid * O + (int)o0] - lse_emit[tid]);
+    }
+    __syncthreads();
+
+    for (int t = 1; t &lt; T; ++t) {
+        long long ot_ll = obs[b * T + t];
+        int ot = (int)ot_ll;
+        if (tid &lt; S) {
+            int j = tid;
+            float m = -INFINITY;
+            for (int i = 0; i &lt; S; ++i) {
+                float v = alpha[i] + log_trans[i * S + j] - lse_trans[i];
+                if (v &gt; m) m = v;
+            }
+            float sum = 0.0f;
+            for (int i = 0; i &lt; S; ++i) {
+                float v = alpha[i] + log_trans[i * S + j] - lse_trans[i];
+                sum += expf(v - m);
+            }
+            next_alpha[j] = m + logf(sum) + log_emit[j * O + ot] - lse_emit[j];
+        }
+        __syncthreads();
+        if (tid &lt; S) alpha[tid] = next_alpha[tid];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float m = -INFINITY;
+        for (int s = 0; s &lt; S; ++s) {
+            float v = alpha[s];
+            if (v &gt; m) m = v;
+        }
+        float sum = 0.0f;
+        for (int s = 0; s &lt; S; ++s) sum += expf(alpha[s] - m);
+        out[b] = m + logf(sum);
+    }
+}
+
+torch::Tensor hmm_forward_cuda(torch::Tensor observations,
+                               torch::Tensor log_init,
+                               torch::Tensor log_trans,
+                               torch::Tensor log_emit) {
+    TORCH_CHECK(observations.is_cuda(), &quot;observations must be CUDA&quot;);
+    TORCH_CHECK(log_init.is_cuda() &amp;&amp; log_trans.is_cuda() &amp;&amp; log_emit.is_cuda(), &quot;parameters must be CUDA&quot;);
+    TORCH_CHECK(log_init.scalar_type() == at::kFloat &amp;&amp; log_trans.scalar_type() == at::kFloat &amp;&amp; log_emit.scalar_type() == at::kFloat, &quot;only float32 supported&quot;);
+    TORCH_CHECK(observations.scalar_type() == at::kLong, &quot;observations must be int64/long&quot;);
+
+    const int B = (int)observations.size(0);
+    const int T = (int)observations.size(1);
+    const int S = (int)log_init.size(0);
+    const int O = (int)log_emit.size(1);
+
+    auto out = torch::empty({B}, log_init.options());
+    const int threads = 128;
+    hmm_forward_kernel&lt;&lt;&lt;B, threads, 0, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+        reinterpret_cast&lt;const long long*&gt;(observations.data_ptr&lt;int64_t&gt;()),
+        log_init.data_ptr&lt;float&gt;(),
+        log_trans.data_ptr&lt;float&gt;(),
+        log_emit.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        B, T, S, O
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+_hmm_ext = load_inline(
+    name=&quot;hmm_forward_ext_v1&quot;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&quot;hmm_forward&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_states, num_obs):
+        super().__init__()
+        self.num_states = num_states
+        self.num_obs = num_obs
+        self.log_init = nn.Parameter(torch.zeros(num_states))
+        self.log_trans = nn.Parameter(torch.zeros(num_states, num_states))
+        self.log_emit = nn.Parameter(torch.zeros(num_states, num_obs))
+
+    def forward(self, observations: torch.Tensor) -&gt; torch.Tensor:
+        return _hmm_ext.hmm_forward(observations, self.log_init, self.log_trans, self.log_emit)
+</pre></details></div>
 </body></html>

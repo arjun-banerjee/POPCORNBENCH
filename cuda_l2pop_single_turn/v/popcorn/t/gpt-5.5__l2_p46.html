@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 46</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 46</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-correct">correct</span>
   <span style="font-size:13px;">46_SteinVariationalGradient.py</span>
@@ -95,5 +95,194 @@ Runtime stats: mean=0.37μs  median=?μs  std=0.00μs
 Numerical precision: max_abs_err=1.86e-08  mean_abs_err=1.05e-09  max_rel_err=6.71e-03
 Memory: 68.33 MB peak (ref: 440.5 MB, ratio: 0.1551x)
 Kernel launches: 22 (ref: 54, fusion ratio: 2.4545)
-SOL score: 0.9173</div></details></div></div>
+SOL score: 0.9173</div></details></div><details class="ref-source"><summary>final submitted kernel (190 lines, 6,221 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cpp_src = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/ATen.h&gt;
+
+void compute_dist_cuda(torch::Tensor particles, torch::Tensor dist);
+void compute_phi_cuda(torch::Tensor particles, torch::Tensor dist, torch::Tensor median, torch::Tensor out);
+
+torch::Tensor svgd_forward(torch::Tensor particles) {
+    TORCH_CHECK(particles.is_cuda(), &quot;particles must be CUDA&quot;);
+    TORCH_CHECK(particles.scalar_type() == at::kFloat, &quot;only float32 supported&quot;);
+    auto p = particles.contiguous();
+    const auto N = p.size(0);
+    auto dist = torch::empty({N, N}, p.options());
+    compute_dist_cuda(p, dist);
+
+    // Match torch.median(dist_sq.view(-1)).clamp(min=1e-5) on device.
+    auto med = at::median(dist.reshape({-1}));
+    med = at::clamp_min(med, 1.0e-5);
+
+    auto out = torch::empty_like(p);
+    compute_phi_cuda(p, dist, med, out);
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+_cuda_src = r&#x27;&#x27;&#x27;
+#include &lt;ATen/ATen.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;c10/cuda/CUDAGuard.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void dist_kernel(const float* __restrict__ p,
+                            float* __restrict__ dist,
+                            int N, int D) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i &gt;= N || j &gt;= N) return;
+    float s = 0.0f;
+    const float* pi = p + i * D;
+    const float* pj = p + j * D;
+#pragma unroll
+    for (int d = 0; d &lt; 32; ++d) {
+        if (d &lt; D) {
+            float v = pj[d] - pi[d];
+            s += v * v;
+        }
+    }
+    for (int d = 32; d &lt; D; ++d) {
+        float v = pj[d] - pi[d];
+        s += v * v;
+    }
+    dist[i * N + j] = s;
+}
+
+__global__ void phi_kernel_32(const float* __restrict__ p,
+                              const float* __restrict__ dist,
+                              const float* __restrict__ medp,
+                              float* __restrict__ out,
+                              int N, int D,
+                              float logden) {
+    int i = blockIdx.x;
+    int tid = threadIdx.x;
+    float med = medp[0];
+    if (med &lt; 1.0e-5f) med = 1.0e-5f;
+    float invh = logden / med;
+
+    float acc[32];
+#pragma unroll
+    for (int d = 0; d &lt; 32; ++d) acc[d] = 0.0f;
+
+    const float* pi = p + i * D;
+    for (int j = tid; j &lt; N; j += blockDim.x) {
+        float k = expf(-0.5f * dist[i * N + j] * invh);
+        const float* pj = p + j * D;
+#pragma unroll
+        for (int d = 0; d &lt; 32; ++d) {
+            float pjd = pj[d];
+            acc[d] += k * (-pjd + (pjd - pi[d]) * invh);
+        }
+    }
+
+    extern __shared__ float sh[];
+#pragma unroll
+    for (int d = 0; d &lt; 32; ++d) sh[tid * 32 + d] = acc[d];
+    __syncthreads();
+
+    for (int stride = blockDim.x &gt;&gt; 1; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (tid &lt; stride) {
+#pragma unroll
+            for (int d = 0; d &lt; 32; ++d) {
+                sh[tid * 32 + d] += sh[(tid + stride) * 32 + d];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float invN = 1.0f / (float)N;
+#pragma unroll
+        for (int d = 0; d &lt; 32; ++d) out[i * D + d] = sh[d] * invN;
+    }
+}
+
+__global__ void phi_kernel_generic(const float* __restrict__ p,
+                                   const float* __restrict__ dist,
+                                   const float* __restrict__ medp,
+                                   float* __restrict__ out,
+                                   int N, int D,
+                                   float logden) {
+    int i = blockIdx.x;
+    int d = blockIdx.y;
+    int tid = threadIdx.x;
+    float med = medp[0];
+    if (med &lt; 1.0e-5f) med = 1.0e-5f;
+    float invh = logden / med;
+    float pi = p[i * D + d];
+    float sum = 0.0f;
+    for (int j = tid; j &lt; N; j += blockDim.x) {
+        float pjd = p[j * D + d];
+        float k = expf(-0.5f * dist[i * N + j] * invh);
+        sum += k * (-pjd + (pjd - pi) * invh);
+    }
+    extern __shared__ float sh[];
+    sh[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x &gt;&gt; 1; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (tid &lt; stride) sh[tid] += sh[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[i * D + d] = sh[0] / (float)N;
+}
+
+void compute_dist_cuda(torch::Tensor particles, torch::Tensor dist) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(particles));
+    int N = (int)particles.size(0);
+    int D = (int)particles.size(1);
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+    dist_kernel&lt;&lt;&lt;grid, block, 0, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+        particles.data_ptr&lt;float&gt;(), dist.data_ptr&lt;float&gt;(), N, D);
+}
+
+void compute_phi_cuda(torch::Tensor particles, torch::Tensor dist, torch::Tensor median, torch::Tensor out) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(particles));
+    int N = (int)particles.size(0);
+    int D = (int)particles.size(1);
+    float logden = logf((float)N);
+    if (logden &lt; 1.0f) logden = 1.0f;
+    int threads = 256;
+    if (D == 32) {
+        size_t smem = (size_t)threads * 32 * sizeof(float);
+        phi_kernel_32&lt;&lt;&lt;N, threads, smem, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+            particles.data_ptr&lt;float&gt;(), dist.data_ptr&lt;float&gt;(), median.data_ptr&lt;float&gt;(),
+            out.data_ptr&lt;float&gt;(), N, D, logden);
+    } else {
+        size_t smem = (size_t)threads * sizeof(float);
+        dim3 grid(N, D);
+        phi_kernel_generic&lt;&lt;&lt;grid, threads, smem, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+            particles.data_ptr&lt;float&gt;(), dist.data_ptr&lt;float&gt;(), median.data_ptr&lt;float&gt;(),
+            out.data_ptr&lt;float&gt;(), N, D, logden);
+    }
+}
+&#x27;&#x27;&#x27;
+
+_svgd_ext = load_inline(
+    name=&#x27;svgd_ext_inline_opt&#x27;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&#x27;svgd_forward&#x27;],
+    extra_cflags=[&#x27;-O3&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    with_cuda=True,
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.register_buffer(&#x27;target_mean&#x27;, torch.zeros(dim))
+
+    def forward(self, particles: torch.Tensor) -&gt; torch.Tensor:
+        return _svgd_ext.svgd_forward(particles)
+</pre></details></div>
 </body></html>

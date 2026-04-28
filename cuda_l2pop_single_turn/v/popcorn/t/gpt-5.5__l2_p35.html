@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 35</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 35</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-correct">correct</span>
   <span style="font-size:13px;">35_FusedConv1dGroupNorm.py</span>
@@ -153,5 +153,170 @@ Runtime stats: mean=0.07μs  median=?μs  std=0.01μs
 Numerical precision: max_abs_err=9.54e-07  mean_abs_err=3.19e-08  max_rel_err=2.30e-02
 Memory: 49.13 MB peak (ref: 49.13 MB, ratio: 1.0x)
 Kernel launches: 12 (ref: 21, fusion ratio: 1.75)
-SOL score: 1.0</div></details></div></div>
+SOL score: 1.0</div></details></div><details class="ref-source"><summary>final submitted kernel (166 lines, 5,049 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+_cpp_src = r&quot;&quot;&quot;
+torch::Tensor group_norm1d_forward(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, int64_t groups, double eps, bool affine);
+&quot;&quot;&quot;
+
+_cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+
+__global__ void group_norm1d_kernel(const float* __restrict__ x,
+                                    const float* __restrict__ gamma,
+                                    const float* __restrict__ beta,
+                                    float* __restrict__ out,
+                                    int C, int T, int G, int cpg,
+                                    float eps, bool affine) {
+    int row = blockIdx.x;            // one (n, group) per CTA
+    int g = row % G;
+    int n = row / G;
+    int tid = threadIdx.x;
+    int M = cpg * T;
+    int base = (n * C + g * cpg) * T;
+
+    float sum = 0.0f;
+    float sum2 = 0.0f;
+
+    // The group is contiguous in NCT layout, so this is fully coalesced.
+    for (int i = tid; i &lt; M; i += BLOCK_SIZE) {
+        float v = x[base + i];
+        sum += v;
+        sum2 += v * v;
+    }
+
+    __shared__ float s_sum[BLOCK_SIZE];
+    __shared__ float s_sum2[BLOCK_SIZE];
+    s_sum[tid] = sum;
+    s_sum2[tid] = sum2;
+    __syncthreads();
+
+    // Block reduction.  BLOCK_SIZE is a power of two.
+    #pragma unroll
+    for (int offset = BLOCK_SIZE / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+        if (tid &lt; offset) {
+            s_sum[tid] += s_sum[tid + offset];
+            s_sum2[tid] += s_sum2[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float mean_s;
+    __shared__ float invstd_s;
+    if (tid == 0) {
+        float invM = 1.0f / (float)M;
+        float mean = s_sum[0] * invM;
+        float var = s_sum2[0] * invM - mean * mean;
+        // Guard against tiny negative roundoff in the E[x^2]-E[x]^2 formula.
+        if (var &lt; 0.0f) var = 0.0f;
+        mean_s = mean;
+        invstd_s = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    float mean = mean_s;
+    float invstd = invstd_s;
+    int c0 = g * cpg;
+
+    if (affine) {
+        for (int i = tid; i &lt; M; i += BLOCK_SIZE) {
+            int c = c0 + i / T;
+            float v = (x[base + i] - mean) * invstd;
+            out[base + i] = v * gamma[c] + beta[c];
+        }
+    } else {
+        for (int i = tid; i &lt; M; i += BLOCK_SIZE) {
+            float v = (x[base + i] - mean) * invstd;
+            out[base + i] = v;
+        }
+    }
+}
+
+torch::Tensor group_norm1d_forward(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, int64_t groups, double eps, bool affine) {
+    const int N = (int)input.size(0);
+    const int C = (int)input.size(1);
+    const int T = (int)input.size(2);
+    const int G = (int)groups;
+    const int cpg = C / G;
+
+    auto output = torch::empty_like(input);
+    dim3 block(BLOCK_SIZE);
+    dim3 grid(N * G);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const float* gptr = affine ? gamma.data_ptr&lt;float&gt;() : input.data_ptr&lt;float&gt;();
+    const float* bptr = affine ? beta.data_ptr&lt;float&gt;() : input.data_ptr&lt;float&gt;();
+
+    group_norm1d_kernel&lt;&lt;&lt;grid, block, 0, stream&gt;&gt;&gt;(
+        input.data_ptr&lt;float&gt;(), gptr, bptr, output.data_ptr&lt;float&gt;(),
+        C, T, G, cpg, (float)eps, affine);
+    return output;
+}
+&quot;&quot;&quot;
+
+_gn_ext = load_inline(
+    name=&quot;custom_group_norm1d_ext_v1&quot;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&quot;group_norm1d_forward&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_groups: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 1,
+        dilation: int = 1,
+        eps: float = 1e-5,
+        affine: bool = True,
+    ):
+        super().__init__()
+        assert out_channels % num_groups == 0
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(
+            num_groups=num_groups,
+            num_channels=out_channels,
+            eps=eps,
+            affine=affine,
+        )
+        self.num_groups = int(num_groups)
+        self.eps = float(eps)
+        self.affine = bool(affine)
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        y = F.conv1d(x, self.conv.weight, None, self.stride, self.padding, self.dilation, 1)
+        if self.affine:
+            return _gn_ext.group_norm1d_forward(y, self.norm.weight, self.norm.bias, self.num_groups, self.eps, True)
+        else:
+            return _gn_ext.group_norm1d_forward(y, y, y, self.num_groups, self.eps, False)
+</pre></details></div>
 </body></html>

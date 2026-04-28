@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 10</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 10</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-correct">correct</span>
   <span style="font-size:13px;">10_GFVLA_FusedPairwiseNodeAggregate.py</span>
@@ -127,5 +127,204 @@ Numerical precision: max_abs_err=3.58e-06  mean_abs_err=3.86e-07  max_rel_err=9.
 Memory: 35.36 MB peak (ref: 38.84 MB, ratio: 0.9104x)
 Kernel launches: 2 (ref: 50, fusion ratio: 25.0)
 Energy: 231.6 mJ/run (ref: 0.0 mJ, ratio: -1x)
-SOL score: 0.002</div></details></div></div>
+SOL score: 0.002</div></details></div><details class="ref-source"><summary>final submitted kernel (200 lines, 6,916 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cpp_src = r&quot;&quot;&quot;
+torch::Tensor fused_forward(torch::Tensor nodes,
+                            torch::Tensor pair_feats,
+                            torch::Tensor edge_mask,
+                            torch::Tensor w1,
+                            torch::Tensor b1,
+                            torch::Tensor w2,
+                            torch::Tensor b2,
+                            torch::Tensor ln_w,
+                            torch::Tensor ln_b);
+&quot;&quot;&quot;
+
+_cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cfloat&gt;
+
+__global__ void linear1_silu_kernel(const float* __restrict__ nodes,
+                                    const float* __restrict__ pair_feats,
+                                    const float* __restrict__ w1,
+                                    const float* __restrict__ b1,
+                                    float* __restrict__ hidden_act,
+                                    int B, int N, int D, int P, int H) {
+    int pair_idx = blockIdx.x;
+    int j = pair_idx % N;
+    int t = pair_idx / N;
+    int i = t % N;
+    int b = t / N;
+    int K = 2 * D + P;
+
+    extern __shared__ float x[];
+    for (int k = threadIdx.x; k &lt; K; k += blockDim.x) {
+        float v;
+        if (k &lt; D) {
+            v = nodes[(b * N + i) * D + k];
+        } else if (k &lt; 2 * D) {
+            v = nodes[(b * N + j) * D + (k - D)];
+        } else {
+            v = pair_feats[((b * N + i) * N + j) * P + (k - 2 * D)];
+        }
+        x[k] = v;
+    }
+    __syncthreads();
+
+    for (int h = threadIdx.x; h &lt; H; h += blockDim.x) {
+        const float* wh = w1 + h * K;
+        float acc = b1[h];
+        #pragma unroll 4
+        for (int k = 0; k &lt; K; ++k) {
+            acc += wh[k] * x[k];
+        }
+        float sig = 1.0f / (1.0f + expf(-acc));
+        hidden_act[(pair_idx * H) + h] = acc * sig;
+    }
+}
+
+__global__ void pool_layernorm_kernel(const float* __restrict__ nodes,
+                                      const float* __restrict__ hidden_act,
+                                      const float* __restrict__ edge_mask,
+                                      const float* __restrict__ w2,
+                                      const float* __restrict__ b2,
+                                      const float* __restrict__ ln_w,
+                                      const float* __restrict__ ln_b,
+                                      float* __restrict__ out,
+                                      int B, int N, int D, int H) {
+    int row = blockIdx.x; // b*N + i
+    int i = row % N;
+    int b = row / N;
+    int tid = threadIdx.x;
+    extern __shared__ float smem[];
+    float* pooled = smem;              // D floats
+    float* red = smem + D;             // blockDim.x floats
+
+    for (int d = tid; d &lt; D; d += blockDim.x) {
+        float best = -FLT_MAX;
+        const float* wd = w2 + d * H;
+        for (int j = 0; j &lt; N; ++j) {
+            float m = edge_mask[(b * N + i) * N + j];
+            if (m &gt;= 0.5f) {
+                int pair_idx = (b * N + i) * N + j;
+                const float* hv = hidden_act + pair_idx * H;
+                float acc = b2[d];
+                #pragma unroll 4
+                for (int h = 0; h &lt; H; ++h) {
+                    acc += wd[h] * hv[h];
+                }
+                best = fmaxf(best, acc);
+            }
+        }
+        pooled[d] = best;
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int d = tid; d &lt; D; d += blockDim.x) sum += pooled[d];
+    red[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x &gt;&gt; 1; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (tid &lt; stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    float mean = red[0] / (float)D;
+
+    float ss = 0.0f;
+    for (int d = tid; d &lt; D; d += blockDim.x) {
+        float z = pooled[d] - mean;
+        ss += z * z;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int stride = blockDim.x &gt;&gt; 1; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (tid &lt; stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(red[0] / (float)D + 1.0e-5f);
+
+    for (int d = tid; d &lt; D; d += blockDim.x) {
+        float normed = (pooled[d] - mean) * inv_std;
+        out[row * D + d] = nodes[row * D + d] + normed * ln_w[d] + ln_b[d];
+    }
+}
+
+torch::Tensor fused_forward(torch::Tensor nodes,
+                            torch::Tensor pair_feats,
+                            torch::Tensor edge_mask,
+                            torch::Tensor w1,
+                            torch::Tensor b1,
+                            torch::Tensor w2,
+                            torch::Tensor b2,
+                            torch::Tensor ln_w,
+                            torch::Tensor ln_b) {
+    int B = (int)nodes.size(0);
+    int N = (int)nodes.size(1);
+    int D = (int)nodes.size(2);
+    int P = (int)pair_feats.size(3);
+    int H = (int)w1.size(0);
+
+    auto hidden_act = torch::empty({B, N, N, H}, nodes.options());
+    auto out = torch::empty({B, N, D}, nodes.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int threads1 = 256;
+    int K = 2 * D + P;
+    size_t sh1 = (size_t)K * sizeof(float);
+    linear1_silu_kernel&lt;&lt;&lt;B * N * N, threads1, sh1, stream&gt;&gt;&gt;(
+        nodes.data_ptr&lt;float&gt;(), pair_feats.data_ptr&lt;float&gt;(), w1.data_ptr&lt;float&gt;(), b1.data_ptr&lt;float&gt;(),
+        hidden_act.data_ptr&lt;float&gt;(), B, N, D, P, H);
+
+    int threads2 = 256;
+    size_t sh2 = (size_t)(D + threads2) * sizeof(float);
+    pool_layernorm_kernel&lt;&lt;&lt;B * N, threads2, sh2, stream&gt;&gt;&gt;(
+        nodes.data_ptr&lt;float&gt;(), hidden_act.data_ptr&lt;float&gt;(), edge_mask.data_ptr&lt;float&gt;(),
+        w2.data_ptr&lt;float&gt;(), b2.data_ptr&lt;float&gt;(), ln_w.data_ptr&lt;float&gt;(), ln_b.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(), B, N, D, H);
+    return out;
+}
+&quot;&quot;&quot;
+
+_ext = load_inline(
+    name=&quot;gf_vla_fused_pairwise_node_ext&quot;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&quot;fused_forward&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int, pair_dim: int, hidden: int):
+        super().__init__()
+        self.dim = dim
+        self.pair_dim = pair_dim
+        self.fuse = nn.Sequential(
+            nn.Linear(2 * dim + pair_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, dim),
+        )
+        self.out_norm = nn.LayerNorm(dim)
+
+    def forward(self, nodes: torch.Tensor, pair_feats: torch.Tensor, edge_mask: torch.Tensor) -&gt; torch.Tensor:
+        return _ext.fused_forward(
+            nodes,
+            pair_feats,
+            edge_mask,
+            self.fuse[0].weight,
+            self.fuse[0].bias,
+            self.fuse[2].weight,
+            self.fuse[2].bias,
+            self.out_norm.weight,
+            self.out_norm.bias,
+        )
+</pre></details></div>
 </body></html>

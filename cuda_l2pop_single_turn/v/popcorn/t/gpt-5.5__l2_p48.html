@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 48</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:52:41 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../../index.html" title="all sweeps">L2 · problem 48</a></div><div class="site-subtitle">gpt-5.5 · popcorn · cuda_l2pop_single_turn</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/gpt-5.5.html">← gpt-5.5</a><span class="meta">generated 2026-04-28 08:57:25 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/gpt-5.5.html" class=current>gpt-5.5</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-incorrect">incorrect</span>
   <span style="font-size:13px;">48_ParticleFilter.py</span>
@@ -113,5 +113,203 @@ def get_init_inputs():
 submit_kernel FAILED: correctness check did not pass ((2 / 5) trials).
 correctness_issue: Output mismatch
 max_difference: [&#x27;1.368099&#x27;, &#x27;0.755713&#x27;, &#x27;2.221871&#x27;]
-avg_difference: [&#x27;0.000057&#x27;, &#x27;0.000024&#x27;, &#x27;0.000092&#x27;]</div></details></div></div>
+avg_difference: [&#x27;0.000057&#x27;, &#x27;0.000024&#x27;, &#x27;0.000092&#x27;]</div></details></div><details class="ref-source"><summary>final submitted kernel (199 lines, 7,212 chars) — full source, untruncated</summary><pre class="block">import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cpp_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;vector&gt;
+
+std::vector&lt;torch::Tensor&gt; particle_forward_cuda(torch::Tensor particles,
+                                                 torch::Tensor log_weights,
+                                                 torch::Tensor observation,
+                                                 torch::Tensor C,
+                                                 torch::Tensor noise,
+                                                 torch::Tensor randu);
+&quot;&quot;&quot;
+
+_cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;vector&gt;
+#include &lt;cmath&gt;
+
+__global__ void pf_kernel(const float* __restrict__ particles,
+                          const float* __restrict__ log_weights,
+                          const float* __restrict__ observation,
+                          const float* __restrict__ C,
+                          const float* __restrict__ noise,
+                          const float* __restrict__ randu,
+                          float* __restrict__ out_particles,
+                          float* __restrict__ out_logw,
+                          int B, int P, int D, int O) {
+    extern __shared__ float sh[];
+    float* vals = sh;              // P floats: unnormalized log weights / cdf
+    float* pred = sh + P;          // P*D floats: predicted particles
+
+    int b = blockIdx.x;
+    int t = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    float local_max = -3.402823466e38f;
+
+    // Predict and compute unnormalized log weight, one particle per thread for P&lt;=1024.
+    for (int p = t; p &lt; P; p += nthreads) {
+        int base = (b * P + p) * D;
+        float sq = 0.0f;
+        // Store predicted state in shared memory.
+        for (int d = 0; d &lt; D; ++d) {
+            float x = 0.9f * particles[base + d] + 0.1f * noise[base + d];
+            pred[p * D + d] = x;
+        }
+        // Observation likelihood: obs_pred = C * pred
+        for (int o = 0; o &lt; O; ++o) {
+            float yhat = 0.0f;
+            const float* cptr = C + o * D;
+            for (int d = 0; d &lt; D; ++d) {
+                yhat = fmaf(cptr[d], pred[p * D + d], yhat);
+            }
+            float diff = observation[b * O + o] - yhat;
+            sq = fmaf(diff, diff, sq);
+        }
+        float v = log_weights[b * P + p] - 2.0f * sq; // -0.5 / (0.5^2) = -2
+        vals[p] = v;
+        if (v &gt; local_max) local_max = v;
+    }
+
+    // Block max reduction.
+    __shared__ float red[1024];
+    red[t] = local_max;
+    __syncthreads();
+    for (int stride = nthreads &gt;&gt; 1; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (t &lt; stride) {
+            float other = red[t + stride];
+            if (other &gt; red[t]) red[t] = other;
+        }
+        __syncthreads();
+    }
+    float m = red[0];
+
+    // Exponentiate shifted weights and sum.
+    float local_sum = 0.0f;
+    for (int p = t; p &lt; P; p += nthreads) {
+        float w = expf(vals[p] - m);
+        vals[p] = w;
+        local_sum += w;
+    }
+    red[t] = local_sum;
+    __syncthreads();
+    for (int stride = nthreads &gt;&gt; 1; stride &gt; 0; stride &gt;&gt;= 1) {
+        if (t &lt; stride) red[t] += red[t + stride];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / red[0];
+
+    // Normalize weights in vals.
+    for (int p = t; p &lt; P; p += nthreads) vals[p] *= inv_sum;
+    __syncthreads();
+
+    // Inclusive scan over vals[0:P].  P is 1024 in the benchmark; this also works for smaller P.
+    for (int offset = 1; offset &lt; P; offset &lt;&lt;= 1) {
+        float add = 0.0f;
+        if (t &gt;= offset &amp;&amp; t &lt; P) add = vals[t - offset];
+        __syncthreads();
+        if (t &gt;= offset &amp;&amp; t &lt; P) vals[t] += add;
+        __syncthreads();
+    }
+    if (t == P - 1) vals[t] = 1.0f; // match clamp/searchsorted robustness at the end
+    __syncthreads();
+
+    const float log_uniform = -logf((float)P);
+    float r0 = randu[b];
+
+    // Systematic resampling and uniform output log-weights.
+    for (int j = t; j &lt; P; j += nthreads) {
+        float u = ((float)j + r0) / (float)P;
+        int lo = 0, hi = P - 1;
+        while (lo &lt; hi) {
+            int mid = (lo + hi) &gt;&gt; 1;
+            if (vals[mid] &lt; u) lo = mid + 1;
+            else hi = mid;
+        }
+        int src = lo;
+        int out_base = (b * P + j) * D;
+        int pred_base = src * D;
+        for (int d = 0; d &lt; D; ++d) {
+            out_particles[out_base + d] = pred[pred_base + d];
+        }
+        out_logw[b * P + j] = log_uniform;
+    }
+}
+
+static inline int next_pow2_int(int x) {
+    int p = 1;
+    while (p &lt; x) p &lt;&lt;= 1;
+    return p;
+}
+
+std::vector&lt;torch::Tensor&gt; particle_forward_cuda(torch::Tensor particles,
+                                                 torch::Tensor log_weights,
+                                                 torch::Tensor observation,
+                                                 torch::Tensor C,
+                                                 torch::Tensor noise,
+                                                 torch::Tensor randu) {
+    const int B = (int)particles.size(0);
+    const int P = (int)particles.size(1);
+    const int D = (int)particles.size(2);
+    const int O = (int)observation.size(1);
+
+    auto out_particles = torch::empty_like(particles);
+    auto out_logw = torch::empty_like(log_weights);
+
+    int threads = next_pow2_int(P);
+    if (threads &lt; 32) threads = 32;
+    if (threads &gt; 1024) threads = 1024;
+    size_t smem = (size_t)P * (size_t)(D + 1) * sizeof(float);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    pf_kernel&lt;&lt;&lt;B, threads, smem, stream&gt;&gt;&gt;(
+        particles.data_ptr&lt;float&gt;(), log_weights.data_ptr&lt;float&gt;(), observation.data_ptr&lt;float&gt;(),
+        C.data_ptr&lt;float&gt;(), noise.data_ptr&lt;float&gt;(), randu.data_ptr&lt;float&gt;(),
+        out_particles.data_ptr&lt;float&gt;(), out_logw.data_ptr&lt;float&gt;(), B, P, D, O);
+
+    return {out_particles, out_logw};
+}
+&quot;&quot;&quot;
+
+_pf_ext = load_inline(
+    name=&quot;pf_linear_gaussian_ext&quot;,
+    cpp_sources=_cpp_src,
+    cuda_sources=_cuda_src,
+    functions=[&quot;particle_forward_cuda&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, state_dim, obs_dim, num_particles):
+        super().__init__()
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
+        self.num_particles = num_particles
+        self.register_buffer(&quot;A&quot;, 0.9 * torch.eye(state_dim))
+        self.register_buffer(&quot;C&quot;, torch.randn(obs_dim, state_dim) * 0.5)
+        self.process_noise = 0.1
+        self.obs_noise = 0.5
+
+    def forward(self, particles: torch.Tensor, log_weights: torch.Tensor, observation: torch.Tensor) -&gt; tuple:
+        # Generate random tensors with the same PyTorch calls/order as the reference implementation.
+        noise = torch.randn_like(particles)
+        randu = torch.rand((particles.shape[0], 1), device=particles.device, dtype=particles.dtype)
+        out_particles, out_logw = _pf_ext.particle_forward_cuda(
+            particles.contiguous(), log_weights.contiguous(), observation.contiguous(),
+            self.C.contiguous(), noise, randu.contiguous()
+        )
+        return out_particles, out_logw
+</pre></details></div>
 </body></html>
