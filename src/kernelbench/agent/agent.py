@@ -111,6 +111,7 @@ class KernelAgent:
         warn_turns_remaining: int = 2,
         turn_delay_s: float = 0.0,
         verbose: bool = False,
+        api_kind: str = "openai",
     ) -> None:
         self.problem_id = problem_id
         self.level = level
@@ -127,6 +128,7 @@ class KernelAgent:
         self.warn_turns_remaining = warn_turns_remaining
         self.turn_delay_s = turn_delay_s
         self.verbose = verbose
+        self.api_kind = api_kind
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -161,6 +163,12 @@ class KernelAgent:
 
     def run(self) -> KernelTrajectory:
         """Execute the agent loop and return a completed KernelTrajectory."""
+        if self.api_kind == "openai_chat":
+            return self._run_chat_completions()
+        return self._run_responses()
+
+    def _run_responses(self) -> KernelTrajectory:
+        """Original Responses-API loop."""
         trajectory = KernelTrajectory(
             problem_id=self.problem_id,
             level=self.level,
@@ -482,3 +490,319 @@ class KernelAgent:
                 ),
                 metadata={"unexpected_error": str(e)},
             )
+
+    # -----------------------------------------------------------------------
+    # Chat Completions code path
+    # -----------------------------------------------------------------------
+
+    def _run_chat_completions(self) -> KernelTrajectory:
+        """Agent loop that uses the OpenAI Chat Completions API.
+
+        Used for models behind endpoints that don't speak the Responses API
+        (e.g. DeepSeek-R1, Llama-Maverick, Kimi via Azure AI Inference).
+
+        Differences vs. _run_responses():
+          - State is a list of messages: {role, content, ...}.
+          - Tool calls come back on the assistant message as `tool_calls=[...]`,
+            and we reply with role="tool" messages keyed by tool_call_id.
+          - Tool schemas use the nested {"type":"function","function":{...}}
+            shape rather than the flat Responses shape.
+          - No `reasoning` items; if a model returns reasoning_content (e.g.
+            DeepSeek-R1) we capture it for the trajectory but don't resend it.
+        """
+        trajectory = KernelTrajectory(
+            problem_id=self.problem_id,
+            level=self.level,
+            problem_name=self.problem_name,
+            run_name=self.run_name,
+            model_name=self.model,
+            backend=self.backend,
+            precision=self.precision,
+            max_turns=self.max_turns,
+            max_tool_calls=self.max_tool_calls,
+            tools_enabled=self.tool_names_enabled,
+        )
+
+        instructions = build_system_prompt(
+            max_turns=self.max_turns,
+            max_tool_calls=self.max_tool_calls,
+            backend=self.backend,
+            tool_names=self.tool_names_enabled,
+        )
+        problem_msg = build_problem_message(
+            ref_arch_src=self.ref_arch_src,
+            backend=self.backend,
+            precision=self.precision,
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": problem_msg},
+        ]
+
+        # Convert each tool's flat Responses schema into the nested Chat shape.
+        tool_schemas = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            }
+            for t in self.tools
+        ]
+
+        for turn_idx in range(self.max_turns):
+            if turn_idx > 0 and self.turn_delay_s > 0:
+                time.sleep(self.turn_delay_s)
+
+            turns_remaining = self.max_turns - turn_idx
+            tool_calls_remaining = self.max_tool_calls - self._total_tool_calls
+            if turns_remaining <= self.warn_turns_remaining and turn_idx > 0:
+                has_profiling = bool(
+                    {"profile_kernel", "disassemble_kernel", "ert_roofline"}
+                    & set(self.tool_names_enabled)
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": build_turn_warning_message(
+                            turns_remaining,
+                            tool_calls_remaining,
+                            has_profiling_tools=has_profiling,
+                        ),
+                    }
+                )
+
+            messages_in_snapshot = json.loads(json.dumps(messages))
+
+            t0 = time.time()
+            try:
+                create_kwargs: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": tool_schemas,
+                    "tool_choice": "auto",
+                }
+                response = self.client.chat.completions.create(**create_kwargs)
+            except Exception as e:
+                err_msg = f"{type(e).__name__}: {e}"
+                tb = traceback.format_exc()
+                print(
+                    f"[Agent/chat] LLM call FAILED on turn {turn_idx} "
+                    f"(problem {self.problem_id}, level {self.level}):\n"
+                    f"{err_msg}\n{tb}"
+                )
+                trajectory.add_turn(
+                    KernelTurn(
+                        turn_id=turn_idx,
+                        messages_in=messages_in_snapshot,
+                        response=[],
+                        feedback_to_model=f"LLM call failed: {err_msg}",
+                        llm_latency_s=time.time() - t0,
+                        is_final=False,
+                    )
+                )
+                trajectory.finish(self._final_result)
+                return trajectory
+            llm_latency = time.time() - t0
+
+            choice = response.choices[0]
+            asst = choice.message
+            asst_content = asst.content or ""
+            reasoning = getattr(asst, "reasoning_content", None) or ""
+            raw_tool_calls = list(asst.tool_calls or [])
+
+            # Build the assistant message that goes back into `messages` for
+            # the next turn. Chat Completions requires tool_calls (and ids) to
+            # be echoed back in the assistant message; otherwise the role=tool
+            # replies have nothing to anchor to.
+            asst_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": asst_content,
+            }
+            if raw_tool_calls:
+                asst_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in raw_tool_calls
+                ]
+            messages.append(asst_msg)
+
+            # Build a Responses-shaped record for the trajectory (so the HTML
+            # report doesn't have to know about both API shapes).
+            response_items: list[dict[str, Any]] = []
+            if reasoning:
+                response_items.append(
+                    {"type": "reasoning", "summary": [{"text": reasoning}]}
+                )
+            if asst_content:
+                response_items.append(
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": asst_content}],
+                    }
+                )
+            for tc in raw_tool_calls:
+                response_items.append(
+                    {
+                        "type": "function_call",
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                        "call_id": tc.id,
+                    }
+                )
+
+            executed_tool_calls: list[ToolCall] = []
+            is_final = False
+            submitted_kernel: str | None = None
+
+            if not raw_tool_calls:
+                trajectory.add_turn(
+                    KernelTurn(
+                        turn_id=turn_idx,
+                        messages_in=messages_in_snapshot,
+                        response=response_items,
+                        tool_calls=[],
+                        feedback_to_model="",
+                        llm_latency_s=llm_latency,
+                        is_final=False,
+                    )
+                )
+                if self.verbose:
+                    print("[Agent/chat] No tool calls — ending loop.")
+                break
+
+            for tc in raw_tool_calls:
+                tool_name = tc.function.name or ""
+                raw_args = tc.function.arguments or "{}"
+
+                if self._total_tool_calls >= self.max_tool_calls:
+                    output_text = (
+                        "Tool call limit reached. No further tool calls will "
+                        "be executed this run."
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": output_text}
+                    )
+                    executed_tool_calls.append(
+                        ToolCall(
+                            tool_name=tool_name,
+                            args={},
+                            result_text=output_text,
+                            success=False,
+                            metadata={"skipped": "tool_call_limit_reached"},
+                        )
+                    )
+                    continue
+
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except json.JSONDecodeError as e:
+                    output_text = (
+                        f"Tool call arguments could not be parsed as JSON: {e}. "
+                        "Please re-issue the call with valid JSON arguments."
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": output_text}
+                    )
+                    executed_tool_calls.append(
+                        ToolCall(
+                            tool_name=tool_name,
+                            args={"_raw": raw_args},
+                            result_text=output_text,
+                            success=False,
+                            metadata={"error": "invalid_json_arguments"},
+                        )
+                    )
+                    self._total_tool_calls += 1
+                    continue
+
+                if tool_name not in self.tool_map:
+                    output_text = (
+                        f"Unknown tool '{tool_name}'. Available tools: "
+                        f"{', '.join(self.tool_names_enabled)}."
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": output_text}
+                    )
+                    executed_tool_calls.append(
+                        ToolCall(
+                            tool_name=tool_name,
+                            args=args,
+                            result_text=output_text,
+                            success=False,
+                            metadata={"error": "unknown_tool"},
+                        )
+                    )
+                    self._total_tool_calls += 1
+                    continue
+
+                tool = self.tool_map[tool_name]
+                tool_result = self._execute_tool(tool, args)
+                self._total_tool_calls += 1
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_result.output,
+                    }
+                )
+
+                logged_args = {
+                    k: (
+                        v[:200] + f"... [truncated, full len={len(v)}]"
+                        if isinstance(v, str) and len(v) > 200
+                        else v
+                    )
+                    for k, v in args.items()
+                }
+                executed_tool_calls.append(
+                    ToolCall(
+                        tool_name=tool_name,
+                        args=logged_args,
+                        result_text=tool_result.output,
+                        success=tool_result.success,
+                        metadata=tool_result.metadata,
+                    )
+                )
+
+                if tool_name == "submit_kernel":
+                    submitted_kernel = args.get("kernel_code")
+                    meta = tool_result.metadata or {}
+                    if "compiled" in meta and "correctness" in meta:
+                        is_final = True
+                        try:
+                            self._final_result = KernelExecResult(**meta)
+                        except Exception:
+                            self._final_result = None
+                        break
+
+            trajectory.add_turn(
+                KernelTurn(
+                    turn_id=turn_idx,
+                    messages_in=messages_in_snapshot,
+                    response=response_items,
+                    tool_calls=executed_tool_calls,
+                    feedback_to_model="",
+                    llm_latency_s=llm_latency,
+                    is_final=is_final,
+                    submitted_kernel=submitted_kernel,
+                )
+            )
+
+            if is_final:
+                if self.verbose:
+                    print(f"[Agent/chat] Final submission on turn {turn_idx}.")
+                break
+
+        trajectory.finish(self._final_result)
+        return trajectory
