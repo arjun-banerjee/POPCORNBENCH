@@ -5,10 +5,11 @@
 # land under runs/{single_turn,multi_turn_default,multi_turn_all}/ and are
 # republished to GitHub Pages every five minutes by publish_to_gh_pages.py.
 #
-# Recommended layout (run inside tmux):
+# Recommended layout (run inside tmux). The LD_LIBRARY_PATH export is the
+# conda-libstdc++ fix needed for torch / nvcc to find the right runtime:
 #
-#   tmux new -s sweeps  './scripts/run_all_sweeps.sh'
-#   tmux new -s pub     'uv run python scripts/publish_to_gh_pages.py --watch 300'
+#   tmux new -s sweeps  'export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; ./scripts/run_all_sweeps.sh'
+#   tmux new -s pub     'export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/publish_to_gh_pages.py --watch 300'
 #
 # Live local report (per-sweep, while it's running):
 #   ssh -L 8765:localhost:8765 user@host    # then http://localhost:8765
@@ -18,6 +19,9 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Conda libstdc++ fix — torch / nvcc otherwise pick up the wrong runtime.
+export LD_LIBRARY_PATH="/opt/conda/lib:${LD_LIBRARY_PATH:-}"
 
 CONFIGS=(
   configs/sweep.single_turn.toml
