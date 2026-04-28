@@ -13,6 +13,7 @@ from kernelbench.prompt_constructor_toml import get_prompt_for_backend, get_cust
 from kernelbench.utils import (
     create_inference_server_from_presets,
     extract_first_code,
+    extract_last_code,
     maybe_multithread,
     set_gpu_arch,
 )
@@ -46,7 +47,10 @@ class GenerationConfig(Config):
             None,
         )  # (start_id, end_id), both inclusive - logical 1-indexed IDs
 
-        self.run_name = REQUIRED  # name of the run
+        self.run_name = REQUIRED  # name of the run (used under runs_dir unless run_dir is set)
+
+        # If set, kernels are written here directly (overrides joining runs_dir + run_name).
+        self.run_dir = None
 
         # num of thread pool to call inference server in parallel
         self.num_workers = 64
@@ -76,7 +80,10 @@ class GenerationConfig(Config):
         # Number of samples to generate per problem for pass@k analysis
         self.num_samples = 1  # Default to 1 sample per problem
 
+        # log=true enables both log_prompt and log_generated_kernel (like generate_and_eval_single_sample)
+        self.log = False
         self.log_prompt = False
+        self.log_generated_kernel = False  # save full LLM reply before code extraction
 
         self.backend = "cuda"
         
@@ -142,9 +149,18 @@ def generate_sample_single(
             f.write(custom_prompt)
 
     # Query server with constructed prompt
-    custom_kernel = inference_server(custom_prompt)
-    custom_kernel = extract_first_code(custom_kernel, ["python", "cpp"])
-    # check LLM is able to generate custom CUDA code
+    raw_text = inference_server(custom_prompt)
+    if config.log_generated_kernel:
+        raw_path = os.path.join(
+            run_dir,
+            f"level_{config.level}_problem_{work.problem_id}_sample_{work.sample_id}_raw.txt",
+        )
+        with open(raw_path, "w") as f:
+            f.write(raw_text if raw_text is not None else "")
+
+    custom_kernel = extract_first_code(raw_text, ["python", "cpp"])
+    if custom_kernel is None and raw_text is not None:
+        custom_kernel = extract_last_code(raw_text, ["python", "cpp"])
     assert custom_kernel is not None, "Custom CUDA code generation failed"
 
     # Optional: we provide a static code checker for kernel code using regex matching
@@ -222,6 +238,31 @@ def main(config: GenerationConfig):
     # Convert string boolean to actual boolean for reasoning model flag
     if isinstance(config.is_reasoning_model, str):
         config.is_reasoning_model = config.is_reasoning_model.lower() in ['true', '1', 'yes']
+
+    if isinstance(config.log, str):
+        config.log = config.log.lower() in ("true", "1", "yes")
+    if config.log:
+        config.log_prompt = True
+        config.log_generated_kernel = True
+
+    if isinstance(config.log_prompt, str):
+        config.log_prompt = config.log_prompt.lower() in ("true", "1", "yes")
+    if isinstance(config.log_generated_kernel, str):
+        config.log_generated_kernel = config.log_generated_kernel.lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
+    run_dir_override = getattr(config, "run_dir", None)
+    if isinstance(run_dir_override, str):
+        trimmed = run_dir_override.strip()
+        if trimmed.lower() in ("", "none"):
+            run_dir_override = None
+        else:
+            run_dir_override = trimmed
+    else:
+        run_dir_override = None
     
     custom_prompt_key = getattr(config, "custom_prompt_key", None)
     if isinstance(custom_prompt_key, str):
@@ -285,11 +326,17 @@ def main(config: GenerationConfig):
     )
 
     # set up run directory
-    run_dir = os.path.join(config.runs_dir, config.run_name)
+    if run_dir_override:
+        run_dir = os.path.abspath(os.path.expanduser(run_dir_override))
+    else:
+        run_dir = os.path.join(config.runs_dir, config.run_name)
     run_exists = os.path.exists(run_dir)
     if run_exists:
         print(f"\n⚠️  WARNING: Run directory already exists: {run_dir}")
-        print(f"   Existing kernels will be skipped. Use a different run_name for a fresh run.\n")
+        print(
+            "   Existing kernels will be skipped. Use a different run_name, a new run_dir, "
+            "or remove the directory for a fresh run.\n"
+        )
     os.makedirs(run_dir, exist_ok=True)
     pydra.save_yaml(config.to_dict(), os.path.join(run_dir, "generation_config.yaml"))
 

@@ -59,15 +59,16 @@ def measure_ref_program_time(
                 precision_dtype = precision
 
 
-            # set model weights and inputs to specified precision
-            inputs = [
-                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
-                for x in inputs
-            ]
-            init_inputs = [
-                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
-                for x in init_inputs
-            ]
+            # set model weights and inputs to specified precision (preserve integer tensors)
+            def _to_device_and_precision(t):
+                if not isinstance(t, torch.Tensor):
+                    return t
+                if not t.is_floating_point():
+                    return t.to(device=device)
+                return t.to(device=device, dtype=precision_dtype)
+
+            inputs = [_to_device_and_precision(x) for x in inputs]
+            init_inputs = [_to_device_and_precision(x) for x in init_inputs]
 
             model = Model(*init_inputs)
             model = model.to(device=device, dtype=precision_dtype)
