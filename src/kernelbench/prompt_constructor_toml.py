@@ -23,6 +23,9 @@ HARDWARE_COMPONENT_KEYS = [
     "hardware_definitions",
     "hardware_best_practices",
 ]
+SOURCE_HARDWARE_COMPONENT_KEYS = [
+    "source_hardware_specs",
+]
 
 @dataclass
 class PromptConfig:
@@ -124,6 +127,12 @@ def _gpu_context_from_gpu_specs(py_path: str, gpu_name: str) -> Dict[str, str]:
         "gpu_best_practices_bullets": best_bullets,
     }
 
+def _source_gpu_context_from_gpu_specs(py_path: str, gpu_name: str) -> Dict[str, str]:
+    """Like _gpu_context_from_gpu_specs but returns keys prefixed with ``source_``
+    so they can coexist with the target-GPU context in the same render pass."""
+    target_ctx = _gpu_context_from_gpu_specs(py_path, gpu_name)
+    return {f"source_{k}": v for k, v in target_ctx.items()}
+
 def render_prompt_by_option(
     *,
     prompts_toml: str,
@@ -132,6 +141,7 @@ def render_prompt_by_option(
     context: Dict[str, str],
     gpu_specs_py: Optional[str] = None,
     gpu_name: Optional[str] = None,
+    source_gpu_name: Optional[str] = None,
     precision: Optional[str] = None,
     include_hardware: bool = False,
     components_override: Optional[List[str]] = None,
@@ -241,6 +251,17 @@ def render_prompt_by_option(
             }
         )
     
+    # Hardware-translation-mode formatting: pre-load the shared template strings
+    # into context; GPU-specific placeholders are resolved by the final
+    # .format(**context) call after GPU specs are loaded.
+    if option == "hardware_translation":
+        hw_trans_ps = shared.get("hardware_translation_problem_statement", "")
+        hw_trans_instr = shared.get("hardware_translation_instruction", "")
+        context.update({
+            "hardware_translation_problem_statement": hw_trans_ps,
+            "hardware_translation_instruction": hw_trans_instr,
+        })
+
     # Load precision details if provided
     if precision:
         try:
@@ -386,6 +407,15 @@ def render_prompt_by_option(
                 f"Hardware info requested for option '{option}'; provide gpu_specs_py and gpu_name"
             )
         context = {**context, **_gpu_context_from_gpu_specs(resolve_path(gpu_specs_py), gpu_name)}
+
+    # Load source-GPU details when any source_hardware_* component is present
+    has_source_hw = any(c in SOURCE_HARDWARE_COMPONENT_KEYS for c in component_sequence)
+    if has_source_hw:
+        if not (gpu_specs_py and source_gpu_name):
+            raise ValueError(
+                f"Source hardware component in option '{option}'; provide gpu_specs_py and source_gpu_name"
+            )
+        context = {**context, **_source_gpu_context_from_gpu_specs(resolve_path(gpu_specs_py), source_gpu_name)}
     
     # Builds the prompt from the components in the toml file.
     prompt_parts = []
@@ -403,6 +433,15 @@ def render_prompt_by_option(
                     f"Component '{component}' requires source_backend in context."
                 )
             prompt_parts.append(context[component])
+        elif component in ("hardware_translation_problem_statement", "hardware_translation_instruction"):
+            if component not in context:
+                raise ValueError(
+                    f"Component '{component}' requires source_gpu_name and gpu_name in context."
+                )
+            prompt_parts.append(context[component])
+        elif component.startswith("source_hardware_"):
+            template_key = f"templates.hardware.{component}"
+            prompt_parts.append(cfg.compose_blocks([template_key]))
         elif component.startswith("hardware_"):
             # Hardware components from templates.hardware
             template_key = f"templates.hardware.{component}"
@@ -538,6 +577,52 @@ def get_translation_prompt(
     )
 
 
+def get_hardware_translation_prompt(
+    *,
+    ref_arch_src: str,
+    source_kernel_src: str,
+    backend: str,
+    source_gpu_name: str,
+    target_gpu_name: str,
+    option: str = "hardware_translation",
+    precision: Optional[str] = None,
+) -> str:
+    """
+    Generate a hardware-translation prompt: re-optimize a kernel originally
+    tuned for one GPU architecture to run efficiently on another.
+
+    Unlike ``get_translation_prompt`` (which changes the DSL), this keeps the
+    same backend but changes the target hardware — e.g. an H100-tuned CUDA
+    kernel re-optimized for A100.
+
+    Args:
+        ref_arch_src: PyTorch reference architecture (functional contract).
+        source_kernel_src: The existing kernel tuned for source_gpu_name.
+        backend: The DSL / backend (same for source and target, e.g. "cuda").
+        source_gpu_name: GPU name the source kernel was optimized for
+            (must exist in gpu_specs.py, e.g. "H100").
+        target_gpu_name: GPU name to re-optimize for (e.g. "A100").
+        option: Prompt option name. Defaults to "hardware_translation".
+        precision: Optional precision string (fp32, fp16, bf16).
+    """
+    backend_lower = backend.lower()
+    return render_prompt_by_option(
+        prompts_toml=PROMPTS_TOML,
+        backend=backend_lower,
+        option=option.lower(),
+        context={
+            "ref_arch_src": ref_arch_src,
+            "source_kernel_src": source_kernel_src,
+            "source_backend": backend_lower,
+        },
+        precision=precision,
+        include_hardware=True,
+        gpu_specs_py=GPU_SPECS_PY,
+        gpu_name=target_gpu_name,
+        source_gpu_name=source_gpu_name,
+    )
+
+
 def get_custom_prompt(
     custom_key: str,
     *,
@@ -579,6 +664,7 @@ def get_custom_prompt(
 __all__ = [
     "get_prompt_for_backend",
     "get_translation_prompt",
+    "get_hardware_translation_prompt",
     "get_custom_prompt",
     "get_annotated_compile_prompt",
     "get_prompt_with_hardware",
@@ -662,6 +748,17 @@ def test_prompt():
         precision="fp32",
     )
     log_prompt(translation_cuda_triton, scratch_dir, "translation_cuda_triton.txt")
+
+    # hardware translation prompt: H100-tuned CUDA -> A100
+    hw_translation = get_hardware_translation_prompt(
+        ref_arch_src=ref_arch_src,
+        source_kernel_src=cuda_source,
+        backend="cuda",
+        source_gpu_name="H100",
+        target_gpu_name="A100",
+        precision="fp32",
+    )
+    log_prompt(hw_translation, scratch_dir, "hardware_translation_h100_a100.txt")
 
     # custom prompt defined in prompts.toml
     custom_prompt = get_custom_prompt(
