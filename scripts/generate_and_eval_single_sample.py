@@ -9,6 +9,7 @@ from kernelbench.eval import eval_kernel_against_ref
 from kernelbench.prompt_constructor_toml import (
     get_annotated_compile_prompt,
     get_custom_prompt,
+    get_hardware_translation_prompt,
     get_prompt_for_backend,
     get_translation_prompt,
 )
@@ -94,6 +95,12 @@ class EvalConfig(Config):
         #   source_backend == "pytorch" (the PyTorch reference is used).
         self.source_backend = None
         self.source_kernel_path = None
+
+        # Hardware translation mode: re-optimize a kernel from one GPU arch to
+        # another (same DSL). Set prompt_option=hardware_translation and provide
+        # source_hardware_gpu_name (the GPU the source kernel was tuned for) plus
+        # hardware_gpu_name (the target GPU). source_kernel_path is still needed.
+        self.source_hardware_gpu_name = None
 
         self.check_kernel = True  # [experimental] optional static checker catching potential hacking patterns
 
@@ -188,7 +195,7 @@ def main(config: EvalConfig):
 
     # Use appropriate prompt constructor based on backend
     prompt_option = str(config.prompt_option).lower()
-    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "annotated_compile", "translation"}
+    valid_prompt_options = {"zero_shot", "one_shot", "few_shot", "annotated_compile", "translation", "hardware_translation"}
     include_hardware = config.include_hardware_info
     if isinstance(include_hardware, str):
         include_hardware = include_hardware.lower() in ["true", "1", "yes"]
@@ -267,6 +274,38 @@ def main(config: EvalConfig):
             precision=config.precision,
             include_hardware=include_hardware,
             gpu_name=config.hardware_gpu_name,
+        )
+    elif prompt_option == "hardware_translation":
+        if not config.source_kernel_path:
+            raise ValueError(
+                "prompt_option=hardware_translation requires source_kernel_path."
+            )
+        if not config.source_hardware_gpu_name:
+            raise ValueError(
+                "prompt_option=hardware_translation requires source_hardware_gpu_name "
+                "(the GPU the source kernel was optimized for, e.g. 'H100')."
+            )
+        if not config.hardware_gpu_name:
+            raise ValueError(
+                "prompt_option=hardware_translation requires hardware_gpu_name "
+                "(the target GPU to re-optimize for, e.g. 'A100')."
+            )
+        src_path = config.source_kernel_path
+        if not os.path.isabs(src_path):
+            src_path = os.path.join(REPO_TOP_DIR, src_path)
+        if not os.path.exists(src_path):
+            raise FileNotFoundError(f"source_kernel_path not found: {src_path}")
+        with open(src_path, "r") as f:
+            hw_source_kernel_src = f.read()
+        source_kernel_src = hw_source_kernel_src
+        source_backend = backend
+        custom_prompt = get_hardware_translation_prompt(
+            ref_arch_src=ref_arch_src,
+            source_kernel_src=hw_source_kernel_src,
+            backend=backend,
+            source_gpu_name=config.source_hardware_gpu_name,
+            target_gpu_name=config.hardware_gpu_name,
+            precision=config.precision,
         )
     elif prompt_option == "annotated_compile":
         custom_prompt = get_annotated_compile_prompt(
