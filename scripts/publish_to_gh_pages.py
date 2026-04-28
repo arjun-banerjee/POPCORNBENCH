@@ -193,6 +193,28 @@ h1{font-weight:400;font-style:italic;font-size:32px;letter-spacing:-.02em}
     (worktree / ".nojekyll").write_text("")
 
 
+def _rebuild_reports(reports: list[tuple[str, Path]]) -> None:
+    """Re-run build_report.py against every detected run before copying.
+
+    Why subprocess instead of importing build_report directly: the running
+    sweep already has build_report imported into its own process and Python
+    caches that import, so updates from `git pull` aren't picked up there.
+    Running build_report as a fresh subprocess from the publisher guarantees
+    every cycle uses the latest code on disk — no sweep restart required.
+    """
+    builder = REPO_ROOT / "scripts" / "build_report.py"
+    for name, report_dir in reports:
+        run_dir = report_dir.parent  # runs/{name}/
+        try:
+            subprocess.run(
+                ["uv", "run", "python", str(builder), str(run_dir)],
+                cwd=str(REPO_ROOT), check=True, capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            tail = (e.stderr or "").strip()[-500:]
+            print(f"[publish] build_report failed for {name}: {tail}")
+
+
 def _has_changes(worktree: Path) -> bool:
     res = _run(["git", "status", "--porcelain"], cwd=worktree, capture=True)
     return bool(res.stdout.strip())
@@ -212,6 +234,12 @@ def publish_once(*, runs_dir: Path, branch: str, worktree: Path,
         return False
     print(f"[publish] found {len(reports)} report(s): "
           f"{', '.join(n for n, _ in reports)}")
+
+    # Always rebuild reports first so any code changes (git pull) take effect
+    # immediately — the running sweep's in-process build_report cache misses
+    # updates, but the publisher's subprocess invocation does not.
+    print("[publish] rebuilding reports from latest build_report.py …")
+    _rebuild_reports(reports)
 
     for name, src in reports:
         dst = worktree / name
