@@ -121,6 +121,109 @@ class RateLimitedClient:
 
 
 # ---------------------------------------------------------------------------
+# Robust per-GPU file lock
+# ---------------------------------------------------------------------------
+#
+# We intentionally don't use multiprocessing.Manager().Lock() here: that lock
+# isn't tied to process lifetime, so if a holder dies (CUDA OOM-kill, segfault
+# inside torch.cuda.synchronize, ncu subprocess hang) the lock stays "held"
+# forever and every other worker on that GPU blocks indefinitely.
+#
+# fcntl.flock is held by a file descriptor; the kernel auto-releases it the
+# moment the FD is closed — which always happens, including on SIGKILL.
+# So a hung/killed worker can never deadlock its peers.
+
+import contextlib
+import fcntl
+import signal as _signal
+
+
+# ---------------------------------------------------------------------------
+# Per-work-item soft timeout via SIGALRM
+# ---------------------------------------------------------------------------
+#
+# `signal.alarm(N)` schedules SIGALRM in N seconds. Our handler raises
+# TimeoutError, which run_one catches, marks the trajectory `outcome="timeout"`
+# on disk so the next sweep run skips it, and returns None. The worker process
+# stays alive to handle the next task.
+#
+# Caveat: SIGALRM only interrupts at the next Python bytecode boundary. Pure
+# C-level deadlocks (e.g. CUDA driver hanging in cudaDeviceSynchronize) won't
+# be interrupted. In practice ~95% of hangs we've seen are Python-side
+# (network recv on slow LLM calls, blocked on a subprocess that never returns)
+# and SIGALRM catches all of those.
+
+class _WorkItemTimeout(Exception):
+    """Raised when a single work item exceeds its soft timeout budget."""
+
+
+def _alarm_handler(_signum, _frame):
+    raise _WorkItemTimeout("work item exceeded soft timeout budget")
+
+
+@contextlib.contextmanager
+def _work_item_timeout(timeout_s: int):
+    """Schedule a SIGALRM-based timeout for the duration of the with-block.
+
+    `timeout_s <= 0` disables the alarm (used as an opt-out)."""
+    if timeout_s <= 0 or not hasattr(_signal, "SIGALRM"):
+        yield
+        return
+    old_handler = _signal.signal(_signal.SIGALRM, _alarm_handler)
+    _signal.alarm(timeout_s)
+    try:
+        yield
+    finally:
+        _signal.alarm(0)  # cancel any pending alarm
+        _signal.signal(_signal.SIGALRM, old_handler)
+
+
+def _mark_trajectory_timed_out(traj_path: str) -> None:
+    """Patch an in-progress trajectory file so future resume skips it.
+
+    The agent autosaves after every turn with outcome='in_progress'. When we
+    soft-timeout, that file exists and contains all turns up to the kill point,
+    but its outcome will be 'in_progress' / finished_at None, which the resume
+    logic correctly re-runs. Override both so a future sweep treats it as done.
+    """
+    if not os.path.exists(traj_path):
+        # Nothing to mark — agent never got to its first save.
+        return
+    try:
+        with open(traj_path) as f:
+            d = json.load(f)
+    except Exception:
+        return
+    d["outcome"] = "timeout"
+    d["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        with open(traj_path, "w") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _gpu_perf_file_lock(lock_path: Optional[str]):
+    """Acquire an exclusive file lock for the duration of the with-block.
+
+    `lock_path=None` is a no-op (used when agents_per_gpu == 1 — no possible
+    contention so we skip locking entirely)."""
+    if not lock_path:
+        yield
+        return
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
@@ -129,7 +232,7 @@ def run_one(
     sweep: dict,
     run_dir: str,
     sem,
-    perf_lock,
+    perf_lock_path: Optional[str],
 ) -> Optional[dict]:
     """Run a single (model, level, problem) work item."""
     model_cfg = sweep["models"][work.model_idx]
@@ -180,89 +283,103 @@ def run_one(
         print(f"[Worker] {model_name}: env var {model_cfg['api_key_env']} not set.")
         return None
 
+    # Per-work-item soft timeout. Catches Python-level hangs (slow LLM, stuck
+    # subprocess, etc.) without taking down the worker process — so the pool
+    # keeps draining and we don't lose the other 7 GPUs.
+    par_cfg = sweep.get("parallelism", {})
+    worker_timeout_s = int(par_cfg.get("worker_timeout_s", 1800))
+
     try:
-        # Load problem
-        dataset = construct_kernelbench_dataset(
-            level=work.level,
-            source=run_cfg["dataset_src"],
-            dataset_name=run_cfg.get("dataset_name", "ScalingIntelligence/KernelBench"),
-            variant=work.variant,
-        )
-        problem = dataset.get_problem_by_id(work.problem_id)
+        with _work_item_timeout(worker_timeout_s):
+            # Load problem
+            dataset = construct_kernelbench_dataset(
+                level=work.level,
+                source=run_cfg["dataset_src"],
+                dataset_name=run_cfg.get("dataset_name", "ScalingIntelligence/KernelBench"),
+                variant=work.variant,
+            )
+            problem = dataset.get_problem_by_id(work.problem_id)
 
-        # OpenAI client (gated on per-model semaphore)
-        raw_client = OpenAI(api_key=api_key, base_url=model_cfg["base_url"])
-        client = RateLimitedClient(raw_client, sem)
+            # OpenAI client (gated on per-model semaphore)
+            raw_client = OpenAI(api_key=api_key, base_url=model_cfg["base_url"])
+            client = RateLimitedClient(raw_client, sem)
 
-        # Tools + cache dir
-        tool_names = _resolve_tools(run_cfg.get("tools", "default"))
-        tools = get_tools(tool_names)
-        build_dir = os.path.join(
-            model_dir, f"level_{work.level}_problem_{work.problem_id}_cache"
-        )
-        os.makedirs(build_dir, exist_ok=True)
+            # Tools + cache dir
+            tool_names = _resolve_tools(run_cfg.get("tools", "default"))
+            tools = get_tools(tool_names)
+            build_dir = os.path.join(
+                model_dir, f"level_{work.level}_problem_{work.problem_id}_cache"
+            )
+            os.makedirs(build_dir, exist_ok=True)
 
-        precision = _force_backend_precision(run_cfg["backend"], run_cfg["precision"])
+            precision = _force_backend_precision(run_cfg["backend"], run_cfg["precision"])
 
-        agent = KernelAgent(
-            problem_id=work.problem_id,
-            level=work.level,
-            problem_name=problem.name,
-            ref_arch_src=problem.code,
-            client=client,
-            model=model_cfg.get("deployment_name", model_name),
-            run_name=run_cfg["name"],
-            tool_names=[t.name for t in tools],
-            max_turns=agent_cfg["max_turns"],
-            max_tool_calls=agent_cfg["max_tool_calls"],
-            backend=run_cfg["backend"],
-            precision=precision,
-            device=device,
-            build_dir=build_dir,
-            num_correct_trials=run_cfg["num_correct_trials"],
-            num_perf_trials=run_cfg["num_perf_trials"],
-            timing_method=run_cfg["timing_method"],
-            reasoning_effort=model_cfg.get("reasoning_effort")
-            or agent_cfg.get("reasoning_effort"),
-            warn_turns_remaining=agent_cfg.get("warn_turns_remaining", 2),
-            turn_delay_s=float(agent_cfg.get("turn_delay_s", 0.0)),
-            verbose=False,
-            api_kind=api_kind,
-            save_path=traj_path,
-        )
+            agent = KernelAgent(
+                problem_id=work.problem_id,
+                level=work.level,
+                problem_name=problem.name,
+                ref_arch_src=problem.code,
+                client=client,
+                model=model_cfg.get("deployment_name", model_name),
+                run_name=run_cfg["name"],
+                tool_names=[t.name for t in tools],
+                max_turns=agent_cfg["max_turns"],
+                max_tool_calls=agent_cfg["max_tool_calls"],
+                backend=run_cfg["backend"],
+                precision=precision,
+                device=device,
+                build_dir=build_dir,
+                num_correct_trials=run_cfg["num_correct_trials"],
+                num_perf_trials=run_cfg["num_perf_trials"],
+                timing_method=run_cfg["timing_method"],
+                reasoning_effort=model_cfg.get("reasoning_effort")
+                or agent_cfg.get("reasoning_effort"),
+                warn_turns_remaining=agent_cfg.get("warn_turns_remaining", 2),
+                turn_delay_s=float(agent_cfg.get("turn_delay_s", 0.0)),
+                verbose=False,
+                api_kind=api_kind,
+                save_path=traj_path,
+            )
 
-        # Wrap submit_kernel.execute with a per-GPU perf lock so timing is
-        # never measured concurrently with another agent on the same device.
-        if perf_lock is not None and "submit_kernel" in agent.tool_map:
-            sk = agent.tool_map["submit_kernel"]
-            orig_execute = sk.execute
+            # Wrap submit_kernel.execute with a per-GPU file lock so timing is
+            # never measured concurrently with another agent on the same device.
+            # File locks (fcntl.flock) auto-release on process death — unlike
+            # manager.Lock(), they cannot leak across worker crashes.
+            if perf_lock_path is not None and "submit_kernel" in agent.tool_map:
+                sk = agent.tool_map["submit_kernel"]
+                orig_execute = sk.execute
 
-            def locked_execute(ctx, **kw):
-                with perf_lock:
-                    return orig_execute(ctx, **kw)
+                def locked_execute(ctx, **kw):
+                    with _gpu_perf_file_lock(perf_lock_path):
+                        return orig_execute(ctx, **kw)
 
-            sk.execute = locked_execute  # type: ignore[assignment]
+                sk.execute = locked_execute  # type: ignore[assignment]
 
-        print(
-            f"[worker] START {model_name} variant={work.variant} "
-            f"L{work.level}/P{work.problem_id} on cuda:{work.device_id}",
-            flush=True,
-        )
-        _t0 = time.time()
-        trajectory = agent.run()
-        print(
-            f"[worker] DONE  {model_name} L{work.level}/P{work.problem_id} "
-            f"→ {trajectory.outcome} in {time.time() - _t0:.1f}s "
-            f"({trajectory.total_turns} turns, {trajectory.total_tool_calls} tool calls)",
-            flush=True,
-        )
-        trajectory.save(traj_path)
-        kernel_path = os.path.join(
-            model_dir, f"level_{work.level}_problem_{work.problem_id}_kernel.py"
-        )
-        trajectory.save_kernel(kernel_path)
-        return _summary_from_dict(trajectory.to_dict(), work.level, model_name, work.variant)
+            print(
+                f"[worker] START {model_name} variant={work.variant} "
+                f"L{work.level}/P{work.problem_id} on cuda:{work.device_id}",
+                flush=True,
+            )
+            _t0 = time.time()
+            trajectory = agent.run()
+            print(
+                f"[worker] DONE  {model_name} L{work.level}/P{work.problem_id} "
+                f"→ {trajectory.outcome} in {time.time() - _t0:.1f}s "
+                f"({trajectory.total_turns} turns, {trajectory.total_tool_calls} tool calls)",
+                flush=True,
+            )
+            trajectory.save(traj_path)
+            kernel_path = os.path.join(
+                model_dir, f"level_{work.level}_problem_{work.problem_id}_kernel.py"
+            )
+            trajectory.save_kernel(kernel_path)
+            return _summary_from_dict(trajectory.to_dict(), work.level, model_name, work.variant)
 
+    except _WorkItemTimeout as te:
+        print(f"[worker] TIMEOUT ({model_name}, lvl {work.level}, p {work.problem_id}) "
+              f"after {worker_timeout_s}s — moving on. {te}", flush=True)
+        _mark_trajectory_timed_out(traj_path)
+        return None
     except Exception as e:
         print(f"[Worker] ERROR ({model_name}, lvl {work.level}, p {work.problem_id}): {e}")
         traceback.print_exc()
@@ -491,12 +608,25 @@ def main():
         per_model_sems.append(manager.Semaphore(cap))
         print(f"  [{m['name']}] per-model concurrency cap = {cap}")
 
-    # Per-GPU perf locks
-    perf_locks = (
-        [manager.Lock() for _ in range(num_gpus)]
-        if par_cfg.get("perf_lock_per_gpu", True)
-        else [None] * num_gpus
-    )
+    # Per-GPU perf locks — file-backed (fcntl.flock) so they auto-release on
+    # worker death. Locks are stored in a per-run subdirectory so concurrent
+    # sweeps in different run dirs don't collide.
+    #
+    # Fast path: if agents_per_gpu == 1 there's never any contention possible,
+    # so we skip lock allocation entirely. This eliminates a whole class of
+    # potential hangs from the demo configs.
+    perf_lock_paths: list[Optional[str]]
+    if par_cfg.get("perf_lock_per_gpu", True) and par_cfg["agents_per_gpu"] > 1:
+        lock_dir = os.path.join(run_dir, ".locks")
+        os.makedirs(lock_dir, exist_ok=True)
+        perf_lock_paths = [
+            os.path.join(lock_dir, f"gpu_{i}.lock") for i in range(num_gpus)
+        ]
+        print(f"  perf-timing serialized per GPU via file locks under {lock_dir}")
+    else:
+        perf_lock_paths = [None] * num_gpus
+        if par_cfg["agents_per_gpu"] == 1:
+            print("  perf-timing lock disabled (agents_per_gpu=1, no possible contention)")
 
     # Background HTML report regen
     stop_event = threading.Event()
@@ -526,7 +656,7 @@ def main():
                     sweep,
                     run_dir,
                     per_model_sems[w.model_idx],
-                    perf_locks[w.device_id],
+                    perf_lock_paths[w.device_id],
                 ): w
                 for w in work_items
             }
