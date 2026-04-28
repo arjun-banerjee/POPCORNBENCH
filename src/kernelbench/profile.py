@@ -60,6 +60,48 @@ def check_ncu_available() -> bool:
 
 
 # =============================================================================
+# Per-Kernel Breakdown (via torch.profiler)
+# =============================================================================
+
+def _get_kernel_breakdown(model, inputs, device, verbose=False):
+    """
+    Quick torch.profiler pass to identify which CUDA kernels the model
+    launches and their relative durations.  Runs before ncu so it doesn't
+    add overhead to the instrumented pass.
+
+    Returns a list of dicts sorted by GPU time descending:
+        [{"name": str, "cuda_time_us": float, "calls": int}, ...]
+    """
+    try:
+        import torch.autograd.profiler as _profiler
+
+        with torch.no_grad():
+            with _profiler.profile(use_cuda=True) as prof:
+                model(*inputs)
+            torch.cuda.synchronize(device)
+
+        events = prof.function_events
+        cuda_events = []
+        for e in events:
+            if e.cuda_time_total > 0 and not e.key.startswith("cudaDevice"):
+                cuda_events.append(
+                    {
+                        "name": e.key,
+                        "cuda_time_us": e.cuda_time_total,
+                        "calls": e.count,
+                    }
+                )
+        cuda_events.sort(key=lambda x: x["cuda_time_us"], reverse=True)
+        if verbose and cuda_events:
+            print(f"[Profile] Kernel breakdown: {len(cuda_events)} CUDA kernels found")
+        return cuda_events
+    except Exception as exc:
+        if verbose:
+            print(f"[Profile] torch.profiler kernel breakdown failed: {exc}")
+        return []
+
+
+# =============================================================================
 # Core Profiling Functions
 # =============================================================================
 
@@ -280,38 +322,43 @@ def profile_kernelbench_model_with_nsight(
         print("[Profile] Model instantiated successfully")
     
     # -------------------------------------------------------------------------
-    # Step 4: Profile the forward pass
+    # Step 4: Per-kernel breakdown via torch.profiler (lightweight, pre-ncu)
     # -------------------------------------------------------------------------
-    # Generate forward pass inputs
     set_seed(seed)
     inputs = [
-        _process_input_tensor(x, device, backend, precision) 
+        _process_input_tensor(x, device, backend, precision)
         for x in get_inputs()
     ]
-    
+
+    kernel_breakdown = _get_kernel_breakdown(custom_model, inputs, device, verbose)
+
+    # -------------------------------------------------------------------------
+    # Step 5: Profile the forward pass with Nsight (ncu)
+    # -------------------------------------------------------------------------
     if verbose:
-        print(f"[Profile] Profiling with nsight (metrics: {metrics})...")
-    
-    # Create a closure for the forward pass
+        print(f"[Profile] Profiling with nsight (metrics: {len(metrics)} metrics)...")
+
     def model_forward():
         with torch.no_grad():
             return custom_model(*inputs)
-    
-    # Run profiling
+
     metric_values = profile_with_nsight(
-        model_forward, 
-        metrics=metrics, 
-        num_trials=num_trials
+        model_forward,
+        metrics=metrics,
+        num_trials=num_trials,
     )
-    
+
     if verbose:
         print("[Profile] Profiling completed successfully")
-    
+
+    # Attach kernel breakdown to results (special key, not a metric)
+    metric_values["_kernel_breakdown"] = kernel_breakdown
+
     # -------------------------------------------------------------------------
-    # Step 5: Cleanup
+    # Step 6: Cleanup
     # -------------------------------------------------------------------------
     graceful_eval_cleanup(context, device, tempfile)
-    
+
     return metric_values
 
 

@@ -66,7 +66,7 @@ from kernelbench.kernel_static_checker import validate_kernel_static
 
 @dataclass
 class ToolContext:
-    """Immutable context shared across all tool calls for one agent run."""
+    """Shared per-run state passed into every tool call."""
 
     ref_arch_src: str  # reference PyTorch model source
     backend: str  # "cuda" | "triton" | "tilelang" | "cute" | "hip"
@@ -77,6 +77,9 @@ class ToolContext:
     num_perf_trials: int = 100  # timing trials in submit_kernel
     timing_method: str = "cuda_event"
     verbose: bool = False
+
+    # Mutable: last profile result for delta comparison across iterations
+    _last_profile_summary: Any = field(default=None, init=False, repr=False)
 
     @property
     def torch_precision(self) -> torch.dtype:
@@ -316,19 +319,18 @@ class RunCorrectnessTool(Tool):
 class ProfileKernelTool(Tool):
     name = "profile_kernel"
     description = (
-        "Profile the kernel with NVIDIA Nsight Compute. Use this when you have "
-        "a correct kernel and need to diagnose why it is slow — it shows whether "
-        "you are memory- or compute-bound. Returns memory-bandwidth utilization, "
-        "compute throughput, arithmetic intensity, and roofline classification. "
-        "Requires ncu and hardware-counter access permissions."
+        "Profile the kernel with NVIDIA Nsight Compute. Returns comprehensive "
+        "diagnostics: DRAM bandwidth utilization, compute throughput "
+        "(FP32/FP16/tensor-core), per-kernel breakdown, warp stall reasons, "
+        "memory coalescing quality, shared-memory bank conflicts, L1/L2 hit "
+        "rates, occupancy with limiting factors (registers, smem, block size), "
+        "pipe utilization, branch divergence, eligible-warps analysis, and "
+        "targeted data-driven optimization hints. Supports delta comparison "
+        "across iterations. Use when you have a correct kernel and need to "
+        "understand why it is slow."
     )
     input_schema = _KERNEL_CODE_SCHEMA
 
-    # Path to the standalone profiling worker script.  nsight-python's
-    # @nsight.analyze.kernel decorator relaunches sys.argv[0] under ncu.
-    # By running profiling in a separate subprocess whose argv[0] is this
-    # worker, the ncu relaunch only re-enters the lightweight worker — not
-    # the batch agent driver.
     _WORKER_SCRIPT = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))),
@@ -403,14 +405,14 @@ class ProfileKernelTool(Tool):
                     metadata={"error": stderr_tail},
                 )
 
-            raw_metrics = json.loads(proc.stdout.strip().splitlines()[-1])
+            raw_output = json.loads(proc.stdout.strip().splitlines()[-1])
 
-            if "error" in raw_metrics:
+            if "error" in raw_output:
                 return ToolResult(
                     tool_name=self.name,
                     success=False,
-                    output=f"profile_kernel FAILED: {raw_metrics['error']}",
-                    metadata={"error": raw_metrics["error"]},
+                    output=f"profile_kernel FAILED: {raw_output['error']}",
+                    metadata={"error": raw_output["error"]},
                 )
 
         except subprocess.TimeoutExpired:
@@ -428,21 +430,40 @@ class ProfileKernelTool(Tool):
                 metadata={"error": str(e)},
             )
 
+        # Separate kernel breakdown from ncu metric values
+        kernel_breakdown = raw_output.pop("_kernel_breakdown", [])
+        raw_metrics = raw_output
+
         device_name = torch.cuda.get_device_name(ctx.device)
-        summary = parse_nsight_metrics(raw_metrics, device_name)
+        previous = ctx._last_profile_summary
+        summary = parse_nsight_metrics(
+            raw_metrics, device_name, kernel_breakdown=kernel_breakdown
+        )
+
+        # Store for delta comparison on next invocation
+        ctx._last_profile_summary = summary
 
         return ToolResult(
             tool_name=self.name,
             success=True,
             output=(
-                f"profile_kernel PASSED: roofline analysis complete.\n"
-                f"{summary.format_for_llm()}"
+                f"profile_kernel PASSED: profiling complete.\n"
+                f"{summary.format_for_llm(previous=previous)}"
             ),
             metadata={
-                "raw_metrics": {k: v for k, v in raw_metrics.items() if v is not None},
+                "raw_metrics": {
+                    k: v for k, v in raw_metrics.items() if v is not None
+                },
                 "bottleneck": summary.bottleneck,
-                "bw_utilization_pct": summary.bw_utilization_pct,
-                "compute_utilization_pct": summary.compute_utilization_pct,
+                "dram_utilization_pct": summary.dram_utilization_pct,
+                "dominant_pipe": summary.dominant_pipe,
+                "dominant_utilization_pct": summary.dominant_utilization_pct,
+                "occupancy_pct": summary.occupancy_pct,
+                "top_stall": (
+                    max(summary.warp_stalls.items(), key=lambda x: x[1])
+                    if summary.warp_stalls
+                    else None
+                ),
             },
         )
 
