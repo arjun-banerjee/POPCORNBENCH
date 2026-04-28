@@ -154,6 +154,48 @@ header .page-wrap { padding-top: 36px; padding-bottom: 24px; }
 .tldr-cell .l { font-size: 10px; opacity: 0.45; font-style: italic; letter-spacing: 0.07em; }
 .tldr-cell .v { font-size: 14px; }
 
+/* extended metrics block */
+.metrics {
+  border: 1px solid var(--g15); margin: 18px 0;
+}
+.metrics-section {
+  border-bottom: 1px solid var(--g15);
+}
+.metrics-section:last-child { border-bottom: none; }
+.metrics-section > .metrics-head {
+  background: var(--g08); padding: 8px 14px; font-size: 11px;
+  font-style: italic; letter-spacing: 0.07em; opacity: 0.7;
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.metrics-section > .metrics-head .src {
+  font-size: 10px; opacity: 0.55;
+}
+.metrics-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 1px; background: var(--g15);
+}
+.metric {
+  background: var(--w); padding: 8px 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.metric .l { font-size: 10px; opacity: 0.45; font-style: italic; letter-spacing: 0.07em; }
+.metric .v { font-size: 13px; }
+.metric .v.muted { opacity: 0.45; font-style: italic; }
+.metric .v.ratio-good { color: #2d6a4f; }
+.metric .v.ratio-bad { color: var(--y); }
+
+/* sweep-wide rollup table */
+.metrics-rollup {
+  width: 100%; border-collapse: collapse; margin: 0 0 6px 0;
+}
+.metrics-rollup td {
+  padding: 9px 14px; font-size: 12px;
+  border-bottom: 1px solid var(--g15);
+}
+.metrics-rollup td:first-child {
+  width: 38%; opacity: 0.55; font-style: italic;
+}
+
 .turn {
   border-top: 1px solid var(--g15); padding: 16px 0;
 }
@@ -281,6 +323,66 @@ def _speedup(d: dict) -> float | None:
     return None
 
 
+def _final_metric(d: dict, group: str, key: str) -> float | None:
+    """Pull a single numeric metric out of final_result.{group}[key]; None if missing/sentinel."""
+    fr = d.get("final_result") or {}
+    g = fr.get(group) or {}
+    if not isinstance(g, dict):
+        return None
+    v = g.get(key)
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if v < 0 or v == float("inf"):
+        return None
+    return v
+
+
+def _avg(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _aggregate_metrics(trajs: list[dict]) -> dict:
+    """Compute sweep-wide averages over the extended metrics, restricted to
+    correct kernels (so memory/energy ratios aren't polluted by failed runs).
+    """
+    correct = [d for d in trajs if d.get("outcome") == "correct"]
+    speedups = [s for s in (_speedup(d) for d in correct) if s is not None]
+    mem_ratios = [v for v in (_final_metric(d, "memory_stats", "memory_ratio") for d in correct) if v is not None]
+    fusion = [v for v in (_final_metric(d, "kernel_launch_stats", "fusion_ratio") for d in correct) if v is not None]
+    energy = [v for v in (_final_metric(d, "energy_stats", "energy_ratio") for d in correct) if v is not None]
+    sol = [v for v in (_final_metric(d, "sol_stats", "sol_score") for d in correct) if v is not None]
+    max_abs = [v for v in (_final_metric(d, "numerical_precision", "max_abs_error") for d in correct) if v is not None]
+    occ = [v for v in (_final_metric(d, "roofline_stats", "occupancy_pct") for d in correct) if v is not None]
+    dram = [v for v in (_final_metric(d, "roofline_stats", "dram_utilization_pct") for d in correct) if v is not None]
+    return {
+        "n_correct": len(correct),
+        "avg_speedup": _avg(speedups),
+        "avg_memory_ratio": _avg(mem_ratios),
+        "avg_fusion_ratio": _avg(fusion),
+        "avg_energy_ratio": _avg(energy),
+        "avg_sol": _avg(sol),
+        "avg_max_abs_err": _avg(max_abs),
+        "avg_occupancy_pct": _avg(occ),
+        "avg_dram_util_pct": _avg(dram),
+        "n_with_memory": len(mem_ratios),
+        "n_with_fusion": len(fusion),
+        "n_with_energy": len(energy),
+        "n_with_sol": len(sol),
+    }
+
+
+def _outcome_counts(trajs: list[dict]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for d in trajs:
+        o = d.get("outcome") or "unknown"
+        out[o] = out.get(o, 0) + 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Index / model pages
 # ---------------------------------------------------------------------------
@@ -292,8 +394,7 @@ def _stat_row(trajs: list[dict]) -> str:
         1 for d in trajs if (d.get("final_result") or {}).get("compiled")
     )
     n_done = sum(1 for d in trajs if d.get("finished_at"))
-    speedups = [s for s in (_speedup(d) for d in trajs) if s is not None]
-    avg_sp = sum(speedups) / len(speedups) if speedups else 0.0
+    agg = _aggregate_metrics(trajs)
     return f"""<div class="stat-row">
   <div class="stat"><div class="stat-label">trajectories</div>
     <div class="stat-val">{total}</div></div>
@@ -304,8 +405,55 @@ def _stat_row(trajs: list[dict]) -> str:
   <div class="stat"><div class="stat-label">compiled</div>
     <div class="stat-val">{n_compiled}</div></div>
   <div class="stat"><div class="stat-label">avg speedup (correct)</div>
-    <div class="stat-val">{avg_sp:.2f}x</div></div>
+    <div class="stat-val">{agg['avg_speedup']:.2f}x</div></div>
 </div>"""
+
+
+def _sweep_metrics_block(trajs: list[dict]) -> str:
+    """Sweep-wide rollup of extended eval metrics, averaged over correct items."""
+    agg = _aggregate_metrics(trajs)
+    counts = _outcome_counts(trajs)
+    if agg["n_correct"] == 0 and not counts:
+        return ""
+
+    def _row(label: str, val: str, note: str = "") -> str:
+        note_html = (f' <span style="opacity:0.45;font-style:italic;">({html.escape(note)})</span>'
+                     if note else "")
+        return f"<tr><td>{html.escape(label)}</td><td>{val}{note_html}</td></tr>"
+
+    nc = agg["n_correct"]
+    rows = [
+        _row("outcomes",
+             " · ".join(f'<span class="outcome-badge {_outcome_class(o)}">{o} {n}</span>'
+                        for o, n in sorted(counts.items(), key=lambda x: -x[1]))),
+        _row("avg speedup", f"{agg['avg_speedup']:.2f}x", f"over {nc} correct"),
+        _row("avg memory ratio (kernel / ref)",
+             f"{agg['avg_memory_ratio']:.2f}x" if agg["n_with_memory"] else "—",
+             f"{agg['n_with_memory']} samples"),
+        _row("avg fusion ratio (ref launches / kernel launches)",
+             f"{agg['avg_fusion_ratio']:.2f}x" if agg["n_with_fusion"] else "—",
+             f"{agg['n_with_fusion']} samples"),
+        _row("avg energy ratio (ref / kernel)",
+             f"{agg['avg_energy_ratio']:.2f}x" if agg["n_with_energy"] else "—",
+             f"{agg['n_with_energy']} samples"),
+        _row("avg SOL score (0–1)",
+             f"{agg['avg_sol']:.3f}" if agg["n_with_sol"] else "—",
+             f"{agg['n_with_sol']} samples"),
+        _row("avg DRAM util %",
+             f"{agg['avg_dram_util_pct']:.1f}%" if agg["avg_dram_util_pct"] else "—"),
+        _row("avg occupancy %",
+             f"{agg['avg_occupancy_pct']:.1f}%" if agg["avg_occupancy_pct"] else "—"),
+        _row("avg max abs error",
+             f"{agg['avg_max_abs_err']:.2e}" if agg["avg_max_abs_err"] else "—"),
+    ]
+    body = (
+        '<div class="metrics-section">'
+        '<div class="metrics-head"><span>sweep-wide eval metrics</span>'
+        '<span class="src">averaged over correct kernels</span></div>'
+        f'<table class="metrics-rollup"><tbody>{"".join(rows)}</tbody></table>'
+        '</div>'
+    )
+    return f'<div class="page-wrap"><div class="metrics">{body}</div></div>'
 
 
 def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
@@ -345,6 +493,7 @@ def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
     body = (
         head
         + _stat_row(all_trajs)
+        + _sweep_metrics_block(all_trajs)
         + f'<div class="page-wrap"><div class="tool-grid">{"".join(cards)}</div></div>'
     )
     return body
@@ -387,7 +536,12 @@ def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
     )
-    body = head + _stat_row(trajs) + f'<div class="page-wrap">{table}</div>'
+    body = (
+        head
+        + _stat_row(trajs)
+        + _sweep_metrics_block(trajs)
+        + f'<div class="page-wrap">{table}</div>'
+    )
     return body
 
 
@@ -477,6 +631,8 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str) -> str:
 {('<div style="margin-top:10px;font-size:12px;opacity:.7;"><b>skip reason:</b> ' + html.escape(str(d.get('skip_reason',''))) + '</div>') if d.get('skip_reason') else ''}
 </div>"""
 
+    metrics_html = _render_extended_metrics(fr)
+
     turns_html = []
     for t in d.get("turns", []):
         turns_html.append(_render_turn(t))
@@ -494,8 +650,199 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str) -> str:
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
     )
-    body = head + f'<div class="page-wrap">{tldr}{"".join(turns_html)}</div>'
+    body = head + f'<div class="page-wrap">{tldr}{metrics_html}{"".join(turns_html)}</div>'
     return body
+
+
+# ---------------------------------------------------------------------------
+# Per-trajectory extended-metrics block
+# ---------------------------------------------------------------------------
+
+def _fmt(v: Any, suffix: str = "", prec: int = 2) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+            return "—"
+        # treat -1 as the eval.py "not measured" sentinel
+        if isinstance(v, (int, float)) and v == -1:
+            return "—"
+        if isinstance(v, float):
+            if abs(v) >= 1e6 or (0 < abs(v) < 1e-3):
+                return f"{v:.{prec}e}{suffix}"
+            return f"{v:.{prec}f}{suffix}"
+        return f"{v}{suffix}"
+    s = str(v)
+    return s if s else "—"
+
+
+def _ratio_class(v: float | None, *, higher_is_better: bool, neutral: float = 1.0) -> str:
+    if v is None or v <= 0:
+        return ""
+    if higher_is_better:
+        return "ratio-good" if v >= neutral else "ratio-bad"
+    return "ratio-good" if v <= neutral else "ratio-bad"
+
+
+def _metric(label: str, val: str, cls: str = "") -> str:
+    return (f'<div class="metric"><div class="l">{html.escape(label)}</div>'
+            f'<div class="v {cls}">{val}</div></div>')
+
+
+def _section(title: str, source: str, cells: list[str]) -> str:
+    if not cells:
+        return ""
+    return (f'<div class="metrics-section">'
+            f'<div class="metrics-head"><span>{html.escape(title)}</span>'
+            f'<span class="src">{html.escape(source)}</span></div>'
+            f'<div class="metrics-grid">{"".join(cells)}</div></div>')
+
+
+def _render_extended_metrics(fr: dict) -> str:
+    """Render every extended eval metric stored on KernelExecResult."""
+    if not fr:
+        return ""
+
+    sections: list[str] = []
+
+    # Timing
+    rt = fr.get("runtime", -1)
+    rrt = fr.get("ref_runtime", -1)
+    sp = (rrt / rt) if (rt and rrt and rt > 0 and rrt > 0) else None
+    rstats = fr.get("runtime_stats") or {}
+    refstats = fr.get("ref_runtime_stats") or {}
+    timing_cells = [
+        _metric("kernel runtime",     _fmt(rt,  " μs")),
+        _metric("ref runtime",        _fmt(rrt, " μs")),
+        _metric("speedup",            _fmt(sp, "x") if sp else "—",
+                _ratio_class(sp, higher_is_better=True)),
+        _metric("kernel mean / median / std",
+                f"{_fmt(rstats.get('mean'),'')} / {_fmt(rstats.get('median'),'')} / {_fmt(rstats.get('std'),'')} μs"
+                if rstats else "—"),
+        _metric("ref mean / median / std",
+                f"{_fmt(refstats.get('mean'),'')} / {_fmt(refstats.get('median'),'')} / {_fmt(refstats.get('std'),'')} μs"
+                if refstats else "—"),
+    ]
+    # Translation mode
+    src_rt = fr.get("source_runtime", -1)
+    if src_rt and src_rt > 0:
+        timing_cells.append(_metric("source runtime",
+                                    f"{_fmt(src_rt,' μs')} ({fr.get('source_backend','?')})"))
+        timing_cells.append(_metric("speedup vs source",
+                                    _fmt(fr.get("speedup_vs_source"), "x"),
+                                    _ratio_class(fr.get("speedup_vs_source"),
+                                                 higher_is_better=True)))
+    sections.append(_section("timing", "kernelbench.timing", timing_cells))
+
+    # Numerical precision
+    np_stats = fr.get("numerical_precision") or {}
+    if np_stats:
+        sections.append(_section("numerical precision", "eval_kernel_against_ref", [
+            _metric("max abs error",  _fmt(np_stats.get("max_abs_error"))),
+            _metric("mean abs error", _fmt(np_stats.get("mean_abs_error"))),
+            _metric("max rel error",  _fmt(np_stats.get("max_rel_error"))),
+            _metric("mean rel error", _fmt(np_stats.get("mean_rel_error"))),
+        ]))
+
+    # Memory
+    mem = fr.get("memory_stats") or {}
+    if mem and "error" not in mem:
+        ratio = mem.get("memory_ratio")
+        sections.append(_section("gpu memory", "extended_metrics.measure_memory", [
+            _metric("kernel peak",  _fmt(mem.get("peak_memory_mb"), " MB")),
+            _metric("ref peak",     _fmt(mem.get("ref_peak_memory_mb"), " MB")),
+            _metric("kernel / ref", _fmt(ratio, "x"),
+                    _ratio_class(ratio, higher_is_better=False)),
+        ]))
+
+    # Kernel launches / fusion
+    kl = fr.get("kernel_launch_stats") or {}
+    if kl and "error" not in kl and (kl.get("num_kernels", -1) or -1) > 0:
+        fusion = kl.get("fusion_ratio")
+        sections.append(_section("kernel launches / fusion", "torch.profiler", [
+            _metric("kernel launches", _fmt(kl.get("num_kernels"), "", prec=0)),
+            _metric("ref launches",    _fmt(kl.get("ref_num_kernels"), "", prec=0)),
+            _metric("fusion ratio (ref / kernel)", _fmt(fusion, "x"),
+                    _ratio_class(fusion, higher_is_better=True)),
+            _metric("total cuda time",
+                    _fmt(kl.get("total_cuda_time_us"), " μs", prec=0)),
+        ]))
+
+    # Energy
+    en = fr.get("energy_stats") or {}
+    if en and "error" not in en and (en.get("energy_per_run_mj", -1) or -1) > 0:
+        eratio = en.get("energy_ratio")
+        sections.append(_section("energy", "NVML (pynvml)", [
+            _metric("kernel mJ / run", _fmt(en.get("energy_per_run_mj"))),
+            _metric("ref mJ / run",    _fmt(en.get("ref_energy_per_run_mj"))),
+            _metric("ratio (ref / kernel)", _fmt(eratio, "x"),
+                    _ratio_class(eratio, higher_is_better=True)),
+            _metric("avg power",       _fmt(en.get("avg_power_w"), " W")),
+            _metric("ref avg power",   _fmt(en.get("ref_avg_power_w"), " W")),
+        ]))
+
+    # SOL
+    sol = fr.get("sol_stats") or {}
+    if sol and (sol.get("sol_score", -1) or -1) >= 0:
+        sections.append(_section("SOL (speed-of-light)",
+                                 sol.get("source", "—"), [
+            _metric("SOL score (0–1)", _fmt(sol.get("sol_score"), "", prec=3),
+                    _ratio_class(sol.get("sol_score"), higher_is_better=True, neutral=0.5)),
+            _metric("dram util %",     _fmt(sol.get("dram_utilization_pct"), "%", prec=1)),
+            _metric("compute util %",  _fmt(sol.get("compute_utilization_pct"), "%", prec=1)),
+            _metric("bottleneck",      html.escape(str(sol.get("bottleneck", "—")))),
+            _metric("dominant pipe",   html.escape(str(sol.get("dominant_pipe", "—")))),
+            _metric("arithmetic intensity", _fmt(sol.get("arithmetic_intensity"))),
+            _metric("ridge point",     _fmt(sol.get("ridge_point"))),
+        ]))
+
+    # Roofline / occupancy
+    rl = fr.get("roofline_stats") or {}
+    if rl and rl.get("source"):
+        rl_cells = [
+            _metric("dram bandwidth",   _fmt(rl.get("dram_bandwidth_gbs"), " GB/s")),
+            _metric("dram util %",      _fmt(rl.get("dram_utilization_pct"), "%", prec=1)),
+            _metric("fp32 tflops",      _fmt(rl.get("fp32_tflops"))),
+            _metric("fp32 util %",      _fmt(rl.get("fp32_utilization_pct"), "%", prec=1)),
+            _metric("fp16 tflops",      _fmt(rl.get("fp16_tflops"))),
+            _metric("occupancy %",      _fmt(rl.get("occupancy_pct"), "%", prec=1)),
+            _metric("bottleneck",       html.escape(str(rl.get("bottleneck", "—")))),
+            _metric("dominant pipe %",  _fmt(rl.get("dominant_utilization_pct"), "%", prec=1)),
+            _metric("arithmetic intensity", _fmt(rl.get("arithmetic_intensity"))),
+            _metric("ridge point",      _fmt(rl.get("ridge_point"))),
+            _metric("L1 hit %",         _fmt(rl.get("l1_hit_rate_pct"), "%", prec=1)),
+            _metric("L2 hit %",         _fmt(rl.get("l2_hit_rate_pct"), "%", prec=1)),
+            _metric("ld sectors / req", _fmt(rl.get("ld_sectors_per_request"))),
+            _metric("st sectors / req", _fmt(rl.get("st_sectors_per_request"))),
+            _metric("regs / thread",    _fmt(rl.get("registers_per_thread"), "", prec=0)),
+            _metric("smem / block",     _fmt(rl.get("shared_mem_per_block"), " B", prec=0)),
+            _metric("block size",       _fmt(rl.get("block_size"), "", prec=0)),
+            _metric("peak bw",          _fmt(rl.get("peak_bw_gbs"), " GB/s")),
+            _metric("peak fp32 tflops", _fmt(rl.get("peak_fp32_tflops"))),
+            _metric("peak fp16 tflops", _fmt(rl.get("peak_fp16_tflops"))),
+        ]
+        sections.append(_section("roofline / occupancy", rl.get("source", "—"), rl_cells))
+
+        # Warp stalls — top 5 reasons.
+        ws = rl.get("warp_stalls") or {}
+        if ws:
+            top = sorted(ws.items(), key=lambda kv: -float(kv[1] or 0))[:5]
+            sections.append(_section("warp stalls (top 5)", "nsight", [
+                _metric(html.escape(str(name)), _fmt(val, "%", prec=1))
+                for name, val in top
+            ]))
+
+    # Flags
+    md = fr.get("metadata") or {}
+    if md.get("excessive_speedup"):
+        sections.append(_section("flags", "submit_kernel guard", [
+            _metric("excessive speedup",
+                    '<span class="ratio-bad">flagged</span>'),
+        ]))
+
+    if not sections:
+        return ""
+    return f'<div class="metrics">{"".join(sections)}</div>'
 
 
 def _render_turn(t: dict) -> str:

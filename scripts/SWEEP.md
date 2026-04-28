@@ -7,7 +7,7 @@ perf-timing locks, and a live self-refreshing HTML report.
 ## TLDR
 
 ```bash
-# 1. Drop API keys in .env (TEJAS_AZURE_KEY, THAVA_AZURE_KEY, etc.).
+# 1. Drop API keys in .env (TEJAS_AZURE_KEY, THAVA_AZURE_KEY, POPCORN_AZURE_KEY, etc.).
 # 2. Edit configs/sweep.example.toml to taste.
 # 3. Run.
 uv run python scripts/run_sweep.py configs/sweep.example.toml
@@ -115,10 +115,10 @@ rpm         = 250
 tpm         = 250000
 
 [[models]]
-name        = "DeepSeek-R1"
+name        = "FW-GLM-5-1"
 api_kind    = "openai_chat"          # "openai_chat" = Chat Completions
-base_url    = "https://thava-openai.services.ai.azure.com/models"
-api_key_env = "THAVA_AZURE_KEY"
+base_url    = "https://popcorn-foundry-resource.openai.azure.com/openai/v1/"
+api_key_env = "POPCORN_AZURE_KEY"
 rpm         = 250
 tpm         = 250000
 ```
@@ -150,20 +150,20 @@ have real token usage numbers.
 | `api_kind`    | Endpoint shape       | Used for                                                |
 |---------------|----------------------|---------------------------------------------------------|
 | `openai`      | Responses API        | gpt-5.x family (supports `reasoning_effort`)            |
-| `openai_chat` | Chat Completions     | DeepSeek-R1, Llama-Maverick, Kimi-K2.x, generic OpenAI  |
+| `openai_chat` | Chat Completions     | FW-GLM-5-1, Llama-Maverick, Kimi-K2.x, generic OpenAI   |
 
 The two paths share tools, prompts, and trajectory format — only the wire
-protocol differs. DeepSeek-R1's `reasoning_content` is captured in the
-trajectory but not resent to the model on the next turn (Chat Completions
-doesn't require it).
+protocol differs. Models that emit a Chat-Completions `reasoning_content`
+field have it captured in the trajectory but not resent to the model on the
+next turn (Chat Completions doesn't require it).
 
 ## Endpoints (Azure-specific)
 
-The five models we sweep sit on two different Azure surfaces. The base URLs
+The five models we sweep sit on three different Azure surfaces. The base URLs
 were verified end-to-end by `scripts/probe_endpoints.py` (one trivial request
 per model) — re-run that script if you suspect an outage or rotated key.
 
-### Azure OpenAI v1 preview (`...cognitiveservices.azure.com`)
+### Azure OpenAI v1 preview, OpenAI-branded models (`tejas-…cognitiveservices.azure.com`)
 
 The OpenAI-branded models (gpt-5.x) live here. The OpenAI Python SDK auto-
 appends `/responses` or `/chat/completions` to the v1 base, so one URL covers
@@ -174,11 +174,22 @@ base_url = "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1
 api_kind = "openai"          # gpt-5.x supports the Responses API
 ```
 
-### Azure AI Inference / Foundry (`...services.ai.azure.com`)
+### Azure OpenAI v1 preview, Foundry-hosted partner models (`popcorn-foundry-resource.openai.azure.com`)
 
-DeepSeek-R1, Llama-Maverick, and Kimi-K2.6 are deployed on Azure AI Inference
-(not Azure OpenAI). The SDK base is `/models`; only Chat Completions is
-supported here, never the Responses API.
+Third-party models that are deployed *through* Azure OpenAI Service (currently
+GLM-5 family) sit on a `…openai.azure.com/openai/v1/` base. Same SDK auto-
+routing as above, but only Chat Completions is supported (not Responses).
+
+```toml
+base_url = "https://popcorn-foundry-resource.openai.azure.com/openai/v1/"
+api_kind = "openai_chat"
+```
+
+### Azure AI Inference / Foundry (`thava-…services.ai.azure.com`)
+
+Llama-Maverick and Kimi-K2.6 are deployed on Azure AI Inference (not Azure
+OpenAI). The SDK base is `/models`; only Chat Completions is supported here,
+never the Responses API.
 
 ```toml
 base_url = "https://thava-openai.services.ai.azure.com/models"
@@ -187,22 +198,32 @@ api_kind = "openai_chat"
 
 ### Verified working today
 
-| Model                                    | base_url                            | api_kind     |
-|------------------------------------------|-------------------------------------|--------------|
-| gpt-5.4-pro                              | `…cognitiveservices…/openai/v1/`    | `openai`     |
-| gpt-5.5                                  | `…cognitiveservices…/openai/v1/`    | `openai`     |
-| DeepSeek-R1                              | `…services.ai.azure.com/models`     | `openai_chat`|
-| Llama-4-Maverick-17B-128E-Instruct-FP8   | `…services.ai.azure.com/models`     | `openai_chat`|
-| Kimi-K2.6                                | `…services.ai.azure.com/models`     | `openai_chat`|
+| Model                                    | base_url                                          | api_kind     |
+|------------------------------------------|---------------------------------------------------|--------------|
+| gpt-5.4-pro                              | `tejas-…cognitiveservices…/openai/v1/`            | `openai`     |
+| gpt-5.5                                  | `tejas-…cognitiveservices…/openai/v1/`            | `openai`     |
+| FW-GLM-5-1                               | `popcorn-foundry-resource.openai.azure.com/openai/v1/` | `openai_chat`|
+| Llama-4-Maverick-17B-128E-Instruct-FP8   | `thava-…services.ai.azure.com/models`             | `openai_chat`|
+| Kimi-K2.6                                | `thava-…services.ai.azure.com/models`             | `openai_chat`|
 
 ### Quirks worth knowing
 
-- **DeepSeek-R1 reasoning is inline.** It emits `<think>...</think>` blocks
-  *inside the assistant `content`* rather than via the `reasoning_content`
-  field that our agent reads. So the agent will treat the reasoning as part of
-  the assistant's normal text. The trajectory still captures it; the HTML
-  report just won't show it under the dedicated "reasoning" expander for that
-  model.
+- **gpt-5.4-pro rejects `reasoning.effort = "low"`.** That deployment only
+  accepts `"medium"` or `"high"` on the Responses API; passing `"low"`
+  returns a 400 `Unsupported value`. Either set `[agent].reasoning_effort =
+  "medium"` globally or override per-model on the gpt-5.4-pro `[[models]]`
+  entry. (gpt-5.5 accepts the full range.)
+- **Some Azure deployments reject `tools=` entirely.** DeepSeek-R1 on the
+  Foundry `…services.ai.azure.com/models` surface returned a 400
+  `UnsupportedToolUse` for any tool-enabled call — that deployment can't run
+  the agent at all (the agent always sends `submit_kernel`). Re-run
+  `probe_endpoints.py` before adding any new model; the `with tools` probe
+  is what surfaces this.
+- **Reasoning-content shape varies.** Some models emit reasoning via the
+  Chat-Completions `reasoning_content` field; others (e.g. R1-style models)
+  emit `<think>...</think>` blocks *inside* the assistant `content`. Both are
+  captured in the trajectory; the HTML report's dedicated "reasoning"
+  expander only renders the former.
 - **`reasoning_effort` is silently ignored** when `api_kind = "openai_chat"`.
   Chat Completions has no `reasoning.effort` field. Set it on the gpt-5.x
   entries only.
@@ -251,6 +272,46 @@ If `serve_host = "0.0.0.0"` and the box is reachable, you can also hit it
 directly. Pages auto-refresh every 60s; the underlying HTML is regenerated
 every `refresh_seconds` (30s default).
 
+## Sweep results & evaluation metrics
+
+Every finished work item produces a `final_result` (a serialized
+`KernelExecResult`) inside its trajectory JSON. The HTML report aggregates
+these into per-variant and per-model rollups, and surfaces the per-problem
+detail on the trajectory page.
+
+### Top-line / rollup metrics (shown on the index pages)
+
+| Metric              | Where it comes from                                    | Meaning |
+|---------------------|--------------------------------------------------------|---------|
+| **trajectories**    | count of trajectory files                              | Total work items resolved (finished or skipped). |
+| **finished**        | `finished_at` is set                                   | Items the agent actually completed (not in-progress). |
+| **correct**         | `outcome == "correct"`                                 | `submit_kernel` reported numerically equivalent output. |
+| **compiled**        | `final_result.compiled`                                | Kernel built — independent of correctness. |
+| **avg speedup**     | mean of `ref_runtime / runtime` over correct items     | How much faster the kernel is than the PyTorch reference. |
+| **outcome**         | `correct` \| `incorrect` \| `compile_fail` \| `error` \| `skipped` \| `in_progress` | Categorical end-state. |
+
+### Per-problem extended metrics (shown on the trajectory page)
+
+Populated by `submit_kernel` when `measure_performance=True`. Defined in
+`src/kernelbench/extended_metrics.py` and stored on `KernelExecResult`:
+
+| Field                    | Source                                  | What it captures |
+|--------------------------|-----------------------------------------|------------------|
+| `runtime` / `ref_runtime`| `cuda_event` / `do_bench` / `host_time` | Wall-clock μs for the candidate and PyTorch reference. |
+| `runtime_stats`          | `kernelbench.timing`                    | `mean`, `median`, `std`, `min`, `max` over `num_perf_trials`. |
+| `numerical_precision`    | `eval_kernel_against_ref`               | `max_abs_error`, `mean_abs_error`, `max_rel_error`, `mean_rel_error` vs reference. |
+| `memory_stats`           | `extended_metrics.measure_memory`       | `peak_memory_mb`, `ref_peak_memory_mb`, `memory_ratio`. |
+| `kernel_launch_stats`    | `torch.profiler`                        | `num_kernels`, `ref_num_kernels`, `fusion_ratio` (= `ref_num_kernels / num_kernels`), top-10 kernel breakdown, total CUDA time. |
+| `energy_stats`           | NVML (`pynvml`)                         | `energy_per_run_mj`, `ref_energy_per_run_mj`, `energy_ratio`, `avg_power_w`, `ref_avg_power_w`. Reports `-1` if `pynvml` not installed. |
+| `sol_stats`              | Nsight (preferred) or speedup heuristic | `sol_score` ∈ [0, 1] = `max(dram_util, compute_util) / 100` from hardware counters; falls back to `min(speedup / 10, 1)` heuristic when ncu is unavailable. |
+| `roofline_stats`         | Nsight (preferred) or device props      | DRAM bandwidth GB/s, FP32/FP16 TFLOPS, arithmetic intensity, ridge point, occupancy %, dominant pipe %, L1/L2 hit rates, coalescing (sectors/request), warp stall reasons, register/smem/block geometry, peak hardware specs. |
+| `metadata.excessive_speedup` | `submit_kernel`                     | `True` when measured speedup tripped the anti-reward-hacking guard. |
+| `source_runtime` / `speedup_vs_source` | translation mode             | When the candidate was translated from another DSL, the source-DSL implementation's timing and the candidate's speedup vs that source. |
+
+Energy, SOL, and roofline metrics degrade gracefully: when NVML or Nsight is
+unavailable the corresponding fields report `-1` / `"heuristic"` source rather
+than blocking the eval.
+
 ## Reading a trajectory
 
 Each trajectory page has:
@@ -266,12 +327,43 @@ Each trajectory page has:
 
 Resolved by the `tools` key in `[run]`:
 
-- `"default"` — all tools except `profile_kernel` (which needs ncu)
-- `"all"` — every tool in the registry
-- `"compile_kernel,run_correctness,submit_kernel"` — explicit comma list
+- `"default"` — every tool in the registry **except** the opt-in tools that
+  require special hardware/software: `profile_kernel`, `disassemble_kernel`,
+  `ert_roofline`.
+- `"all"` — every tool in the registry, including the opt-in ones.
+- `"compile_kernel,run_correctness,submit_kernel"` — explicit comma list.
 
 `submit_kernel` is always added regardless; without it the agent has no way to
 finalize a run.
+
+### Full tool catalogue
+
+The complete set of tools registered in `src/kernelbench/agent/tools.py`. Every
+tool returns a one-line `{ToolName} {PASSED|FAILED}: {summary}` plus an
+optional detail block (the two reference-data tools — `get_gpu_specs` and
+`static_check` — are documented exceptions to the strict PASS/FAIL rule).
+
+| Tool                  | In `default`? | Inputs        | What it does |
+|-----------------------|:-------------:|---------------|--------------|
+| `compile_kernel`      | yes           | `kernel_code` | Build the kernel only — surfaces nvcc/linker/syntax errors cheaply, no GPU run. |
+| `run_correctness`     | yes           | `kernel_code` | Run `num_correct_trials` correctness checks against the PyTorch reference; reports per-trial pass/fail and numerical-precision stats (max/mean abs+rel error). No timing. |
+| `get_gpu_specs`       | yes           | none          | Return peak hardware specs for the current GPU (memory bandwidth, TFLOPS per precision, SM count, smem per SM, registers). Reference data only. |
+| `static_check`        | yes           | `kernel_code` | Static-analysis pass for reward-hacking patterns (try/except fallback to reference, timing-function patches, lazy-tensor tricks, threading injection). PASSED / PASSED-with-warnings / FAILED. |
+| `submit_kernel`       | yes (always)  | `kernel_code` | Final eval: `num_correct_trials` correctness + `num_perf_trials` timing. Reports kernel runtime in μs **plus all extended metrics** (numerical precision, peak memory + ratio, kernel-launch count + fusion ratio, energy/run + ratio, SOL score). Reference runtime and speedup are intentionally hidden. Also flags excessive speedup. |
+| `profile_kernel`      | opt-in        | `kernel_code` | Nsight Compute roofline profiling. Returns DRAM bandwidth utilization, FP32/FP16/tensor-core throughput, per-kernel breakdown, warp stall reasons, coalescing quality, L1/L2 hit rates, occupancy with limiting factors, pipe utilization, branch divergence, and targeted optimization hints. Supports delta comparison across calls. **Requires `nsight-python` + `ncu` in PATH.** |
+| `disassemble_kernel`  | opt-in        | `kernel_code` | Disassemble the compiled CUDA binary to inspect SASS, PTX, register usage, instruction mix (memory vs compute vs control), tensor-core usage, and register spills. **Requires `cuobjdump` + `nvdisasm` (CUDA Toolkit).** |
+| `ert_roofline`        | opt-in        | none          | Empirical Roofline Tool — micro-benchmarks measured peak bandwidth at each memory tier (L1, L2, DRAM/HBM) and peak FP32/FP16 TFLOPS for the current GPU. Computes the ridge point. Results are cached per GPU after first call. |
+
+Notes:
+
+- The agent's `tools` filter is applied case-sensitively against these exact
+  names. Unknown names are silently dropped from the wanted set.
+- All `kernel_code` arguments must be a complete Python module that defines a
+  `ModelNew` class — not raw CUDA C/C++.
+- `profile_kernel` runs in a subprocess (`scripts/_profile_worker.py`) because
+  ncu relaunches the application — this is why oversubscribing agents per GPU
+  is fine but the per-GPU `perf_lock_per_gpu` lock is important to keep timing
+  measurements clean.
 
 ## TOML reference
 
@@ -296,7 +388,7 @@ have sensible defaults.
 | `timing_method`      | string           | `"cuda_event"`                         | `"cuda_event"` \| `"do_bench"` \| `"host_time"`. |
 | `num_correct_trials` | int              | `5`                                    | Correctness trials run by `run_correctness` and inside `submit_kernel`. |
 | `num_perf_trials`    | int              | `100`                                  | Timing trials inside `submit_kernel`. Drop to ~20 for smoke tests. |
-| `tools`              | string           | `"default"`                            | `"default"` (everything except `profile_kernel`), `"all"`, or a comma list like `"compile_kernel,run_correctness,submit_kernel"`. `submit_kernel` is always included regardless. |
+| `tools`              | string           | `"default"`                            | `"default"` (everything except the opt-in tools `profile_kernel`, `disassemble_kernel`, `ert_roofline`), `"all"`, or a comma list like `"compile_kernel,run_correctness,submit_kernel"`. `submit_kernel` is always included regardless. See **Full tool catalogue** above. |
 
 #### How to specify problems
 
@@ -357,7 +449,7 @@ you want to run.
 | Key                | Type   | Default                                                      | Notes |
 |--------------------|--------|--------------------------------------------------------------|-------|
 | `name`             | string | **req**                                                      | Display name. Also used as the directory under `runs/{name}/{variant}/{name}/`. |
-| `api_kind`         | string | `"openai"`                                                   | `"openai"` for the Responses API (gpt-5.x), `"openai_chat"` for Chat Completions (DeepSeek-R1, Llama-Maverick, Kimi). |
+| `api_kind`         | string | `"openai"`                                                   | `"openai"` for the Responses API (gpt-5.x), `"openai_chat"` for Chat Completions (FW-GLM-5-1, Llama-Maverick, Kimi). |
 | `base_url`         | string | **req**                                                      | The full endpoint URL; for Azure include `?api-version=...`. |
 | `api_key_env`      | string | **req**                                                      | Name of the env var holding the API key. The runner reads `os.environ[api_key_env]`. |
 | `deployment_name`  | string | falls back to `name`                                         | If your Azure deployment name differs from the display name, put the deployment name here. |
@@ -388,7 +480,7 @@ Before a long run, sanity-check that every key + URL combination still works:
 uv run python scripts/probe_endpoints.py
 # OK    gpt-5.4-pro                             openai       pong
 # OK    gpt-5.5                                 openai       pong
-# OK    DeepSeek-R1                             openai_chat  <think>...</think>
+# OK    FW-GLM-5-1                              openai_chat  Pong!
 # OK    Llama-4-Maverick-17B-128E-Instruct-FP8  openai_chat  Pong!
 # OK    Kimi-K2.6                               openai_chat  <no text>
 # 5/5 endpoints reachable

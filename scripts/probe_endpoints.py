@@ -34,11 +34,11 @@ PROBES = [
         "gpt-5.5",
     ),
     (
-        "DeepSeek-R1",
+        "FW-GLM-5-1",
         "openai_chat",
-        "https://thava-openai.services.ai.azure.com/models",
-        "THAVA_AZURE_KEY",
-        "DeepSeek-R1",
+        "https://popcorn-foundry-resource.openai.azure.com/openai/v1/",
+        "POPCORN_AZURE_KEY",
+        "FW-GLM-5-1",
     ),
     (
         "Llama-4-Maverick-17B-128E-Instruct-FP8",
