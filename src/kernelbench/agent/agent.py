@@ -182,8 +182,12 @@ class KernelAgent:
             return self._run_chat_completions()
         return self._run_responses()
 
+    def _tag(self) -> str:
+        return f"[L{self.level}/P{self.problem_id}/{self.model}]"
+
     def _run_responses(self) -> KernelTrajectory:
         """Original Responses-API loop."""
+        tag = self._tag()
         trajectory = KernelTrajectory(
             problem_id=self.problem_id,
             level=self.level,
@@ -224,6 +228,10 @@ class KernelAgent:
             # Pacing for rate-limited APIs.
             if turn_idx > 0 and self.turn_delay_s > 0:
                 time.sleep(self.turn_delay_s)
+            print(
+                f"{tag} turn {turn_idx + 1}/{self.max_turns} → LLM call...",
+                flush=True,
+            )
 
             turns_remaining = self.max_turns - turn_idx
             tool_calls_remaining = self.max_tool_calls - self._total_tool_calls
@@ -282,6 +290,17 @@ class KernelAgent:
                 trajectory.finish(self._final_result)
                 return trajectory
             llm_latency = time.time() - t0
+
+            # Always-on per-turn line so users can see progress in long runs.
+            n_fc = sum(
+                1 for it in (item.model_dump() for item in response.output)
+                if it.get("type") == "function_call"
+            )
+            print(
+                f"{tag} turn {turn_idx + 1} LLM done in {llm_latency:.1f}s "
+                f"({n_fc} tool call{'s' if n_fc != 1 else ''})",
+                flush=True,
+            )
 
             # Serialize the model's output items so we can both (a) resend
             # them to the API next turn and (b) store them in the trajectory.
@@ -427,7 +446,14 @@ class KernelAgent:
                     continue
 
                 tool = self.tool_map[tool_name]
+                _t_tool = time.time()
                 tool_result = self._execute_tool(tool, args)
+                _tool_dt = time.time() - _t_tool
+                print(
+                    f"{tag}   {tool_name} {'OK' if tool_result.success else 'FAIL'} "
+                    f"({_tool_dt:.1f}s)",
+                    flush=True,
+                )
                 self._total_tool_calls += 1
 
                 input_items.append(
@@ -532,6 +558,7 @@ class KernelAgent:
           - No `reasoning` items; if a model returns reasoning_content (e.g.
             DeepSeek-R1) we capture it for the trajectory but don't resend it.
         """
+        tag = self._tag()
         trajectory = KernelTrajectory(
             problem_id=self.problem_id,
             level=self.level,
@@ -578,6 +605,10 @@ class KernelAgent:
         for turn_idx in range(self.max_turns):
             if turn_idx > 0 and self.turn_delay_s > 0:
                 time.sleep(self.turn_delay_s)
+            print(
+                f"{tag} turn {turn_idx + 1}/{self.max_turns} → LLM call...",
+                flush=True,
+            )
 
             turns_remaining = self.max_turns - turn_idx
             tool_calls_remaining = self.max_tool_calls - self._total_tool_calls
@@ -629,6 +660,12 @@ class KernelAgent:
                 trajectory.finish(self._final_result)
                 return trajectory
             llm_latency = time.time() - t0
+            _n_fc_chat = len(response.choices[0].message.tool_calls or [])
+            print(
+                f"{tag} turn {turn_idx + 1} LLM done in {llm_latency:.1f}s "
+                f"({_n_fc_chat} tool call{'s' if _n_fc_chat != 1 else ''})",
+                flush=True,
+            )
 
             choice = response.choices[0]
             asst = choice.message
@@ -780,7 +817,14 @@ class KernelAgent:
                     continue
 
                 tool = self.tool_map[tool_name]
+                _t_tool = time.time()
                 tool_result = self._execute_tool(tool, args)
+                _tool_dt = time.time() - _t_tool
+                print(
+                    f"{tag}   {tool_name} {'OK' if tool_result.success else 'FAIL'} "
+                    f"({_tool_dt:.1f}s)",
+                    flush=True,
+                )
                 self._total_tool_calls += 1
 
                 messages.append(

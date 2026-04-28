@@ -238,7 +238,19 @@ def run_one(
 
             sk.execute = locked_execute  # type: ignore[assignment]
 
+        print(
+            f"[worker] START {model_name} variant={work.variant} "
+            f"L{work.level}/P{work.problem_id} on cuda:{work.device_id}",
+            flush=True,
+        )
+        _t0 = time.time()
         trajectory = agent.run()
+        print(
+            f"[worker] DONE  {model_name} L{work.level}/P{work.problem_id} "
+            f"→ {trajectory.outcome} in {time.time() - _t0:.1f}s "
+            f"({trajectory.total_turns} turns, {trajectory.total_tool_calls} tool calls)",
+            flush=True,
+        )
         trajectory.save(traj_path)
         kernel_path = os.path.join(
             model_dir, f"level_{work.level}_problem_{work.problem_id}_kernel.py"
