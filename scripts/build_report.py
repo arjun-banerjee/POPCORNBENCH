@@ -570,7 +570,7 @@ def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
 
     head = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title"><a href="../../index.html" title="all sweeps">{html.escape(run_name)}</a></div>'
+        f'<div class="site-title"><a href="../index.html" title="all sweeps">{html.escape(run_name)}</a></div>'
         f'<div class="site-subtitle">kernelbench sweep report · {len(by_variant)} variants</div>'
         f'<div class="header-links">'
         f'<a href="index.html">overview</a>'
@@ -618,7 +618,7 @@ def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
 
     head = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title"><a href="../../../../index.html" title="all sweeps">{html.escape(variant)}</a></div>'
+        f'<div class="site-title"><a href="../../../index.html" title="all sweeps">{html.escape(variant)}</a></div>'
         f'<div class="site-subtitle">{html.escape(run_name)} · variant overview</div>'
         f'<div class="header-links">'
         f'<a href="../../index.html">← all variants</a>'
@@ -670,7 +670,7 @@ def _render_model_page(model: str, variant: str, trajs: list[dict],
 
     body = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title"><a href="../../../../../index.html" title="all sweeps">{html.escape(model)}</a></div>'
+        f'<div class="site-title"><a href="../../../../index.html" title="all sweeps">{html.escape(model)}</a></div>'
         f'<div class="site-subtitle">{html.escape(run_name)} · {html.escape(variant)} · '
         f'{len(trajs)} trajectories</div>'
         f'<div class="header-links">'
@@ -804,7 +804,7 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str,
     variant = d.get("_variant", "default")
     head = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title"><a href="../../../../../index.html" title="all sweeps">L{d.get("level")} · problem {d.get("problem_id")}</a></div>'
+        f'<div class="site-title"><a href="../../../../index.html" title="all sweeps">L{d.get("level")} · problem {d.get("problem_id")}</a></div>'
         f'<div class="site-subtitle">{html.escape(model)} · {html.escape(variant)} · {html.escape(run_name)}</div>'
         f'<div class="header-links">'
         f'<a href="../../../index.html">← all variants</a>'
