@@ -324,12 +324,24 @@ class ProfileKernelTool(Tool):
     )
     input_schema = _KERNEL_CODE_SCHEMA
 
+    # Path to the standalone profiling worker script.  nsight-python's
+    # @nsight.analyze.kernel decorator relaunches sys.argv[0] under ncu.
+    # By running profiling in a separate subprocess whose argv[0] is this
+    # worker, the ncu relaunch only re-enters the lightweight worker — not
+    # the batch agent driver.
+    _WORKER_SCRIPT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))),
+        "scripts", "_profile_worker.py",
+    )
+
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
-        from kernelbench.profile import (
-            NSIGHT_AVAILABLE,
-            check_ncu_available,
-            profile_kernelbench_model_with_nsight,
-        )
+        import json
+        import subprocess
+        import sys
+        import tempfile
+
+        from kernelbench.profile import NSIGHT_AVAILABLE, check_ncu_available
         from kernelbench.agent.nsight_parser import (
             ROOFLINE_METRICS,
             parse_nsight_metrics,
@@ -339,7 +351,7 @@ class ProfileKernelTool(Tool):
             return ToolResult(
                 tool_name=self.name,
                 success=False,
-                output=("profile_kernel FAILED: nsight-python package not installed."),
+                output="profile_kernel FAILED: nsight-python package not installed.",
                 metadata={"available": False},
             )
         if not check_ncu_available():
@@ -350,24 +362,69 @@ class ProfileKernelTool(Tool):
                 metadata={"available": False},
             )
 
+        request = {
+            "custom_model_src": kernel_code,
+            "ref_model_src": ctx.ref_arch_src,
+            "metrics": ROOFLINE_METRICS,
+            "num_trials": 1,
+            "seed": 42,
+            "device_index": ctx.device.index or 0,
+            "backend": ctx.backend,
+            "precision": ctx.precision,
+            "build_dir": ctx.build_dir,
+            "verbose": ctx.verbose,
+        }
+
         try:
-            raw_metrics = profile_kernelbench_model_with_nsight(
-                custom_model_src=kernel_code,
-                ref_model_src=ctx.ref_arch_src,
-                metrics=ROOFLINE_METRICS,
-                num_trials=1,
-                seed=42,
-                device=ctx.device,
-                backend=ctx.backend,
-                precision=ctx.torch_precision,
-                build_dir=ctx.build_dir,
-                verbose=ctx.verbose,
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as tmp:
+                json.dump(request, tmp)
+                req_path = tmp.name
+
+            proc = subprocess.run(
+                [sys.executable, self._WORKER_SCRIPT, req_path],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            os.unlink(req_path)
+
+            if proc.returncode != 0:
+                stderr_tail = (proc.stderr or "").strip()[-500:]
+                return ToolResult(
+                    tool_name=self.name,
+                    success=False,
+                    output=(
+                        f"profile_kernel FAILED: worker exited with code "
+                        f"{proc.returncode}.\n{stderr_tail}"
+                    ),
+                    metadata={"error": stderr_tail},
+                )
+
+            raw_metrics = json.loads(proc.stdout.strip().splitlines()[-1])
+
+            if "error" in raw_metrics:
+                return ToolResult(
+                    tool_name=self.name,
+                    success=False,
+                    output=f"profile_kernel FAILED: {raw_metrics['error']}",
+                    metadata={"error": raw_metrics["error"]},
+                )
+
+        except subprocess.TimeoutExpired:
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                output="profile_kernel FAILED: profiling timed out (300s).",
+                metadata={"error": "timeout"},
             )
         except Exception as e:
             return ToolResult(
                 tool_name=self.name,
                 success=False,
-                output=(f"profile_kernel FAILED: {type(e).__name__}: {e}"),
+                output=f"profile_kernel FAILED: {type(e).__name__}: {e}",
                 metadata={"error": str(e)},
             )
 
