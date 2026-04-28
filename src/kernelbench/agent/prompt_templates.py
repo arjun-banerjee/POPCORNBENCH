@@ -85,8 +85,10 @@ def _build_optimization_workflow(tool_names: set[str]) -> str:
     has_disasm = "disassemble_kernel" in tool_names
     has_ert = "ert_roofline" in tool_names
     has_gpu_specs = "get_gpu_specs" in tool_names
+    has_static = "static_check" in tool_names
+    has_any_analysis = has_profile or has_disasm
 
-    # Step 1 — understand hardware
+    # ── Step 1: Understand hardware ──
     hw_parts: list[str] = []
     if has_gpu_specs:
         hw_parts.append("`get_gpu_specs`")
@@ -94,45 +96,112 @@ def _build_optimization_workflow(tool_names: set[str]) -> str:
         hw_parts.append("`ert_roofline`")
     if hw_parts:
         hw_step = (
-            f"1. **Understand the hardware**: call {' and '.join(hw_parts)} "
-            "to know your bandwidth and compute ceilings.\n"
+            f"1. **Understand the hardware**: call {' and '.join(hw_parts)}. "
         )
+        if has_gpu_specs and has_ert:
+            hw_step += (
+                "`get_gpu_specs` gives theoretical peaks; `ert_roofline` "
+                "gives *measured* peaks per memory level (L1 / L2 / DRAM) "
+                "and per precision (FP32 / FP16 / tensor-core). Use the "
+                "empirical numbers to set realistic optimization targets.\n"
+            )
+        elif has_gpu_specs:
+            hw_step += "Know your bandwidth and compute ceilings.\n"
+        elif has_ert:
+            hw_step += (
+                "Measured peaks per memory level and precision give you "
+                "realistic optimization ceilings.\n"
+            )
     else:
         hw_step = ""
 
-    # Step 3 — profile after correctness
-    profile_parts: list[str] = []
-    if has_profile:
-        profile_parts.append(
-            "`profile_kernel` (roofline analysis — shows whether you are "
-            "memory- or compute-bound, bandwidth/compute utilization)"
+    # ── Step 2: Initial kernel ──
+    write_step = (
+        "2. **Write an initial kernel**, then `compile_kernel` → "
+        "`run_correctness`.\n"
+    )
+
+    # ── Steps 3–6: Analysis / optimize / iterate ──
+    if has_any_analysis:
+        # Build the analysis step dynamically from available tools
+        analysis_actions: list[str] = []
+        if has_profile:
+            analysis_actions.append(
+                "`profile_kernel` — gives runtime hardware counters: DRAM "
+                "bandwidth, warp stalls, coalescing, bank conflicts, "
+                "occupancy limiters, pipe utilization, cache hit rates, "
+                "eligible warps, and a roofline classification"
+            )
+        if has_disasm:
+            analysis_actions.append(
+                "`disassemble_kernel` — gives compiler output: per-kernel "
+                "register count, shared/local memory, register spills, "
+                "instruction mix (memory vs compute vs control vs "
+                "tensor-core), and whether the compiler is generating the "
+                "instructions you expect"
+            )
+        analysis_list = "\n   - ".join(analysis_actions)
+        analysis_step = (
+            f"3. **Analyse the kernel** — call your analysis tools:\n"
+            f"   - {analysis_list}\n"
         )
-    if has_disasm:
-        profile_parts.append(
-            "`disassemble_kernel` (SASS/PTX inspection — shows register "
-            "pressure, spills, instruction mix, tensor-core usage)"
-        )
-    if profile_parts:
-        tools_list = " and/or ".join(profile_parts)
-        profile_step = (
-            "3. **Profile before submitting**: once correct, call "
-            f"{tools_list} to identify the bottleneck.\n"
-        )
+        if has_profile and has_disasm:
+            analysis_step += (
+                "   Use BOTH together: `profile_kernel` tells you *what* is "
+                "slow at runtime (e.g. warp stalls on global memory); "
+                "`disassemble_kernel` tells you *why* at the instruction "
+                "level (e.g. register spills forcing local memory traffic, "
+                "or no tensor-core instructions where you expected them). "
+                "Cross-reference them to form a precise diagnosis.\n"
+            )
+        elif has_profile:
+            analysis_step += (
+                "   Read EVERY section of the output. The warp stall "
+                "breakdown and memory access quality metrics are the most "
+                "actionable — they directly name the bottleneck.\n"
+            )
+        elif has_disasm:
+            analysis_step += (
+                "   Check register pressure, spills, and instruction mix. "
+                "High register count or spills directly hurt occupancy.\n"
+            )
+
         optimize_step = (
-            "4. **Optimize based on profiling data**: rewrite the kernel to "
-            "address the bottleneck — better tiling, shared-memory staging, "
-            "vectorized loads, operator fusion, etc. Then re-verify "
-            "correctness with `run_correctness`.\n"
-            "5. **Iterate steps 3–4** as budget allows. Each "
-            "profile → optimize cycle should target a specific bottleneck.\n"
+            "4. **Fix the #1 bottleneck**: make ONE targeted change that "
+            "directly addresses what the analysis told you. Then "
+            "`compile_kernel` → `run_correctness` to verify correctness "
+            "is preserved.\n"
         )
+
+        # Build the iterate step referencing available tools
+        tool_shortlist = []
+        if has_profile:
+            tool_shortlist.append("`profile_kernel`")
+        if has_disasm:
+            tool_shortlist.append("`disassemble_kernel`")
+        tools_for_iterate = " and/or ".join(tool_shortlist)
+        iterate_step = (
+            f"5. **Analyse AGAIN** with {tools_for_iterate}. Check deltas — "
+            "did the targeted metric improve? A new bottleneck may now "
+            "dominate. Repeat steps 3–5 until you run low on budget or "
+            "metrics plateau.\n"
+        )
+
+        static_note = ""
+        if has_static:
+            static_note = (
+                " Run `static_check` before submitting to catch "
+                "reward-hacking patterns that cause evaluation failure."
+            )
+
         submit_step = (
-            "6. **Submit only when you've exhausted your optimization ideas** "
-            "or are running low on turns/tool calls.\n"
-        )
+            "6. **Submit** only after 2–3 analyse → optimise cycles, or "
+            "when you've exhausted improvement ideas.{static_note}\n"
+        ).format(static_note=static_note)
     else:
-        profile_step = ""
+        analysis_step = ""
         optimize_step = ""
+        iterate_step = ""
         submit_step = (
             "3. **Submit** when you are confident the kernel is correct and "
             "well-optimized.\n"
@@ -140,17 +209,203 @@ def _build_optimization_workflow(tool_names: set[str]) -> str:
 
     section = (
         "\n## Optimization workflow\n\n"
-        "Correctness is step 1, not the finish line. Follow this loop:\n\n"
+        "Correctness is a prerequisite, not the goal. Your job is to "
+        "iteratively analyse and optimise. Follow this loop:\n\n"
         f"{hw_step}"
-        "2. **Write an initial kernel**, then `compile_kernel` → "
-        "`run_correctness`.\n"
-        f"{profile_step}"
+        f"{write_step}"
+        f"{analysis_step}"
         f"{optimize_step}"
+        f"{iterate_step}"
         f"{submit_step}"
         "\nDo NOT call `submit_kernel` the moment you have a correct kernel "
-        "— a correct but unoptimized kernel is a wasted submission."
+        "— a correct but unoptimized kernel is a wasted submission. "
+        "Do NOT submit without analysing at least once."
     )
+
+    section += _build_tool_synergy_guide(tool_names)
+
     return section
+
+
+def _build_tool_synergy_guide(tool_names: set[str]) -> str:
+    """Build the combined tool-interpretation guide, covering all analysis
+    tools the agent has access to."""
+    has_profile = "profile_kernel" in tool_names
+    has_disasm = "disassemble_kernel" in tool_names
+    has_ert = "ert_roofline" in tool_names
+
+    sections: list[str] = ["\n\n## How to use your analysis tools"]
+
+    # ── Tool overview: when to call what ──
+    sections.append("""
+### When to call each tool
+
+| Tool | What it tells you | When to call it |
+|---|---|---|""")
+    if "get_gpu_specs" in tool_names:
+        sections.append(
+            "| `get_gpu_specs` | Theoretical peak BW, TFLOPS, SM count, "
+            "shared mem / register limits | Once at start |"
+        )
+    if has_ert:
+        sections.append(
+            "| `ert_roofline` | *Measured* peak BW per memory level "
+            "(L1/L2/DRAM) and TFLOPS per precision (FP32/FP16/TC). "
+            "Ridge points. | Once at start — gives realistic ceilings |"
+        )
+    if has_profile:
+        sections.append(
+            "| `profile_kernel` | Runtime hardware counters: DRAM BW, "
+            "warp stalls, coalescing, bank conflicts, occupancy, pipe "
+            "utilization, cache hit rates, eligible warps, roofline "
+            "classification, per-kernel breakdown, delta vs previous run | "
+            "Every iteration — this is your primary feedback loop |"
+        )
+    if has_disasm:
+        sections.append(
+            "| `disassemble_kernel` | Compiler output: registers/thread, "
+            "shared/local memory, spills, SASS instruction mix "
+            "(memory/compute/control/tensor-core) | When you suspect "
+            "register pressure, spills, or want to verify tensor-core "
+            "codegen |"
+        )
+
+    # ── Cross-referencing tools ──
+    if has_profile and has_disasm:
+        sections.append("""
+### Cross-referencing `profile_kernel` + `disassemble_kernel`
+
+Profiling tells you *what* is slow; disassembly tells you *why*:
+
+- **`profile_kernel` says low occupancy, limited by registers** → call \
+`disassemble_kernel` to see exact register count per kernel and whether \
+there are spills. If spilling, add `__launch_bounds__` or reduce live \
+variables.
+- **`profile_kernel` says Tensor pipe = 0% on a matmul-heavy kernel** → \
+call `disassemble_kernel` to check if HMMA/IMMA instructions are present. \
+If not, the compiler isn't generating tensor-core code — switch to \
+half-precision inputs or use WMMA intrinsics explicitly.
+- **`profile_kernel` says high compute instruction count** → call \
+`disassemble_kernel` to see the instruction mix breakdown. A high ratio \
+of control/predication instructions means branch divergence; a high ratio \
+of memory instructions means the kernel is issuing too many loads/stores \
+per compute op.""")
+
+    if has_profile and has_ert:
+        sections.append("""
+### Cross-referencing `profile_kernel` + `ert_roofline`
+
+`ert_roofline` gives you the empirical ceiling; `profile_kernel` gives you \
+where you are relative to it:
+
+- If `ert_roofline` measured DRAM BW = 2800 GB/s and `profile_kernel` shows \
+DRAM BW = 1400 GB/s (50%), you have room to improve memory throughput.
+- If your kernel is already at 90%+ of the measured peak, further memory \
+optimization won't help — the kernel is as memory-efficient as physically \
+possible. Shift focus to reducing total bytes moved (algorithmic change, \
+operator fusion) or switching to compute-bound operation.""")
+
+    # ── Profiling interpretation ──
+    if has_profile:
+        sections.append(_build_profiling_details())
+
+    # ── Disassembly interpretation ──
+    if has_disasm:
+        sections.append(_build_disassembly_details())
+
+    return "\n".join(sections)
+
+
+def _build_profiling_details() -> str:
+    """Interpretation guide for `profile_kernel` output."""
+    return """
+### Reading `profile_kernel` output
+
+#### Bottleneck classification
+
+- **MEMORY-BOUND**: speed limited by data movement. Reduce DRAM traffic, \
+improve access patterns.
+- **COMPUTE-BOUND**: speed limited by arithmetic. Reduce instruction count, \
+use tensor cores.
+- **LATENCY-BOUND** (low eligible warps + low BW% + low compute%): GPU is \
+idle because nothing is ready to execute. Need more parallelism (larger grid, \
+more ILP, prefetching).
+
+#### Warp stall reasons → specific fixes
+
+The top stall reason directly names the bottleneck:
+
+| Stall | Root cause | Fix |
+|---|---|---|
+| `long_scoreboard` | Waiting for DRAM/L2 | Tile to shared memory, prefetch, coalesce, __ldg |
+| `short_scoreboard` | Waiting for shared mem/L1 | Fix bank conflicts (pad +1), double-buffer, async copy |
+| `mio_throttle` | Too many memory instructions | Batch loads, vectorized loads (float4), reduce address divergence |
+| `barrier` | __syncthreads overhead | Reduce sync frequency, overlap compute with sync |
+| `math_pipe_throttle` | Compute pipe saturated | Good utilization — try more ILP to overlap with memory |
+| `lg_throttle` | Local/global queue full | Reduce outstanding memory requests per warp |
+| `not_selected` | Scheduler busy | Usually benign — good latency hiding |
+
+#### Memory access quality
+
+- **Sectors/request > 1.0** = uncoalesced. 4.0 = 4x wasted BW. Fix: thread i \
+must access consecutive addresses.
+- **Smem bank conflicts > 0** = layout bug. Fix: pad arrays +1 in inner dim.
+- **Cache effectiveness close to 1.0** = no caching benefit → tile for reuse.
+
+#### Occupancy — check the Launch line for the limiter
+
+- **regs/thread > 64**: use `__launch_bounds__`, reduce live variables.
+- **smem/blk near SM limit**: smaller tiles or less shared memory.
+- **block < 128**: too few threads per block.
+
+#### Pipe utilization
+
+- **Tensor=0% but compute-bound** → not using tensor cores. Switch to FP16/BF16 \
+with WMMA or half-precision `torch.matmul`.
+- **FMA high, Tensor low** → FP32 pipe bottleneck. Consider FP16 where precision \
+allows.
+
+#### Delta comparison
+
+After optimising, `profile_kernel` shows deltas vs the previous run. \
+GPU time ↓ = success. GPU time ↑ = regression — revert and try another approach. \
+Check which bottleneck is now dominant.
+
+#### Kernel breakdown
+
+Top of output shows which CUDA kernel is hottest. If it's a library call \
+(cuBLAS, cuDNN), you can't optimise it directly — fuse the surrounding ops."""
+
+
+def _build_disassembly_details() -> str:
+    """Interpretation guide for `disassemble_kernel` output."""
+    return """
+### Reading `disassemble_kernel` output
+
+#### Per-kernel resource usage
+
+Each kernel shows registers, shared memory, local memory, and spills. \
+Key things to check:
+- **Registers > 64/thread**: limits occupancy. Use `__launch_bounds__(maxThreads, \
+minBlocks)` to cap the compiler's register allocation.
+- **Spill stores/loads > 0**: the compiler ran out of registers and is spilling \
+to slow local memory. This is a major perf bug. Reduce live variables, simplify \
+expressions, or split the kernel.
+- **Local memory > 0** (without spills): arrays declared in the kernel that \
+didn't fit in registers. Consider using shared memory instead.
+
+#### Instruction mix
+
+The breakdown shows what fraction of instructions are memory, compute, control, \
+tensor-core, etc:
+- **High memory%**: kernel is dominated by load/store instructions. Fuse \
+operations to increase compute per load.
+- **High control%**: branch/predication overhead. Reduce conditionals, \
+restructure for uniform control flow.
+- **Tensor-core = 0**: if you expected HMMA/IMMA instructions, check that you're \
+using half-precision inputs and appropriate matrix dimensions (multiples of 16).
+- **Tensor-core > 0**: good — verify with `profile_kernel` that the tensor pipe \
+utilization is high. If not, the tensor ops may be bottlenecked by data supply."""
 
 
 def build_system_prompt(
@@ -305,10 +560,25 @@ def build_turn_warning_message(
         f"{tool_calls_remaining} {call_word} remain. "
     )
     if has_profiling_tools:
-        msg += (
-            "If you haven't profiled yet, do so now and make one final "
-            "optimization pass before submitting."
-        )
+        if turns_remaining >= 3:
+            msg += (
+                "If you haven't analysed your kernel yet, call "
+                "`profile_kernel` (and `disassemble_kernel` if register "
+                "pressure or instruction mix is unclear) NOW. Make a "
+                "targeted optimisation based on the #1 bottleneck, then "
+                "analyse again before submitting. Do not submit without at "
+                "least one analyse → optimise cycle."
+            )
+        elif turns_remaining == 2:
+            msg += (
+                "Two turns left. Use this turn for a final optimisation "
+                "(or analyse if you haven't yet), then `submit_kernel` on "
+                "the last turn."
+            )
+        else:
+            msg += (
+                "LAST turn. Call `submit_kernel` now with your best kernel."
+            )
     else:
         msg += "Submit your best kernel soon."
     return msg
