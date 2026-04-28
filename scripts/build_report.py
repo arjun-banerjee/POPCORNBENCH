@@ -689,6 +689,26 @@ def _render_model_page(model: str, variant: str, trajs: list[dict],
 # Trajectory page
 # ---------------------------------------------------------------------------
 
+def _load_submitted_kernel(d: dict) -> str | None:
+    """Read the saved kernel file at runs/.../level_{L}_problem_{P}_kernel.py.
+
+    The path is derived from the trajectory JSON path so this works regardless
+    of which run / variant / model the trajectory belongs to. Returns None if
+    the kernel was never submitted (e.g. compile_fail before submit_kernel).
+    """
+    traj_path = d.get("_path")
+    if not traj_path:
+        return None
+    kernel_path = traj_path.replace("_trajectory.json", "_kernel.py")
+    if not os.path.exists(kernel_path):
+        return None
+    try:
+        with open(kernel_path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def _load_reference_source(level: int, variant: str, problem_id: int) -> str | None:
     """Find KernelBench/level{N}/{variant}/{pid}_*.py and read it."""
     if not level or problem_id is None:
@@ -796,9 +816,25 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str,
     sitemap = (_render_sitemap(by_variant, link_prefix="../../../",
                                here=("trajectory", (variant, model)))
                if by_variant else "")
+
+    # Final submitted kernel (if the agent ever called submit_kernel and the
+    # runner saved it to disk). Shown below the turns in the same expander
+    # style as the reference source so the comparison is one click away.
+    kernel_block = ""
+    submitted = _load_submitted_kernel(d)
+    if submitted:
+        n_lines = submitted.count("\n") + 1
+        kernel_block = (
+            '<details class="ref-source"><summary>'
+            f'final submitted kernel ({n_lines:,} lines, '
+            f'{len(submitted):,} chars) — full source, untruncated'
+            '</summary>'
+            f'<pre class="block">{html.escape(submitted)}</pre></details>'
+        )
+
     body = (head + sitemap
             + f'<div class="page-wrap">{tldr}{metrics_html}{ref_block}'
-            f'{"".join(turns_html)}</div>')
+            f'{"".join(turns_html)}{kernel_block}</div>')
     return body
 
 
