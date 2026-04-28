@@ -1,27 +1,14 @@
-# Architecture and Long-Context reference problems
+# Level 4 Popcorn: Whole-Model Wrappers
 
-These modules implement compute-intensive kernels inspired by **modern
-transformer and state-space architectures**. They focus on isolated kernel
-motifs rather than full blocks so the resulting training data emphasizes
-reusable implementation patterns: low-rank KV expansion, expert routing,
-grouped-query attention, scaled low-precision attention, and recurrent
-delta-style linear attention.
+These are full-model references in the same style as `level4/original`.
+Each file loads a pretrained model and runs a full forward pass.
 
-Each file is a self-contained PyTorch reference (`class Model`, `get_inputs()`,
-`get_init_inputs()`). They are local-only reference problems in the same style
-as `level9`.
+## Included domains
 
-## Suggested mapping to architecture domains
+- LLMs: Llama, Mistral, Mixtral, Gemma, Falcon, StarCoder2, Phi, Pythia, GPT-2, OPT, DeepSeek, Qwen
+- VLMs/VLAs: LLaVA, Idefics2, OpenVLA, SmolVLA, XVLA
+- Diffusion: SDXL UNet
+- Protein: ESM2
+- Physics: ClimaX
 
-| File | Domain | Typical use |
-|------|--------|-------------|
-| `1_DeepSeekMLALoRAExpansion.py` | MLA / compressed KV cache | Reconstruct K/V tensors from low-rank latent projections |
-| `2_DeepSeekMoEGroundedTop2Routing.py` | MoE routing | Grounded top-2 expert selection with similarity-biased router logits |
-| `3_GQAKVHeadExpansionAttention.py` | Grouped-query attention | Causal attention with KV-head expansion across query-head groups |
-| `4_FP8ScaledAttention.py` | Low-precision attention | Scaled quantized Q/K/V attention with explicit dequantization semantics |
-| `5_GatedDeltaNetLinearAttention.py` | Linear attention / recurrent state | Scalar-gated delta-state update with query readout |
-| `6_KimiDeltaAttentionChannelwise.py` | Linear attention / recurrent state | Channel-wise gated delta-state update with per-channel decay |
-| `7_RoPEKVCacheUpdate.py` | KV cache management | Apply RoPE to fresh keys and write keys/values into cache slots |
-| `8_DeepSeekMoEDispatchPermute.py` | MoE token movement | Expert-major token dispatch into a packed per-expert activation buffer |
-| `9_DeepSeekMoECombineScatter.py` | MoE token movement | Weighted scatter-add of expert outputs back into token order |
-| `10_FusedMLAAttention.py` | MLA attention | Causal attention that expands compressed MLA latents into K/V on the fly |
+All files expose `Model`, `get_inputs()`, and `get_init_inputs()`.
