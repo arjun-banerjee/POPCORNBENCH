@@ -323,7 +323,9 @@ def main(config: ScriptConfig):
                                                     verbose=False,
                                                     precision=config.precision,
                                                     )
-        ref_exec_eager_time = ref_time_eager_result.get("mean", None)
+        ref_exec_eager_time = (
+            ref_time_eager_result.get("mean", None) if ref_time_eager_result else None
+        )
 
         # Measure Torch Compile time
         ref_time_compile_result = measure_ref_program_time(ref_arch_name="Reference Program",
@@ -335,7 +337,9 @@ def main(config: ScriptConfig):
                                                     verbose=False,
                                                     precision=config.precision,
                                                     )
-        ref_exec_compile_time = ref_time_compile_result.get("mean", None)
+        ref_exec_compile_time = (
+            ref_time_compile_result.get("mean", None) if ref_time_compile_result else None
+        )
 
     elif config.eval_mode == "modal":
         # Modal evaluation (remote execution)
@@ -368,7 +372,9 @@ def main(config: ScriptConfig):
                 gpu_arch=gpu_arch,
                 precision=config.precision,
             )
-            ref_exec_eager_time = ref_time_eager_result.get("mean", None)
+            ref_exec_eager_time = (
+                ref_time_eager_result.get("mean", None) if ref_time_eager_result else None
+            )
 
             # Measure Torch Compile time
             print("[INFO] Measuring reference program time (torch.compile)")
@@ -383,7 +389,9 @@ def main(config: ScriptConfig):
                 gpu_arch=gpu_arch,
                 precision=config.precision,
             )
-            ref_exec_compile_time = ref_time_compile_result.get("mean", None)
+            ref_exec_compile_time = (
+                ref_time_compile_result.get("mean", None) if ref_time_compile_result else None
+            )
 
     print("="*40)
     print(f"[Eval] Kernel eval result: {kernel_eval_result}")
@@ -393,11 +401,18 @@ def main(config: ScriptConfig):
     print(f"[Timing] Custom Kernel exec time: {kernel_exec_time} ms")
     print("-"*40)   
     
-    if kernel_eval_result.correctness:
-        print(f"[Speedup] Speedup over eager: {ref_exec_eager_time / kernel_exec_time:.2f}x")
-        print(f"[Speedup] Speedup over torch.compile: {ref_exec_compile_time / kernel_exec_time:.2f}x")
+    if not kernel_eval_result.correctness:
+        print("[Speedup] Speedup not available: kernel did not pass correctness.")
+    elif kernel_exec_time is None or kernel_exec_time <= 0:
+        print(
+            "[Speedup] Speedup not available: custom kernel runtime was not measured "
+            "(set measure_performance=True to time ModelNew), or timing was invalid."
+        )
     else:
-        print("[Speedup] Speedup Not Available as Kernel did not pass correctness")
+        if ref_exec_eager_time is not None:
+            print(f"[Speedup] Speedup over eager: {ref_exec_eager_time / kernel_exec_time:.2f}x")
+        if ref_exec_compile_time is not None:
+            print(f"[Speedup] Speedup over torch.compile: {ref_exec_compile_time / kernel_exec_time:.2f}x")
 
     print("="*40)
 
