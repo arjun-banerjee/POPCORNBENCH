@@ -65,6 +65,9 @@ header .page-wrap { padding-top: 36px; padding-bottom: 24px; }
   font-weight: 400; font-style: italic; font-size: 36px;
   letter-spacing: -0.02em; line-height: 1; margin-bottom: 6px;
 }
+.site-title a { text-decoration: none; }
+.site-title a::before { content: "↑ "; opacity: 0.4; font-size: 22px; vertical-align: middle; }
+.site-title a:hover { opacity: 0.6; }
 .site-subtitle { font-size: 13px; opacity: 0.45; font-style: italic; }
 .header-links { margin-top: 12px; display: flex; gap: 14px; font-size: 12px; font-style: italic; }
 .header-links a { opacity: 0.55; text-decoration: none; }
@@ -244,6 +247,28 @@ details[open] > summary::before { content: "▾ "; }
 .block.tool-out.fail { border-left-color: var(--r); }
 .block.reasoning { border-left-color: var(--y); font-style: italic; opacity: 0.85; }
 .block.assistant { border-left-color: var(--g); }
+
+/* reference-PyTorch source on the trajectory page */
+.ref-source { margin: 18px 0; border: 1px solid var(--g15); }
+.ref-source > summary {
+  background: var(--g08); padding: 10px 14px;
+  font-size: 12px; font-style: italic; opacity: 0.75;
+  letter-spacing: 0.04em; cursor: pointer;
+}
+.ref-source pre {
+  margin: 0; padding: 12px 16px; max-height: 480px; overflow: auto;
+  white-space: pre; font-size: 11px; line-height: 1.4;
+  background: var(--w); border-top: 1px solid var(--g15);
+}
+
+/* whole-turn collapse for long turns */
+.turn-collapse { border-top: 1px solid var(--g15); }
+.turn-collapse > summary {
+  padding: 12px 0; cursor: pointer; font-size: 13px; opacity: 0.85;
+}
+.turn-collapse[open] > summary { opacity: 1; }
+.turn-collapse > summary::before { content: "▸ "; opacity: 0.5; }
+.turn-collapse[open] > summary::before { content: "▾ "; }
 
 .role-tag {
   display: inline-block;
@@ -545,7 +570,7 @@ def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
 
     head = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title">{html.escape(run_name)}</div>'
+        f'<div class="site-title"><a href="../../index.html" title="all sweeps">{html.escape(run_name)}</a></div>'
         f'<div class="site-subtitle">kernelbench sweep report · {len(by_variant)} variants</div>'
         f'<div class="header-links">'
         f'<a href="index.html">overview</a>'
@@ -593,7 +618,7 @@ def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
 
     head = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title">{html.escape(variant)}</div>'
+        f'<div class="site-title"><a href="../../../../index.html" title="all sweeps">{html.escape(variant)}</a></div>'
         f'<div class="site-subtitle">{html.escape(run_name)} · variant overview</div>'
         f'<div class="header-links">'
         f'<a href="../../index.html">← all variants</a>'
@@ -645,7 +670,7 @@ def _render_model_page(model: str, variant: str, trajs: list[dict],
 
     body = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title">{html.escape(model)}</div>'
+        f'<div class="site-title"><a href="../../../../../index.html" title="all sweeps">{html.escape(model)}</a></div>'
         f'<div class="site-subtitle">{html.escape(run_name)} · {html.escape(variant)} · '
         f'{len(trajs)} trajectories</div>'
         f'<div class="header-links">'
@@ -663,6 +688,24 @@ def _render_model_page(model: str, variant: str, trajs: list[dict],
 # ---------------------------------------------------------------------------
 # Trajectory page
 # ---------------------------------------------------------------------------
+
+def _load_reference_source(level: int, variant: str, problem_id: int) -> str | None:
+    """Find KernelBench/level{N}/{variant}/{pid}_*.py and read it."""
+    if not level or problem_id is None:
+        return None
+    base = os.path.join(REPO_TOP_DIR, "KernelBench", f"level{level}", variant)
+    if not os.path.isdir(base):
+        return None
+    matches = [f for f in os.listdir(base)
+               if f.startswith(f"{problem_id}_") and f.endswith(".py")]
+    if not matches:
+        return None
+    try:
+        with open(os.path.join(base, matches[0])) as f:
+            return f.read()
+    except OSError:
+        return None
+
 
 def _trajectory_id(d: dict) -> str:
     model = d.get("model_name") or d["_model_dir"]
@@ -705,15 +748,43 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str,
 
     metrics_html = _render_extended_metrics(fr)
 
+    # Reference PyTorch source — loaded from KernelBench at render time.
+    ref_src = _load_reference_source(d.get("level"), d.get("_variant", "original"),
+                                     d.get("problem_id"))
+    ref_block = ""
+    if ref_src:
+        ref_block = (
+            '<details class="ref-source"><summary>'
+            'reference PyTorch source (the prompt the agent sees)'
+            '</summary>'
+            f'<pre class="block">{html.escape(ref_src)}</pre></details>'
+        )
+
+    # Collapse a turn into <details> if its rendered HTML is large; keep short
+    # turns expanded by default so quick scans don't require any clicks.
+    _COLLAPSE_THRESHOLD = 6000  # chars of inner HTML
     turns_html = []
     for t in d.get("turns", []):
-        turns_html.append(_render_turn(t))
+        inner = _render_turn(t)
+        if len(inner) > _COLLAPSE_THRESHOLD:
+            tid = t.get("turn_id", "?")
+            n_calls = len(t.get("tool_calls") or [])
+            tag = "FINAL · " if t.get("is_final") else ""
+            turns_html.append(
+                f'<details class="turn-collapse"><summary>'
+                f'<b>turn {tid}</b> · {tag}{n_calls} tool call(s) · '
+                f'{t.get("llm_latency_s",0):.1f}s · '
+                f'{len(inner):,} chars (click to expand)'
+                f'</summary>{inner}</details>'
+            )
+        else:
+            turns_html.append(inner)
 
     model = d.get("model_name") or d["_model_dir"]
     variant = d.get("_variant", "default")
     head = (
         f'<header><div class="page-wrap">'
-        f'<div class="site-title">L{d.get("level")} · problem {d.get("problem_id")}</div>'
+        f'<div class="site-title"><a href="../../../../../index.html" title="all sweeps">L{d.get("level")} · problem {d.get("problem_id")}</a></div>'
         f'<div class="site-subtitle">{html.escape(model)} · {html.escape(variant)} · {html.escape(run_name)}</div>'
         f'<div class="header-links">'
         f'<a href="../../../index.html">← all variants</a>'
@@ -725,7 +796,9 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str,
     sitemap = (_render_sitemap(by_variant, link_prefix="../../../",
                                here=("trajectory", (variant, model)))
                if by_variant else "")
-    body = head + sitemap + f'<div class="page-wrap">{tldr}{metrics_html}{"".join(turns_html)}</div>'
+    body = (head + sitemap
+            + f'<div class="page-wrap">{tldr}{metrics_html}{ref_block}'
+            f'{"".join(turns_html)}</div>')
     return body
 
 
