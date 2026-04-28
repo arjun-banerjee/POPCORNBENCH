@@ -24,9 +24,9 @@ cd "$(dirname "$0")/.."
 export LD_LIBRARY_PATH="/opt/conda/lib:${LD_LIBRARY_PATH:-}"
 
 CONFIGS=(
-  configs/sweep.single_turn.toml
-  configs/sweep.multi_turn_default.toml
-  configs/sweep.multi_turn_all.toml
+  configs/sweep.cuda_single_turn.toml
+  configs/sweep.cuda_multi_turn_default.toml
+  configs/sweep.cuda_multi_turn_all.toml
 )
 
 for cfg in "${CONFIGS[@]}"; do

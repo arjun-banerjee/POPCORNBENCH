@@ -71,6 +71,25 @@ header .page-wrap { padding-top: 36px; padding-bottom: 24px; }
 .header-links a:hover { opacity: 1; }
 .header-links .meta { opacity: 0.32; }
 
+/* sitemap nav — appears on every page so any (variant, model) is one click away */
+.sitemap {
+  border-bottom: 1px solid var(--g15);
+  background: var(--g08);
+  font-size: 11px;
+}
+.sitemap .page-wrap { padding-top: 10px; padding-bottom: 10px; }
+.sitemap .group { margin-right: 18px; display: inline-block; }
+.sitemap .grp-label {
+  font-style: italic; opacity: 0.55;
+  letter-spacing: 0.06em; margin-right: 6px;
+}
+.sitemap a {
+  text-decoration: none; opacity: 0.75;
+  margin-right: 8px;
+}
+.sitemap a:hover { opacity: 1; }
+.sitemap a.current { opacity: 1; font-weight: 500; text-decoration: underline; }
+
 /* summary stats */
 .stat-row {
   display: flex; gap: 0; border-bottom: 1px solid var(--g);
@@ -375,6 +394,49 @@ def _aggregate_metrics(trajs: list[dict]) -> dict:
     }
 
 
+def _render_sitemap(by_variant: dict[str, list[dict]], *, link_prefix: str,
+                    here: tuple[str, str | None] = ("top", None)) -> str:
+    """Render a single-row sitemap with a Home link and per-variant model lists.
+
+    `link_prefix` is the relative path back to the report root, e.g. ""
+    (top index), "../../" (variant index), "../" (model page is one level up
+    from variant root via models/, but href targets need to be from the
+    *page* — see callers).
+
+    `here` is ('top'|'variant'|'model'|'trajectory', context) used to
+    highlight the current page.
+    """
+    parts = [
+        '<nav class="sitemap"><div class="page-wrap">',
+        '<span class="group">'
+        f'<a href="{link_prefix}index.html"'
+        f'{" class=current" if here[0] == "top" else ""}>home</a></span>',
+    ]
+    for variant in sorted(by_variant.keys()):
+        v_safe = _safe_filename(variant)
+        v_href = f'{link_prefix}v/{v_safe}/index.html'
+        v_cur = (here[0] == "variant" and here[1] == variant)
+        models = sorted({d.get("model_name") or d["_model_dir"]
+                         for d in by_variant[variant]})
+        model_links = []
+        for m in models:
+            m_safe = _safe_filename(m)
+            m_href = f'{link_prefix}v/{v_safe}/models/{m_safe}.html'
+            cur = (here[0] in ("model", "trajectory")
+                   and here[1] == (variant, m))
+            model_links.append(
+                f'<a href="{m_href}"{" class=current" if cur else ""}>'
+                f'{html.escape(m)}</a>'
+            )
+        parts.append(
+            f'<span class="group"><span class="grp-label">{html.escape(variant)}:</span>'
+            f'<a href="{v_href}"{" class=current" if v_cur else ""}>overview</a>'
+            f'{"".join(model_links)}</span>'
+        )
+    parts.append('</div></nav>')
+    return "".join(parts)
+
+
 def _outcome_counts(trajs: list[dict]) -> dict[str, int]:
     out: dict[str, int] = {}
     for d in trajs:
@@ -492,6 +554,7 @@ def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
     )
     body = (
         head
+        + _render_sitemap(by_variant, link_prefix="", here=("top", None))
         + _stat_row(all_trajs)
         + _sweep_metrics_block(all_trajs)
         + f'<div class="page-wrap"><div class="tool-grid">{"".join(cards)}</div></div>'
@@ -500,7 +563,8 @@ def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
 
 
 def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
-                          generated_at: str) -> str:
+                          generated_at: str,
+                          by_variant: dict[str, list[dict]] | None = None) -> str:
     """Per-variant summary page (used to be the top-level index)."""
     by_model: dict[str, list[dict]] = {}
     for d in trajs:
@@ -536,8 +600,12 @@ def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
     )
+    sitemap = (_render_sitemap(by_variant, link_prefix="../../",
+                               here=("variant", variant))
+               if by_variant else "")
     body = (
         head
+        + sitemap
         + _stat_row(trajs)
         + _sweep_metrics_block(trajs)
         + f'<div class="page-wrap">{table}</div>'
@@ -546,7 +614,8 @@ def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
 
 
 def _render_model_page(model: str, variant: str, trajs: list[dict],
-                       run_name: str, generated_at: str) -> str:
+                       run_name: str, generated_at: str,
+                       by_variant: dict[str, list[dict]] | None = None) -> str:
     cards = []
     for d in sorted(
         trajs, key=lambda x: (x.get("level", 0), x.get("problem_id", 0))
@@ -584,7 +653,9 @@ def _render_model_page(model: str, variant: str, trajs: list[dict],
         f'<a href="../index.html">← {html.escape(variant)}</a>'
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
-        f'<div class="page-wrap"><div class="tool-grid">{"".join(cards)}</div></div>'
+        + (_render_sitemap(by_variant, link_prefix="../../../",
+                           here=("model", (variant, model))) if by_variant else "")
+        + f'<div class="page-wrap"><div class="tool-grid">{"".join(cards)}</div></div>'
     )
     return body
 
@@ -602,7 +673,8 @@ def _safe_filename(s: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)
 
 
-def _render_trajectory(d: dict, run_name: str, generated_at: str) -> str:
+def _render_trajectory(d: dict, run_name: str, generated_at: str,
+                       by_variant: dict[str, list[dict]] | None = None) -> str:
     fr = d.get("final_result") or {}
     sp = _speedup(d)
     sp_str = f"{sp:.2f}x" if sp is not None else "—"
@@ -650,7 +722,10 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str) -> str:
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
     )
-    body = head + f'<div class="page-wrap">{tldr}{metrics_html}{"".join(turns_html)}</div>'
+    sitemap = (_render_sitemap(by_variant, link_prefix="../../../",
+                               here=("trajectory", (variant, model)))
+               if by_variant else "")
+    body = head + sitemap + f'<div class="page-wrap">{tldr}{metrics_html}{"".join(turns_html)}</div>'
     return body
 
 
@@ -969,7 +1044,8 @@ def build_report(run_dir: str) -> None:
         os.makedirs(os.path.join(vdir, "t"), exist_ok=True)
 
         # variant index
-        body = _render_variant_index(run_name, variant, vtrajs, generated_at)
+        body = _render_variant_index(run_name, variant, vtrajs, generated_at,
+                                     by_variant=by_variant)
         with open(os.path.join(vdir, "index.html"), "w") as f:
             f.write(_page(f"{variant} · {run_name}", body, css_path="../../style.css"))
 
@@ -978,7 +1054,8 @@ def build_report(run_dir: str) -> None:
         for d in vtrajs:
             by_model.setdefault(d.get("model_name") or d["_model_dir"], []).append(d)
         for model, items in by_model.items():
-            body = _render_model_page(model, variant, items, run_name, generated_at)
+            body = _render_model_page(model, variant, items, run_name, generated_at,
+                                      by_variant=by_variant)
             path = os.path.join(vdir, "models", f"{_safe_filename(model)}.html")
             with open(path, "w") as f:
                 f.write(_page(f"{model} · {variant} · {run_name}", body,
@@ -986,7 +1063,7 @@ def build_report(run_dir: str) -> None:
 
         # per-trajectory pages
         for d in vtrajs:
-            body = _render_trajectory(d, run_name, generated_at)
+            body = _render_trajectory(d, run_name, generated_at, by_variant=by_variant)
             path = os.path.join(vdir, "t", f"{_trajectory_id(d)}.html")
             with open(path, "w") as f:
                 f.write(_page(f"L{d.get('level')} P{d.get('problem_id')} · {variant}",
