@@ -440,7 +440,6 @@ def main():
 
     work_items: list[WorkItem] = []
     num_gpus = par_cfg["num_gpu_devices"]
-    counter = 0
     for variant in variants:
         for level in levels:
             ds = construct_kernelbench_dataset(
@@ -460,11 +459,20 @@ def main():
                             model_idx=m_idx,
                             level=level,
                             problem_id=int(pid),
-                            device_id=counter % num_gpus,
+                            device_id=0,  # re-stamped after shuffle
                             variant=variant,
                         )
                     )
-                    counter += 1
+
+    # Shuffle so the pool doesn't drain a single model first (which both
+    # starves the per-model LLM semaphore and pile-ups on the per-GPU
+    # perf-timing locks). Re-stamp device_id afterwards to keep GPU coverage
+    # balanced.
+    import random as _random
+    _random.seed(0xC0FFEE)  # deterministic so resumes pick the same order
+    _random.shuffle(work_items)
+    for i, w in enumerate(work_items):
+        w.device_id = i % num_gpus
 
     print(f"[run_sweep] {len(work_items)} work items across "
           f"{len(sweep['models'])} models, levels={levels}, variants={variants}")
