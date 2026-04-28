@@ -178,8 +178,14 @@ class BaseDataset(ABC):
 class LocalKernelBenchDataset(BaseDataset):
     """Dataset backed by local filesystem.
     
-    Loads problems from KernelBench/level{N}/*.py
-    Flexible for any level number (1, 2, 3, or custom levels).
+    Loads problems from KernelBench/level{N}/{variant}/*.py.
+
+    `variant` selects which problem set to load. The current layout is:
+        KernelBench/level{N}/original/  -- the upstream KernelBench problems
+        KernelBench/level{N}/popcorn/   -- the popcorn-specific problem set
+
+    For backwards compatibility, if the variant subdirectory does not exist
+    we fall back to loading directly from KernelBench/level{N}/*.py.
     """
 
     def __init__(
@@ -188,22 +194,25 @@ class LocalKernelBenchDataset(BaseDataset):
         base_path: str = KERNEL_BENCH_PATH,
         problem_ids: Optional[list[int]] = None,
         id_range: Optional[tuple[int, int]] = None,
+        variant: str = "original",
     ):
         """Initialize local dataset.
-        
+
         Args:
             level: KernelBench level (any positive integer)
             base_path: Path to KernelBench directory
             problem_ids: Optional list of specific problem IDs to include
             id_range: Optional (start_id, end_id) inclusive range
+            variant: Subdirectory under level{N}/ (e.g. "original", "popcorn").
         """
         if level < 1:
             raise ValueError(f"level must be >= 1, got {level}")
 
         self._level = level
         self._base_path = base_path
+        self._variant = variant
         self._problems: dict[int, Problem] = {}
-        
+
         # Build filter set from problem_ids and/or id_range
         self._filter_ids = self._build_filter_set(problem_ids, id_range)
         self._load_problems()
@@ -230,10 +239,16 @@ class LocalKernelBenchDataset(BaseDataset):
         return self._level
 
     def _load_problems(self):
-        problem_dir = os.path.join(self._base_path, f"level{self._level}")
-        
-        if not os.path.exists(problem_dir):
-            raise FileNotFoundError(f"Problem directory not found: {problem_dir}")
+        level_dir = os.path.join(self._base_path, f"level{self._level}")
+        variant_dir = os.path.join(level_dir, self._variant)
+        if os.path.isdir(variant_dir):
+            problem_dir = variant_dir
+        elif os.path.isdir(level_dir):
+            problem_dir = level_dir  # legacy flat layout
+        else:
+            raise FileNotFoundError(
+                f"Problem directory not found: {variant_dir} (and no fallback at {level_dir})"
+            )
 
         for file_name in os.listdir(problem_dir):
             if not file_name.endswith(".py"):
@@ -276,7 +291,10 @@ class LocalKernelBenchDataset(BaseDataset):
             yield self._problems[pid]
 
     def __repr__(self) -> str:
-        return f"LocalKernelBenchDataset(level={self._level}, problems={len(self)})"
+        return (
+            f"LocalKernelBenchDataset(level={self._level}, "
+            f"variant={self._variant!r}, problems={len(self)})"
+        )
 
     def subset(
         self,
@@ -289,6 +307,7 @@ class LocalKernelBenchDataset(BaseDataset):
             base_path=self._base_path,
             problem_ids=problem_ids,
             id_range=id_range,
+            variant=self._variant,
         )
 
 
@@ -407,6 +426,7 @@ def construct_kernelbench_dataset(
     base_path: str = KERNEL_BENCH_PATH,
     problem_ids: Optional[list[int]] = None,
     id_range: Optional[tuple[int, int]] = None,
+    variant: str = "original",
 ) -> BaseDataset:
     """Construct a KernelBench dataset for a specific level.
     
@@ -450,7 +470,9 @@ def construct_kernelbench_dataset(
         'import torch...'
     """
     if source == "local":
-        return LocalKernelBenchDataset(level, base_path, problem_ids, id_range)
+        return LocalKernelBenchDataset(
+            level, base_path, problem_ids, id_range, variant=variant
+        )
     elif source == "huggingface":
         return HuggingFaceKernelBenchDataset(level, dataset_name, problem_ids, id_range)
     else:
