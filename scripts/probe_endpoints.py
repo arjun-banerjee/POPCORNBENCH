@@ -19,26 +19,26 @@ from openai import OpenAI
 
 PROBES = [
     # (display_name, api_kind, base_url, key_env, model_id_to_send)
-    (
-        "gpt-5.4-pro",
-        "openai",
-        "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/",
-        "TEJAS_AZURE_KEY",
-        "gpt-5.4-pro",
-    ),
-    (
-        "gpt-5.5",
-        "openai",
-        "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/",
-        "TEJAS_AZURE_KEY",
-        "gpt-5.5",
-    ),
+    # (
+    #     "gpt-5.4-pro",
+    #     "openai",
+    #     "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/",
+    #     "TEJAS_AZURE_KEY",
+    #     "gpt-5.4-pro",
+    # ),
+    # (
+    #     "gpt-5.5",
+    #     "openai",
+    #     "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/",
+    #     "TEJAS_AZURE_KEY",
+    #     "gpt-5.5",
+    # ),
     (
         "gpt-5.5 (popcorn-centralus)",
         "openai",
         "https://popcorn-centralus-resource.services.ai.azure.com/openai/v1/",
         "POPCORN_CENTRAL_AZURE_KEY",
-        "gpt-5.5",
+        "gpt-5.5-priority",
     ),
     (
         "FW-GLM-5-1",
@@ -97,56 +97,68 @@ def probe(name, api_kind, base_url, key_env, model):
     client = OpenAI(api_key=key, base_url=base_url)
     results = []
     if api_kind == "openai":
-        results.append(_try(
-            "bare",
-            lambda: client.responses.create(model=model, input="ping"),
-        ))
-        results.append(_try(
-            "with instructions",
-            lambda: client.responses.create(
-                model=model,
-                instructions="Be terse.",
-                input=[{"role": "user", "content": "ping"}],
-            ),
-        ))
-        results.append(_try(
-            "with tools",
-            lambda: client.responses.create(
-                model=model,
-                instructions="Be terse.",
-                input=[{"role": "user", "content": "ping"}],
-                tools=[_DUMMY_TOOL_RESPONSES],
-            ),
-        ))
-        results.append(_try(
-            "with tools + reasoning.effort=low",
-            lambda: client.responses.create(
-                model=model,
-                instructions="Be terse.",
-                input=[{"role": "user", "content": "ping"}],
-                tools=[_DUMMY_TOOL_RESPONSES],
-                reasoning={"effort": "low"},
-            ),
-        ))
+        results.append(
+            _try(
+                "bare",
+                lambda: client.responses.create(model=model, input="ping"),
+            )
+        )
+        results.append(
+            _try(
+                "with instructions",
+                lambda: client.responses.create(
+                    model=model,
+                    instructions="Be terse.",
+                    input=[{"role": "user", "content": "ping"}],
+                ),
+            )
+        )
+        results.append(
+            _try(
+                "with tools",
+                lambda: client.responses.create(
+                    model=model,
+                    instructions="Be terse.",
+                    input=[{"role": "user", "content": "ping"}],
+                    tools=[_DUMMY_TOOL_RESPONSES],
+                ),
+            )
+        )
+        results.append(
+            _try(
+                "with tools + reasoning.effort=low",
+                lambda: client.responses.create(
+                    model=model,
+                    instructions="Be terse.",
+                    input=[{"role": "user", "content": "ping"}],
+                    tools=[_DUMMY_TOOL_RESPONSES],
+                    reasoning={"effort": "low"},
+                ),
+            )
+        )
     else:
-        results.append(_try(
-            "bare",
-            lambda: client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=16,
-            ),
-        ))
-        results.append(_try(
-            "with tools",
-            lambda: client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "ping"}],
-                tools=[_DUMMY_TOOL_CHAT],
-                tool_choice="auto",
-                max_tokens=16,
-            ),
-        ))
+        results.append(
+            _try(
+                "bare",
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=16,
+                ),
+            )
+        )
+        results.append(
+            _try(
+                "with tools",
+                lambda: client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    tools=[_DUMMY_TOOL_CHAT],
+                    tool_choice="auto",
+                    max_tokens=16,
+                ),
+            )
+        )
     ok = all("OK" in r for r in results)
     return ok, results
 
