@@ -39,14 +39,36 @@ success/failure framing:
 from __future__ import annotations
 
 import os
+import random
+import time
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
-from typing import Any
+from typing import Any, Callable
 
 import torch
+
+
+# When eval_kernel_against_ref returns None (e.g. torch JIT extension lock-file
+# contention from oversubscribed agents on the same GPU), retry transparently
+# instead of reporting failure to the model — it's our infra, not a bad kernel.
+_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_BASE_SLEEP_S = 0.5  # exponential backoff with jitter
+
+
+def _retry_eval_on_lock(eval_fn: Callable[[], Any]) -> Any:
+    """Call eval_fn(); if it returns None, retry with exponential backoff."""
+    for attempt in range(_LOCK_RETRY_ATTEMPTS):
+        result = eval_fn()
+        if result is not None:
+            return result
+        if attempt == _LOCK_RETRY_ATTEMPTS - 1:
+            return None
+        sleep_s = _LOCK_RETRY_BASE_SLEEP_S * (2 ** attempt) + random.uniform(0, 0.25)
+        time.sleep(sleep_s)
+    return None
 
 from kernelbench.eval import (
     KernelExecResult,
@@ -244,7 +266,7 @@ class RunCorrectnessTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
-        result: KernelExecResult | None = eval_kernel_against_ref(
+        result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
             original_model_src=ctx.ref_arch_src,
             custom_model_src=kernel_code,
             num_correct_trials=ctx.num_correct_trials,
@@ -256,15 +278,15 @@ class RunCorrectnessTool(Tool):
             backend=ctx.backend,
             precision=ctx.torch_precision,
             check_for_excessive_speedup=False,
-        )
+        ))
 
         if result is None:
             return ToolResult(
                 tool_name=self.name,
                 success=False,
                 output=(
-                    "run_correctness FAILED: lock file or transient error. "
-                    "Please retry."
+                    "run_correctness FAILED: persistent build/lock contention "
+                    "after retries. Please try a different kernel."
                 ),
                 metadata={},
             )
@@ -598,7 +620,7 @@ class SubmitKernelTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
-        result: KernelExecResult | None = eval_kernel_against_ref(
+        result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
             original_model_src=ctx.ref_arch_src,
             custom_model_src=kernel_code,
             num_correct_trials=ctx.num_correct_trials,
@@ -611,14 +633,15 @@ class SubmitKernelTool(Tool):
             backend=ctx.backend,
             precision=ctx.torch_precision,
             check_for_excessive_speedup=True,
-        )
+        ))
 
         if result is None:
             return ToolResult(
                 tool_name=self.name,
                 success=False,
                 output=(
-                    "submit_kernel FAILED: lock file or transient error. Please retry."
+                    "submit_kernel FAILED: persistent build/lock contention "
+                    "after retries. Please try a different kernel."
                 ),
                 metadata={},
             )
