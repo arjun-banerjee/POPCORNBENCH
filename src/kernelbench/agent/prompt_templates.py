@@ -571,12 +571,6 @@ def build_turn_warning_message(
             )
         elif turns_remaining == 2:
             msg += (
-                "Two turns left. Use this turn for a final optimisation "
-                "(or analyse if you haven't yet), then `submit_kernel` on "
-                "the last turn."
-            )
-        else:
-            msg += (
                 "LAST turn. Call `submit_kernel` now with your best kernel."
             )
     else:
