@@ -755,13 +755,17 @@ def eval_kernel_against_ref(
         nsight_profile = None
         try:
             if verbose:
-                print("[Eval] Attempting Nsight profiling for SOL / Roofline")
-            torch.cuda.synchronize(device=device)
-            set_seed(seed_num)
-            perf_inputs = get_inputs()
-            perf_inputs = [_process_input_tensor(x, device, backend, precision) for x in perf_inputs]
-            perf_model = custom_model.to(device=device, dtype=precision)
-            nsight_profile = extended_metrics.profile_kernel_with_nsight(perf_model, perf_inputs, device)
+                print("[Eval] Attempting Nsight profiling for SOL / Roofline (subprocess)")
+            precision_str = {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(precision, "fp32")
+            nsight_profile = extended_metrics.profile_kernel_with_nsight(
+                custom_model_src=custom_model_src,
+                ref_model_src=original_model_src,
+                device=device,
+                backend=backend,
+                precision=precision_str,
+                build_dir=build_dir,
+                verbose=verbose,
+            )
             if nsight_profile and verbose:
                 print(f"[Eval] Nsight profiling succeeded: occupancy={nsight_profile.get('occupancy_pct')}%, "
                       f"DRAM util={nsight_profile.get('dram_utilization_pct')}%")
