@@ -34,6 +34,13 @@ PROBES = [
         "gpt-5.5",
     ),
     (
+        "gpt-5.5 (popcorn-centralus)",
+        "openai",
+        "https://popcorn-centralus-resource.services.ai.azure.com/openai/v1/",
+        "POPCORN_CENTRAL_AZURE_KEY",
+        "gpt-5.5",
+    ),
+    (
         "FW-GLM-5-1",
         "openai_chat",
         "https://popcorn-foundry-resource.openai.azure.com/openai/v1/",
