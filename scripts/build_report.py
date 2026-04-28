@@ -230,18 +230,38 @@ def _header(run_name: str, generated_at: str, here_link: str = "index.html",
 # ---------------------------------------------------------------------------
 
 def _load_all_trajectories(run_dir: str) -> list[dict]:
-    """Load every trajectory JSON under runs/{name}/{model}/."""
+    """Load every trajectory JSON under the run directory.
+
+    Supports two layouts:
+      - new: runs/{name}/{variant}/{model}/level_*_problem_*_trajectory.json
+      - legacy: runs/{name}/{model}/level_*_problem_*_trajectory.json
+        (variant is set to "default" for legacy runs)
+    """
     out = []
-    pattern = os.path.join(run_dir, "*", "level_*_problem_*_trajectory.json")
-    for path in sorted(glob.glob(pattern)):
-        try:
-            with open(path) as f:
-                d = json.load(f)
+    seen = set()
+    patterns = [
+        (os.path.join(run_dir, "*", "*", "level_*_problem_*_trajectory.json"), 2),
+        (os.path.join(run_dir, "*", "level_*_problem_*_trajectory.json"), 1),
+    ]
+    for pattern, depth in patterns:
+        for path in sorted(glob.glob(pattern)):
+            if path in seen:
+                continue
+            # Skip the report directory if its name happens to match the glob.
+            rel_parts = os.path.relpath(path, run_dir).split(os.sep)
+            if rel_parts and rel_parts[0] == "report":
+                continue
+            seen.add(path)
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+            except Exception as e:
+                print(f"[build_report] could not read {path}: {e}")
+                continue
             d["_path"] = path
             d["_model_dir"] = os.path.basename(os.path.dirname(path))
+            d["_variant"] = rel_parts[0] if depth == 2 else "default"
             out.append(d)
-        except Exception as e:
-            print(f"[build_report] could not read {path}: {e}")
     return out
 
 
@@ -262,11 +282,7 @@ def _speedup(d: dict) -> float | None:
 # Index / model pages
 # ---------------------------------------------------------------------------
 
-def _render_index(run_name: str, trajs: list[dict], generated_at: str) -> str:
-    by_model: dict[str, list[dict]] = {}
-    for d in trajs:
-        by_model.setdefault(d.get("model_name") or d["_model_dir"], []).append(d)
-
+def _stat_row(trajs: list[dict]) -> str:
     total = len(trajs)
     n_correct = sum(1 for d in trajs if d.get("outcome") == "correct")
     n_compiled = sum(
@@ -275,8 +291,7 @@ def _render_index(run_name: str, trajs: list[dict], generated_at: str) -> str:
     n_done = sum(1 for d in trajs if d.get("finished_at"))
     speedups = [s for s in (_speedup(d) for d in trajs) if s is not None]
     avg_sp = sum(speedups) / len(speedups) if speedups else 0.0
-
-    stat_row = f"""<div class="stat-row">
+    return f"""<div class="stat-row">
   <div class="stat"><div class="stat-label">trajectories</div>
     <div class="stat-val">{total}</div></div>
   <div class="stat"><div class="stat-label">finished</div>
@@ -288,6 +303,56 @@ def _render_index(run_name: str, trajs: list[dict], generated_at: str) -> str:
   <div class="stat"><div class="stat-label">avg speedup (correct)</div>
     <div class="stat-val">{avg_sp:.2f}x</div></div>
 </div>"""
+
+
+def _render_top_index(run_name: str, by_variant: dict[str, list[dict]],
+                      generated_at: str) -> str:
+    """Top-level overview that lists each variant as a card-grid entry."""
+    all_trajs = [d for v in by_variant.values() for d in v]
+
+    cards = []
+    for variant in sorted(by_variant.keys()):
+        items = by_variant[variant]
+        n = len(items)
+        n_correct = sum(1 for d in items if d.get("outcome") == "correct")
+        n_compiled = sum(1 for d in items if (d.get("final_result") or {}).get("compiled"))
+        speedups = [s for s in (_speedup(d) for d in items) if s is not None]
+        avg = sum(speedups) / len(speedups) if speedups else 0.0
+        models = sorted({d.get("model_name") or d["_model_dir"] for d in items})
+        cards.append(f"""<a class="tool-card" href="v/{_safe_filename(variant)}/index.html">
+  <div class="card-top">
+    <span class="card-name">{html.escape(variant)}</span>
+    <span class="card-meta">{n} trajectories · {len(models)} models</span>
+  </div>
+  <div class="card-row">
+    <span class="outcome-badge outcome-correct">{n_correct} correct</span>
+    <span class="card-runtime">{n_compiled} compiled · avg {avg:.2f}x</span>
+  </div>
+</a>""")
+
+    head = (
+        f'<header><div class="page-wrap">'
+        f'<div class="site-title">{html.escape(run_name)}</div>'
+        f'<div class="site-subtitle">kernelbench sweep report · {len(by_variant)} variants</div>'
+        f'<div class="header-links">'
+        f'<a href="index.html">overview</a>'
+        f'<span class="meta">generated {html.escape(generated_at)}</span>'
+        f'</div></div></header>'
+    )
+    body = (
+        head
+        + _stat_row(all_trajs)
+        + f'<div class="page-wrap"><div class="tool-grid">{"".join(cards)}</div></div>'
+    )
+    return body
+
+
+def _render_variant_index(run_name: str, variant: str, trajs: list[dict],
+                          generated_at: str) -> str:
+    """Per-variant summary page (used to be the top-level index)."""
+    by_model: dict[str, list[dict]] = {}
+    for d in trajs:
+        by_model.setdefault(d.get("model_name") or d["_model_dir"], []).append(d)
 
     rows = []
     for model in sorted(by_model.keys()):
@@ -310,17 +375,21 @@ def _render_index(run_name: str, trajs: list[dict], generated_at: str) -> str:
 <th>avg speedup</th></tr></thead>
 <tbody>{"".join(rows)}</tbody></table>"""
 
-    body = (
-        _header(run_name, generated_at, link_prefix="")
-        .replace('href=""', 'href="index.html"')
-        + stat_row
-        + f'<div class="page-wrap">{table}</div>'
+    head = (
+        f'<header><div class="page-wrap">'
+        f'<div class="site-title">{html.escape(variant)}</div>'
+        f'<div class="site-subtitle">{html.escape(run_name)} · variant overview</div>'
+        f'<div class="header-links">'
+        f'<a href="../../index.html">← all variants</a>'
+        f'<span class="meta">generated {html.escape(generated_at)}</span>'
+        f'</div></div></header>'
     )
+    body = head + _stat_row(trajs) + f'<div class="page-wrap">{table}</div>'
     return body
 
 
-def _render_model_page(model: str, trajs: list[dict], run_name: str,
-                       generated_at: str) -> str:
+def _render_model_page(model: str, variant: str, trajs: list[dict],
+                       run_name: str, generated_at: str) -> str:
     cards = []
     for d in sorted(
         trajs, key=lambda x: (x.get("level", 0), x.get("problem_id", 0))
@@ -351,9 +420,11 @@ def _render_model_page(model: str, trajs: list[dict], run_name: str,
     body = (
         f'<header><div class="page-wrap">'
         f'<div class="site-title">{html.escape(model)}</div>'
-        f'<div class="site-subtitle">{run_name} · {len(trajs)} trajectories</div>'
+        f'<div class="site-subtitle">{html.escape(run_name)} · {html.escape(variant)} · '
+        f'{len(trajs)} trajectories</div>'
         f'<div class="header-links">'
-        f'<a href="../index.html">← overview</a>'
+        f'<a href="../../../index.html">← all variants</a>'
+        f'<a href="../index.html">← {html.escape(variant)}</a>'
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
         f'<div class="page-wrap"><div class="tool-grid">{"".join(cards)}</div></div>'
@@ -391,6 +462,7 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str) -> str:
   <div class="tldr-cell"><div class="l">turns / max</div><div class="v">{d.get('total_turns',0)} / {d.get('max_turns','?')}</div></div>
   <div class="tldr-cell"><div class="l">tool calls</div><div class="v">{d.get('total_tool_calls',0)}</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">{html.escape(d.get('backend',''))} {html.escape(d.get('precision',''))}</div></div>
+  <div class="tldr-cell"><div class="l">variant</div><div class="v">{html.escape(d.get('_variant','default'))}</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">{rt_str}</div></div>
   <div class="tldr-cell"><div class="l">ref runtime</div>
     <div class="v">{(fr.get('ref_runtime') or 0):.2f} μs</div></div>
@@ -407,12 +479,14 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str) -> str:
         turns_html.append(_render_turn(t))
 
     model = d.get("model_name") or d["_model_dir"]
+    variant = d.get("_variant", "default")
     head = (
         f'<header><div class="page-wrap">'
         f'<div class="site-title">L{d.get("level")} · problem {d.get("problem_id")}</div>'
-        f'<div class="site-subtitle">{html.escape(model)} · {run_name}</div>'
+        f'<div class="site-subtitle">{html.escape(model)} · {html.escape(variant)} · {html.escape(run_name)}</div>'
         f'<div class="header-links">'
-        f'<a href="../index.html">← overview</a>'
+        f'<a href="../../../index.html">← all variants</a>'
+        f'<a href="../index.html">← {html.escape(variant)}</a>'
         f'<a href="../models/{_safe_filename(model)}.html">← {html.escape(model)}</a>'
         f'<span class="meta">generated {html.escape(generated_at)}</span>'
         f'</div></div></header>'
@@ -506,14 +580,21 @@ def _details(summary: str, body: str, cls: str = "", open_: bool = False,
 # ---------------------------------------------------------------------------
 
 def build_report(run_dir: str) -> None:
-    """Rebuild the static report site under {run_dir}/report/."""
+    """Rebuild the static report site under {run_dir}/report/.
+
+    Layout:
+        report/index.html                       -- all-variants overview
+        report/style.css                        -- shared styles
+        report/v/{variant}/index.html           -- per-variant summary
+        report/v/{variant}/models/{model}.html  -- model card grid
+        report/v/{variant}/t/{traj_id}.html     -- one page per trajectory
+    """
     import time as _time
     generated_at = _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()) + " UTC"
 
     run_name = os.path.basename(os.path.normpath(run_dir))
     report_dir = os.path.join(run_dir, "report")
-    os.makedirs(os.path.join(report_dir, "models"), exist_ok=True)
-    os.makedirs(os.path.join(report_dir, "t"), exist_ok=True)
+    os.makedirs(report_dir, exist_ok=True)
 
     # CSS
     with open(os.path.join(report_dir, "style.css"), "w") as f:
@@ -521,28 +602,45 @@ def build_report(run_dir: str) -> None:
 
     trajs = _load_all_trajectories(run_dir)
 
-    # index.html
-    index_body = _render_index(run_name, trajs, generated_at)
+    # Group trajectories by variant.
+    by_variant: dict[str, list[dict]] = {}
+    for d in trajs:
+        by_variant.setdefault(d["_variant"], []).append(d)
+
+    # Top-level overview.
+    top_body = _render_top_index(run_name, by_variant, generated_at)
     with open(os.path.join(report_dir, "index.html"), "w") as f:
-        f.write(_page(f"{run_name} · sweep", index_body, css_path="style.css"))
+        f.write(_page(f"{run_name} · sweep", top_body, css_path="style.css"))
 
-    # per-model pages
-    by_model: dict[str, list[dict]] = {}
-    for d in trajs:
-        by_model.setdefault(d.get("model_name") or d["_model_dir"], []).append(d)
-    for model, items in by_model.items():
-        body = _render_model_page(model, items, run_name, generated_at)
-        path = os.path.join(report_dir, "models", f"{_safe_filename(model)}.html")
-        with open(path, "w") as f:
-            f.write(_page(f"{model} · {run_name}", body, css_path="../style.css"))
+    # One subreport per variant.
+    for variant, vtrajs in by_variant.items():
+        vdir = os.path.join(report_dir, "v", _safe_filename(variant))
+        os.makedirs(os.path.join(vdir, "models"), exist_ok=True)
+        os.makedirs(os.path.join(vdir, "t"), exist_ok=True)
 
-    # per-trajectory pages
-    for d in trajs:
-        body = _render_trajectory(d, run_name, generated_at)
-        path = os.path.join(report_dir, "t", f"{_trajectory_id(d)}.html")
-        with open(path, "w") as f:
-            f.write(_page(f"L{d.get('level')} P{d.get('problem_id')}",
-                          body, css_path="../style.css"))
+        # variant index
+        body = _render_variant_index(run_name, variant, vtrajs, generated_at)
+        with open(os.path.join(vdir, "index.html"), "w") as f:
+            f.write(_page(f"{variant} · {run_name}", body, css_path="../../style.css"))
+
+        # per-model pages
+        by_model: dict[str, list[dict]] = {}
+        for d in vtrajs:
+            by_model.setdefault(d.get("model_name") or d["_model_dir"], []).append(d)
+        for model, items in by_model.items():
+            body = _render_model_page(model, variant, items, run_name, generated_at)
+            path = os.path.join(vdir, "models", f"{_safe_filename(model)}.html")
+            with open(path, "w") as f:
+                f.write(_page(f"{model} · {variant} · {run_name}", body,
+                              css_path="../../../style.css"))
+
+        # per-trajectory pages
+        for d in vtrajs:
+            body = _render_trajectory(d, run_name, generated_at)
+            path = os.path.join(vdir, "t", f"{_trajectory_id(d)}.html")
+            with open(path, "w") as f:
+                f.write(_page(f"L{d.get('level')} P{d.get('problem_id')} · {variant}",
+                              body, css_path="../../../style.css"))
 
 
 def main():

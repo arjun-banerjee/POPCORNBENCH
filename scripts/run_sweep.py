@@ -16,11 +16,12 @@ Concurrency model
 - A background thread re-renders the HTML report every `refresh_seconds`.
 
 Usage:
-    uv run python scripts/run_sweep.py config=configs/sweep.example.toml
+    uv run python scripts/run_sweep.py configs/sweep.example.toml
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import multiprocessing as mp
 import os
@@ -32,11 +33,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import pydra
 import tomli
 import torch
 from openai import OpenAI
-from pydra import Config, REQUIRED
 from tqdm import tqdm
 
 from kernelbench.agent import KernelAgent, get_tools
@@ -46,20 +45,13 @@ from kernelbench.utils import set_gpu_arch
 REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-class SweepConfig(Config):
-    def __init__(self):
-        self.config = REQUIRED  # path to the sweep TOML
-
-    def __repr__(self):
-        return f"SweepConfig(config={self.config})"
-
-
 @dataclass
 class WorkItem:
     model_idx: int        # index into sweep.models
     level: int
     problem_id: int
     device_id: int        # CUDA device this worker should use
+    variant: str = "original"  # KernelBench variant subdir
 
 
 def _resolve_tools(tools_arg) -> list[str] | None:
@@ -154,8 +146,9 @@ def run_one(
         arch = run_cfg["gpu_arch"]
         set_gpu_arch(arch if isinstance(arch, list) else [arch])
 
-    # Output dir is per-model so results don't collide
-    model_dir = os.path.join(run_dir, _safe_filename(model_name))
+    # Layout: runs/{name}/{variant}/{model}/...
+    variant_dir = os.path.join(run_dir, _safe_filename(work.variant))
+    model_dir = os.path.join(variant_dir, _safe_filename(model_name))
     os.makedirs(model_dir, exist_ok=True)
 
     traj_path = os.path.join(
@@ -165,7 +158,7 @@ def run_one(
         try:
             with open(traj_path) as f:
                 d = json.load(f)
-            return _summary_from_dict(d, work.level, model_name)
+            return _summary_from_dict(d, work.level, model_name, work.variant)
         except Exception:
             pass
 
@@ -189,7 +182,7 @@ def run_one(
             level=work.level,
             source=run_cfg["dataset_src"],
             dataset_name=run_cfg.get("dataset_name", "ScalingIntelligence/KernelBench"),
-            variant=run_cfg.get("variant", "original"),
+            variant=work.variant,
         )
         problem = dataset.get_problem_by_id(work.problem_id)
 
@@ -251,7 +244,7 @@ def run_one(
             model_dir, f"level_{work.level}_problem_{work.problem_id}_kernel.py"
         )
         trajectory.save_kernel(kernel_path)
-        return _summary_from_dict(trajectory.to_dict(), work.level, model_name)
+        return _summary_from_dict(trajectory.to_dict(), work.level, model_name, work.variant)
 
     except Exception as e:
         print(f"[Worker] ERROR ({model_name}, lvl {work.level}, p {work.problem_id}): {e}")
@@ -263,10 +256,11 @@ def _safe_filename(s: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)
 
 
-def _summary_from_dict(d: dict, level: int, model_name: str) -> dict:
+def _summary_from_dict(d: dict, level: int, model_name: str, variant: str = "") -> dict:
     fr = d.get("final_result") or {}
     return {
         "model": model_name,
+        "variant": variant,
         "problem_id": d.get("problem_id"),
         "level": level,
         "problem_name": d.get("problem_name"),
@@ -384,11 +378,21 @@ def _start_http_server(report_dir: str, host: str, port: int):
 # Main
 # ---------------------------------------------------------------------------
 
-@pydra.main(base=SweepConfig)
-def main(cfg: SweepConfig):
-    cfg_path = cfg.config
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run a TOML-driven KernelBench sweep across models and variants.",
+    )
+    parser.add_argument(
+        "config",
+        help="Path to the sweep TOML (relative paths are resolved from the repo root).",
+    )
+    args = parser.parse_args()
+
+    cfg_path = args.config
     if not os.path.isabs(cfg_path):
-        cfg_path = os.path.join(REPO_TOP_DIR, cfg_path)
+        # Resolve relative to CWD first (for tab-complete), then repo root.
+        if not os.path.exists(cfg_path):
+            cfg_path = os.path.join(REPO_TOP_DIR, args.config)
     with open(cfg_path, "rb") as f:
         sweep = tomli.load(f)
 
@@ -404,34 +408,49 @@ def main(cfg: SweepConfig):
     with open(os.path.join(run_dir, "sweep_config.json"), "w") as f:
         json.dump(sweep, f, indent=2)
 
-    # Build (model, level, problem) matrix
+    # Resolve variants: prefer `variants = [...]`; fall back to legacy
+    # singular `variant = "..."`; default to ["original"].
+    if "variants" in run_cfg:
+        variants = list(run_cfg["variants"])
+    elif "variant" in run_cfg:
+        variants = [run_cfg["variant"]]
+    else:
+        variants = ["original"]
+
+    # Build (model, level, variant, problem) matrix
     levels = run_cfg["levels"]
     subset = set(run_cfg.get("problem_subset") or [])
 
     work_items: list[WorkItem] = []
     num_gpus = par_cfg["num_gpu_devices"]
-    for level in levels:
-        ds = construct_kernelbench_dataset(
-            level=level,
-            source=run_cfg["dataset_src"],
-            dataset_name=run_cfg.get("dataset_name", "ScalingIntelligence/KernelBench"),
-            variant=run_cfg.get("variant", "original"),
-        )
-        all_pids = ds.get_problem_ids()
-        pids = [p for p in all_pids if (not subset) or (p in subset)]
-        for m_idx, _model in enumerate(sweep["models"]):
-            for i, pid in enumerate(pids):
-                work_items.append(
-                    WorkItem(
-                        model_idx=m_idx,
-                        level=level,
-                        problem_id=int(pid),
-                        device_id=(m_idx * 1000 + i) % num_gpus,
+    counter = 0
+    for variant in variants:
+        for level in levels:
+            ds = construct_kernelbench_dataset(
+                level=level,
+                source=run_cfg["dataset_src"],
+                dataset_name=run_cfg.get(
+                    "dataset_name", "ScalingIntelligence/KernelBench"
+                ),
+                variant=variant,
+            )
+            all_pids = ds.get_problem_ids()
+            pids = [p for p in all_pids if (not subset) or (p in subset)]
+            for m_idx, _model in enumerate(sweep["models"]):
+                for pid in pids:
+                    work_items.append(
+                        WorkItem(
+                            model_idx=m_idx,
+                            level=level,
+                            problem_id=int(pid),
+                            device_id=counter % num_gpus,
+                            variant=variant,
+                        )
                     )
-                )
+                    counter += 1
 
     print(f"[run_sweep] {len(work_items)} work items across "
-          f"{len(sweep['models'])} models, levels={levels}")
+          f"{len(sweep['models'])} models, levels={levels}, variants={variants}")
     print(f"[run_sweep] Workers: {num_gpus * par_cfg['agents_per_gpu']} "
           f"({num_gpus} GPUs x {par_cfg['agents_per_gpu']} per GPU)")
 
