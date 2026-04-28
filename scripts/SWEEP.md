@@ -57,7 +57,7 @@ serve_port         = 8765
 [[models]]
 name        = "gpt-5.5"
 api_kind    = "openai"
-base_url    = "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
+base_url    = "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/"
 api_key_env = "TEJAS_AZURE_KEY"
 rpm         = 250
 tpm         = 250000
@@ -109,7 +109,7 @@ serve_port         = 8765
 [[models]]
 name        = "gpt-5.5"
 api_kind    = "openai"               # "openai" = Responses API
-base_url    = "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview"
+base_url    = "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/"
 api_key_env = "TEJAS_AZURE_KEY"
 rpm         = 250
 tpm         = 250000
@@ -117,7 +117,7 @@ tpm         = 250000
 [[models]]
 name        = "DeepSeek-R1"
 api_kind    = "openai_chat"          # "openai_chat" = Chat Completions
-base_url    = "https://thava-openai.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+base_url    = "https://thava-openai.services.ai.azure.com/models"
 api_key_env = "THAVA_AZURE_KEY"
 rpm         = 250
 tpm         = 250000
@@ -156,6 +156,59 @@ The two paths share tools, prompts, and trajectory format — only the wire
 protocol differs. DeepSeek-R1's `reasoning_content` is captured in the
 trajectory but not resent to the model on the next turn (Chat Completions
 doesn't require it).
+
+## Endpoints (Azure-specific)
+
+The five models we sweep sit on two different Azure surfaces. The base URLs
+were verified end-to-end by `scripts/probe_endpoints.py` (one trivial request
+per model) — re-run that script if you suspect an outage or rotated key.
+
+### Azure OpenAI v1 preview (`...cognitiveservices.azure.com`)
+
+The OpenAI-branded models (gpt-5.x) live here. The OpenAI Python SDK auto-
+appends `/responses` or `/chat/completions` to the v1 base, so one URL covers
+both `api_kind`s. **No `api-version` query string required.**
+
+```toml
+base_url = "https://tejas-mohrgcfh-eastus2.cognitiveservices.azure.com/openai/v1/"
+api_kind = "openai"          # gpt-5.x supports the Responses API
+```
+
+### Azure AI Inference / Foundry (`...services.ai.azure.com`)
+
+DeepSeek-R1, Llama-Maverick, and Kimi-K2.6 are deployed on Azure AI Inference
+(not Azure OpenAI). The SDK base is `/models`; only Chat Completions is
+supported here, never the Responses API.
+
+```toml
+base_url = "https://thava-openai.services.ai.azure.com/models"
+api_kind = "openai_chat"
+```
+
+### Verified working today
+
+| Model                                    | base_url                            | api_kind     |
+|------------------------------------------|-------------------------------------|--------------|
+| gpt-5.4-pro                              | `…cognitiveservices…/openai/v1/`    | `openai`     |
+| gpt-5.5                                  | `…cognitiveservices…/openai/v1/`    | `openai`     |
+| DeepSeek-R1                              | `…services.ai.azure.com/models`     | `openai_chat`|
+| Llama-4-Maverick-17B-128E-Instruct-FP8   | `…services.ai.azure.com/models`     | `openai_chat`|
+| Kimi-K2.6                                | `…services.ai.azure.com/models`     | `openai_chat`|
+
+### Quirks worth knowing
+
+- **DeepSeek-R1 reasoning is inline.** It emits `<think>...</think>` blocks
+  *inside the assistant `content`* rather than via the `reasoning_content`
+  field that our agent reads. So the agent will treat the reasoning as part of
+  the assistant's normal text. The trajectory still captures it; the HTML
+  report just won't show it under the dedicated "reasoning" expander for that
+  model.
+- **`reasoning_effort` is silently ignored** when `api_kind = "openai_chat"`.
+  Chat Completions has no `reasoning.effort` field. Set it on the gpt-5.x
+  entries only.
+- **Rotate any key that lands in the working tree.** `tmp.py` and similar
+  scratch files are not committed but they're on disk; treat any key inside
+  them as compromised.
 
 ## Output layout
 
@@ -326,6 +379,23 @@ Each work item lives in its own JSON trajectory file under
 `runs/{name}/{variant}/{model}/level_{L}_problem_{P}_trajectory.json`. If that
 file already exists when the runner starts, the work item is skipped — so
 re-running the same TOML resumes a partial sweep.
+
+## Probing endpoints before a real sweep
+
+Before a long run, sanity-check that every key + URL combination still works:
+
+```bash
+uv run python scripts/probe_endpoints.py
+# OK    gpt-5.4-pro                             openai       pong
+# OK    gpt-5.5                                 openai       pong
+# OK    DeepSeek-R1                             openai_chat  <think>...</think>
+# OK    Llama-4-Maverick-17B-128E-Instruct-FP8  openai_chat  Pong!
+# OK    Kimi-K2.6                               openai_chat  <no text>
+# 5/5 endpoints reachable
+```
+
+Each probe sends a one-token "ping" through the same OpenAI SDK code path the
+sweep uses, so a 200 here means the sweep can talk to that model.
 
 ## Generating the report manually
 

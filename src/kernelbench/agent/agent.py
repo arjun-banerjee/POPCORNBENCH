@@ -614,6 +614,18 @@ class KernelAgent:
             reasoning = getattr(asst, "reasoning_content", None) or ""
             raw_tool_calls = list(asst.tool_calls or [])
 
+            # DeepSeek-R1 (and similar) emit reasoning inline as <think>...</think>
+            # in the content. Split those out into the reasoning slot and strip
+            # them from the visible content so they're not resent next turn.
+            if "<think>" in asst_content:
+                import re as _re
+                think_blocks = _re.findall(r"<think>(.*?)</think>", asst_content, _re.S)
+                if think_blocks:
+                    reasoning = (reasoning + "\n" + "\n".join(think_blocks)).strip()
+                    asst_content = _re.sub(
+                        r"<think>.*?</think>", "", asst_content, flags=_re.S
+                    ).strip()
+
             # Build the assistant message that goes back into `messages` for
             # the next turn. Chat Completions requires tool_calls (and ids) to
             # be echoed back in the assistant message; otherwise the role=tool
