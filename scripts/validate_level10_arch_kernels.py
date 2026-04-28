@@ -40,10 +40,31 @@ KERNELS = [
         "ref": LEVEL10 / "6_KimiDeltaAttentionChannelwise.py",
         "new": PROMPTS / "model_new_level10_kimi_delta_attention_channelwise.py",
     },
+    {
+        "name": "rope_kv_cache_update",
+        "ref": LEVEL10 / "7_RoPEKVCacheUpdate.py",
+        "new": PROMPTS / "model_new_level10_rope_kv_cache_update.py",
+    },
+    {
+        "name": "deepseek_moe_dispatch_permute",
+        "ref": LEVEL10 / "8_DeepSeekMoEDispatchPermute.py",
+        "new": PROMPTS / "model_new_level10_deepseek_moe_dispatch_permute.py",
+    },
+    {
+        "name": "deepseek_moe_combine_scatter",
+        "ref": LEVEL10 / "9_DeepSeekMoECombineScatter.py",
+        "new": PROMPTS / "model_new_level10_deepseek_moe_combine_scatter.py",
+    },
+    {
+        "name": "fused_mla_attention",
+        "ref": LEVEL10 / "10_FusedMLAAttention.py",
+        "new": PROMPTS / "model_new_level10_fused_mla_attention.py",
+    },
 ]
 
 TOLERANCES = {
     "deepseek_mla_lora_expansion": (3e-4, 3e-4),
+    "fused_mla_attention": (3e-4, 3e-4),
 }
 
 
@@ -129,6 +150,37 @@ def handcrafted_cases(name: str):
             torch.randn(1, 6, 2, 4, dtype=torch.float32),
             torch.randn(1, 6, 2, 4, dtype=torch.float32),
             torch.sigmoid(torch.randn(1, 6, 2, 4, dtype=torch.float32)),
+        ]]
+    if name == "rope_kv_cache_update":
+        return [[
+            torch.randn(1, 3, 2, 4, dtype=torch.float32),
+            torch.randn(1, 3, 2, 4, dtype=torch.float32),
+            torch.ones(8, 2, dtype=torch.float32),
+            torch.zeros(8, 2, dtype=torch.float32),
+            torch.zeros(1, 8, 2, 4, dtype=torch.float32),
+            torch.zeros(1, 8, 2, 4, dtype=torch.float32),
+            torch.tensor([[1, 3, 5]], dtype=torch.int32),
+        ]]
+    if name == "deepseek_moe_dispatch_permute":
+        return [[
+            torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]], dtype=torch.float32),
+            torch.tensor([0, 1, 0, 1], dtype=torch.int32),
+            torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+            torch.tensor([0, 2, 4], dtype=torch.int32),
+        ]]
+    if name == "deepseek_moe_combine_scatter":
+        return [[
+            torch.tensor([[1.0, 2.0], [3.0, 4.0], [10.0, 20.0], [30.0, 40.0]], dtype=torch.float32),
+            torch.tensor([0, 0, 1, 1], dtype=torch.int32),
+            torch.tensor([0.25, 0.75, 0.6, 0.4], dtype=torch.float32),
+            2,
+        ]]
+    if name == "fused_mla_attention":
+        return [[
+            torch.randn(1, 5, 2, 4, dtype=torch.float32),
+            torch.randn(1, 5, 3, dtype=torch.float32),
+            torch.randn(3, 2, 4, dtype=torch.float32),
+            torch.randn(3, 2, 4, dtype=torch.float32),
         ]]
     return []
 

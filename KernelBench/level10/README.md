@@ -21,3 +21,7 @@ as `level9`.
 | `4_FP8ScaledAttention.py` | Low-precision attention | Scaled quantized Q/K/V attention with explicit dequantization semantics |
 | `5_GatedDeltaNetLinearAttention.py` | Linear attention / recurrent state | Scalar-gated delta-state update with query readout |
 | `6_KimiDeltaAttentionChannelwise.py` | Linear attention / recurrent state | Channel-wise gated delta-state update with per-channel decay |
+| `7_RoPEKVCacheUpdate.py` | KV cache management | Apply RoPE to fresh keys and write keys/values into cache slots |
+| `8_DeepSeekMoEDispatchPermute.py` | MoE token movement | Expert-major token dispatch into a packed per-expert activation buffer |
+| `9_DeepSeekMoECombineScatter.py` | MoE token movement | Weighted scatter-add of expert outputs back into token order |
+| `10_FusedMLAAttention.py` | MLA attention | Causal attention that expands compressed MLA latents into K/V on the fly |
