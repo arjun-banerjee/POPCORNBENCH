@@ -38,6 +38,7 @@ success/failure framing:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import time
@@ -56,6 +57,22 @@ import torch
 # instead of reporting failure to the model — it's our infra, not a bad kernel.
 _LOCK_RETRY_ATTEMPTS = 5
 _LOCK_RETRY_BASE_SLEEP_S = 0.5  # exponential backoff with jitter
+
+
+def _per_kernel_build_dir(base_build_dir: str | None, kernel_code: str) -> str | None:
+    """Return a content-keyed subdirectory of base_build_dir.
+
+    Same kernel → same subdir → torch JIT cache hit (fast).
+    Different kernel → different subdir → no shared lock files, no contention.
+
+    Returns None if base_build_dir is None (caller falls back to default cache).
+    """
+    if not base_build_dir:
+        return None
+    digest = hashlib.sha1(kernel_code.encode("utf-8", errors="replace")).hexdigest()[:12]
+    sub = os.path.join(base_build_dir, f"k_{digest}")
+    os.makedirs(sub, exist_ok=True)
+    return sub
 
 
 def _retry_eval_on_lock(eval_fn: Callable[[], Any]) -> Any:
@@ -201,6 +218,7 @@ class CompileKernelTool(Tool):
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
         stdout_buf = StringIO()
         context: dict = {}
+        build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
 
         try:
             os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -214,7 +232,7 @@ class CompileKernelTool(Tool):
                     )
                     graceful_eval_cleanup({}, ctx.device, tmp)
                 else:
-                    ModelNew = load_custom_model(kernel_code, context, ctx.build_dir)
+                    ModelNew = load_custom_model(kernel_code, context, build_dir)
                     graceful_eval_cleanup(context, ctx.device)
 
             if ModelNew is None:
@@ -266,6 +284,7 @@ class RunCorrectnessTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
         result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
             original_model_src=ctx.ref_arch_src,
             custom_model_src=kernel_code,
@@ -273,7 +292,7 @@ class RunCorrectnessTool(Tool):
             num_perf_trials=0,
             measure_performance=False,
             verbose=ctx.verbose,
-            build_dir=ctx.build_dir,
+            build_dir=build_dir,
             device=ctx.device,
             backend=ctx.backend,
             precision=ctx.torch_precision,
@@ -403,7 +422,7 @@ class ProfileKernelTool(Tool):
             "device_index": ctx.device.index or 0,
             "backend": ctx.backend,
             "precision": ctx.precision,
-            "build_dir": ctx.build_dir,
+            "build_dir": _per_kernel_build_dir(ctx.build_dir, kernel_code),
             "verbose": ctx.verbose,
         }
 
@@ -620,6 +639,7 @@ class SubmitKernelTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
         result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
             original_model_src=ctx.ref_arch_src,
             custom_model_src=kernel_code,
@@ -628,7 +648,7 @@ class SubmitKernelTool(Tool):
             measure_performance=True,
             timing_method=ctx.timing_method,
             verbose=ctx.verbose,
-            build_dir=ctx.build_dir,
+            build_dir=build_dir,
             device=ctx.device,
             backend=ctx.backend,
             precision=ctx.torch_precision,
@@ -790,7 +810,7 @@ class DisassembleKernelTool(Tool):
                 device=ctx.device,
                 backend=ctx.backend,
                 precision=ctx.torch_precision,
-                build_dir=ctx.build_dir,
+                build_dir=_per_kernel_build_dir(ctx.build_dir, kernel_code),
                 include_ptx=True,
                 include_nvdisasm=nvdisasm_ok,
                 include_life_range=nvdisasm_ok,
