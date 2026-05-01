@@ -261,9 +261,15 @@ def compute_sol_score_from_nsight(nsight_profile: dict) -> dict:
     if dram_util is None and compute_util is None:
         return {"sol_score": -1, "source": "nsight", "note": "utilization metrics unavailable"}
 
-    dram_pct = dram_util or 0.0
-    compute_pct = compute_util or 0.0
+    # Clip each utilization to [0, 100]. Nsight occasionally reports values
+    # slightly above 100% for `sm__throughput.avg.pct_of_peak_sustained_active`
+    # due to elastic-pipeline measurement artifacts, which would otherwise
+    # produce SOL > 1. The SOL convention (achieved / peak) is bounded in [0, 1].
+    dram_pct = max(0.0, min(100.0, dram_util or 0.0))
+    compute_pct = max(0.0, min(100.0, compute_util or 0.0))
     sol_score = max(dram_pct, compute_pct) / 100.0
+    # Belt-and-suspenders clamp on the final ratio.
+    sol_score = max(0.0, min(1.0, sol_score))
 
     return {
         "sol_score": round(sol_score, 4),

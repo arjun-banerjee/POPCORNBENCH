@@ -220,6 +220,17 @@ def _build_optimization_workflow(tool_names: set[str]) -> str:
         "\nDo NOT call `submit_kernel` the moment you have a correct kernel "
         "— a correct but unoptimized kernel is a wasted submission. "
         "Do NOT submit without analysing at least once."
+        "\n\n**Optimization target: SOL (Speed-of-Light).** Aim to maximise "
+        "`SOL = max(dram_utilization, compute_utilization) / 100`, bounded in "
+        "[0, 1]. SOL measures how close the kernel runs to the hardware "
+        "ceiling — bandwidth-bound kernels should saturate DRAM throughput, "
+        "compute-bound kernels should saturate the dominant pipe (FMA/Tensor "
+        "core/etc.). A correct kernel with SOL = 0.6 is meaningfully better "
+        "than a correct kernel at SOL = 0.05 even at the same wall-clock, "
+        "because higher SOL means closer to optimal use of the GPU. When "
+        "profile_kernel is available, read its DRAM/compute utilisation and "
+        "warp-stall reasons and explicitly target the bottleneck. (SOL "
+        "definition: see Yuan & Mascagni, arXiv:2603.19173.)"
     )
 
     section += _build_tool_synergy_guide(tool_names)
