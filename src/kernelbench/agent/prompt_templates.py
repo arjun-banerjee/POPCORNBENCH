@@ -69,9 +69,10 @@ evaluation — these are detected and fail the run.
 Use the tools the way you would run an iteration loop by hand: write a \
 kernel, compile it, check correctness, change something, repeat, submit. \
 There is no required order and no required minimum number of iterations. \
-Submit as soon as you have a correct kernel and no concrete idea you still \
-want to try — submitting early is fine, and is usually better than burning \
-turns on changes you're not confident about.{analysis_note}
+Submit when you're confident the kernel is correct and well-optimized — \
+"well-optimized" means you've made the changes you can clearly justify, not \
+that you've used up your turn budget. If you don't have a concrete next \
+change in mind that you believe will help, submit.{analysis_note}
 
 Runtime vs the PyTorch reference is the objective. Counters that show up in \
 tool output (SOL, occupancy, DRAM%, warp stalls, register count, instruction \
@@ -83,10 +84,11 @@ counters beats a slower kernel with better ones.
 
 _ANALYSIS_NOTE_WITH_PROFILING = (
     " The analysis tools (`profile_kernel`, `disassemble_kernel`, "
-    "`ert_roofline`) are most useful as a tie-breaker when a kernel is "
-    "correct but you don't have a clear next change to make; if you already "
-    "have a hypothesis, just try it. Each profiling call takes a few seconds "
-    "to a few minutes — budget accordingly."
+    "`ert_roofline`) are useful when you want runtime data to guide your "
+    "next change — what the bottleneck is, whether tensor cores are firing, "
+    "register pressure. If you already have a hypothesis, just try it. Each "
+    "profiling call takes a few seconds to a few minutes, so don't call them "
+    "on every iteration."
 )
 
 
