@@ -266,6 +266,20 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 <tr><td><code>ae_focus_original</code></td><td>L1-L2 original, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
 </table>
 
+<h3>Run order</h3>
+<p>Each sweep is GPU-bound and contests the full 8xH100 box, so the four primary sweeps run sequentially. The aeproxy server and the gh-pages publisher run as background daemons throughout, in parallel with everything else.</p>
+<table class="plan-table">
+<tr><th>Step</th><th>Command</th><th>Wall-clock</th><th>Runs in parallel with</th></tr>
+<tr><td>0a (background)</td><td><code>cd /scratch/tejas/sp26-ae-llm &amp;&amp; uv run python -m aeproxy.server</code></td><td>persistent</td><td>everything (idle until step 4)</td></tr>
+<tr><td>0b (background)</td><td><code>cd /scratch/tejas/PopcornBench &amp;&amp; uv run python scripts/publish_to_gh_pages.py --watch 300</code></td><td>persistent</td><td>everything</td></tr>
+<tr><td>1</td><td><code>uv run python scripts/run_sweep.py configs/sweep.smoke_all.toml</code></td><td>~15 min</td><td>nothing (alone)</td></tr>
+<tr><td>2</td><td><code>uv run python scripts/run_sweep.py configs/sweep.full.toml</code></td><td>~5-6 hours (overnight)</td><td>nothing (alone)</td></tr>
+<tr><td>3</td><td><code>uv run python scripts/run_sweep.py configs/sweep.full_heavy.toml</code></td><td>~24-28 hours</td><td>nothing (alone)</td></tr>
+<tr><td>4</td><td><code>uv run python scripts/run_sweep.py configs/sweep.ae_focus.toml</code></td><td>~3-4 hours</td><td>nothing (alone)</td></tr>
+<tr><td>5</td><td><code>uv run python scripts/run_sweep.py configs/sweep.ae_focus_orig.toml</code></td><td>~1.5-2 hours</td><td>nothing (alone)</td></tr>
+</table>
+<p>If step 5 has to be dropped for time, the popcorn AE results in step 4 are sufficient to make the AE-on-hard-problems argument. If steps 4 and 5 can swap GPU partitioning (run full sweeps on GPUs 1-7, pin aeproxy to GPU 0), the AE runs become parallel with full_heavy. We don't currently do this; the configs assume the full box.</p>
+
 <h3>Planned figures</h3>
 <ol class="plan-figs">
   <li><b>Pareto frontier in (speedup, SOL).</b> One panel per level. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
