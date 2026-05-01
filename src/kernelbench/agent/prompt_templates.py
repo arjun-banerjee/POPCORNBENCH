@@ -239,7 +239,13 @@ def _build_optimization_workflow(tool_names: set[str]) -> str:
         "When `profile_kernel` is available, read its DRAM%/compute%/warp-"
         "stall breakdown and target the dominant bottleneck explicitly. "
         "Prefer kernels that are fast *and* high-SOL over kernels that are "
-        "fast but low-SOL — both metrics are reported."
+        "fast but low-SOL — both metrics are reported.\n"
+        "Energy (`energy_per_run_mj`, measured via NVML) is also recorded "
+        "for downstream comparison; you don't need to optimise for it "
+        "directly — it tracks runtime closely on the same GPU — but be "
+        "aware that tensor-core paths consume more power per FLOP than "
+        "fp32 SIMT, so the energy ratio relative to the reference can "
+        "diverge from the speedup ratio."
     )
 
     section += _build_tool_synergy_guide(tool_names)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import html
+import json
 import os
 import shutil
 import subprocess
@@ -185,9 +186,27 @@ main.wrap{padding-top:32px;padding-bottom:56px}
 .section-head{font-size:11px;font-style:italic;letter-spacing:.08em;color:var(--pri);
   text-transform:uppercase;margin-bottom:12px;opacity:.65}
 nav.topnav{display:flex;gap:16px;margin-top:14px;font-size:13px;font-style:italic}
-nav.topnav a{color:var(--pri);opacity:.6;border-bottom:1px solid transparent;padding-bottom:1px}
+nav.topnav a{color:var(--pri);opacity:.55;border-bottom:1px solid transparent;padding-bottom:1px}
 nav.topnav a:hover{opacity:1}
+nav.topnav a.current{opacity:1;border-bottom:2px solid var(--pri);font-style:normal;font-weight:600}
 """
+
+
+_TOPNAV_ITEMS = [
+    ("Home", "index.html"),
+    ("Experiments", "experiments.html"),
+    ("Docs", "docs.html"),
+    ("Prompts", "prompts.html"),
+]
+
+
+def _topnav(current: str) -> str:
+    """Same nav on every page; the current page is marked with .current."""
+    out = []
+    for label, href in _TOPNAV_ITEMS:
+        cls = ' class="current"' if label.lower() == current.lower() else ""
+        out.append(f'<a href="{href}"{cls}>{label}</a>')
+    return f'<nav class="topnav">{"".join(out)}</nav>'
 
 
 def _page(title: str, body: str, *, refresh: bool = False, extra_css: str = "") -> str:
@@ -203,7 +222,6 @@ def _page(title: str, body: str, *, refresh: bool = False, extra_css: str = "") 
 
 
 def _build_homepage(worktree: Path, n_reports: int) -> None:
-    """Write the top-level index.html — short hero blurb + two link cards."""
     when = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     blurb = (
         "PopcornBench is an extension of KernelBench with a multi-model "
@@ -217,31 +235,80 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
     cards = (
         f'<a class="hero-card" href="experiments.html">'
         f'<div class="hero-name">Experiments</div>'
-        f'<div class="hero-hint">{n_reports} sweep run{"s" if n_reports != 1 else ""} · per-model, per-problem reports</div>'
+        f'<div class="hero-hint">{n_reports} sweep run{"s" if n_reports != 1 else ""}, per-model and per-problem reports</div>'
         f'<div class="hero-arrow">→</div></a>'
         f'<a class="hero-card" href="docs.html">'
         f'<div class="hero-name">Docs</div>'
-        f'<div class="hero-hint">getting started · adding models · AlphaEvolve</div>'
+        f'<div class="hero-hint">getting started, adding models, AlphaEvolve</div>'
+        f'<div class="hero-arrow">→</div></a>'
+        f'<a class="hero-card" href="prompts.html">'
+        f'<div class="hero-name">Prompts</div>'
+        f'<div class="hero-hint">system, user, and tool prompts the agent receives</div>'
         f'<div class="hero-arrow">→</div></a>'
     )
+
+    plan = """
+<h2>Plan</h2>
+<p>We score each correct kernel on three signals and compare submissions on the Pareto frontier across all three:</p>
+<ul class="signals">
+  <li><b>Runtime.</b> Wall-clock per call relative to the PyTorch reference. Reported as speedup = ref_runtime / runtime.</li>
+  <li><b>SOL.</b> max(dram_utilization, compute_utilization) / 100 from Nsight counters, bounded in [0, 1]. Heuristic fallback when ncu is unavailable.</li>
+  <li><b>Energy.</b> Joules per call from NVML (energy_per_run_mj). Meaningful only when per-call runtime exceeds the NVML sampling window (~10 ms), so reported on L3 and L4 only.</li>
+</ul>
+<p>A kernel is considered to dominate another only if it is at least as good on all three signals and strictly better on one. Models are then ranked by the size of their Pareto-optimal subset within each (level, variant).</p>
+
+<h3>Sweeps that feed the figures</h3>
+<table class="plan-table">
+<tr><th>Run</th><th>Coverage</th><th>Models</th></tr>
+<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems</td><td>gpt-5.5, FW-GLM-5-1, Llama-4-Maverick, Kimi-K2.6</td></tr>
+<tr><td><code>full_l34</code></td><td>L3, L4, original + popcorn, all problems</td><td>same four</td></tr>
+<tr><td><code>ae_focus_popcorn</code></td><td>L1-L4 popcorn, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
+</table>
+
+<h3>Planned figures</h3>
+<ol class="plan-figs">
+  <li><b>Pareto frontier in (speedup, SOL).</b> One panel per level. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
+  <li><b>Pareto frontier in (speedup, 1 / energy_ratio).</b> L3 and L4 only. Source: <code>full_l34</code>.</li>
+  <li><b>Speedup vs SOL scatter, all problems.</b> One dot per (model, problem), colored by level, faceted by variant. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
+  <li><b>Correctness rate stacked by tier on L2-popcorn.</b> Source: existing <code>cuda_l2pop_*</code> sweeps.</li>
+  <li><b>SOL distribution by tier on L2-popcorn.</b> Source: existing L2-pop sweeps after the SOL clamp fix.</li>
+  <li><b>AlphaEvolve speedup vs best non-AE speedup, per problem.</b> Source: <code>ae_focus_popcorn</code> joined to <code>full_*</code>.</li>
+  <li><b>Failure-mode breakdown per (model, level).</b> Stacked correct / wrong / compile_fail / timeout / error. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
+</ol>
+"""
+
     body = (
         f'<header><div class="wrap"><h1>PopcornBench</h1>'
-        f'<div class="sub">multi-model kernel-benchmark harness · last published {html.escape(when)}</div>'
+        f'<div class="sub">multi-model kernel-benchmark harness, last published {html.escape(when)}</div>'
+        f'{_topnav("Home")}'
         f'</div></header>'
         f'<main class="wrap">'
         f'<p class="blurb">{blurb}</p>'
         f'<div class="hero-grid">{cards}</div>'
+        f'{plan}'
         f'</main>'
     )
     extra = """
 .blurb{max-width:720px;margin:8px 0 30px;font-size:14.5px;line-height:1.7}
-.hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:8px}
+.hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:8px}
 .hero-card{display:block;padding:22px 24px;border:2px solid var(--pri);background:var(--bg);
   color:var(--fg);text-decoration:none;transition:background var(--t),color var(--t);position:relative}
 .hero-card:hover{background:var(--soft);text-decoration:none}
 .hero-name{font-family:"neue-kabel",sans-serif;font-weight:700;font-style:normal;font-size:30px;color:var(--pri);letter-spacing:-.01em}
 .hero-hint{font-size:12.5px;opacity:.75;margin-top:6px}
 .hero-arrow{position:absolute;top:18px;right:22px;font-size:18px;color:var(--pri)}
+main.wrap h2{font-family:"neue-kabel",sans-serif;font-weight:900;font-size:36px;
+  color:var(--pri);margin:42px 0 12px;letter-spacing:-.02em}
+main.wrap h3{font-family:"neue-kabel",sans-serif;font-weight:700;font-size:18px;
+  color:var(--pri);margin:24px 0 10px;letter-spacing:-.005em}
+main.wrap p{margin:8px 0}
+ul.signals,ol.plan-figs{margin:8px 0 14px 20px}
+ul.signals li,ol.plan-figs li{margin:6px 0}
+table.plan-table{border-collapse:collapse;margin:10px 0 18px;width:100%;font-size:13px}
+table.plan-table th,table.plan-table td{padding:8px 10px;border-bottom:1px solid var(--pri15);
+  text-align:left;vertical-align:top}
+table.plan-table th{color:var(--pri);font-weight:600}
+code{background:var(--soft08);padding:1px 5px;border-radius:3px;font-size:13px;color:var(--pri)}
 """
     (worktree / "index.html").write_text(_page("PopcornBench", body, refresh=True, extra_css=extra))
     (worktree / ".nojekyll").write_text("")
@@ -318,8 +385,8 @@ def _build_experiments(worktree: Path, reports: list[tuple[str, Path]]) -> None:
 
     body = (
         f'<header><div class="wrap"><h1>Experiments</h1>'
-        f'<div class="sub">{len(flat)} run{"s" if len(flat) != 1 else ""} · updated {html.escape(when)}</div>'
-        f'<nav class="topnav"><a href="index.html">← home</a><a href="docs.html">docs</a></nav>'
+        f'<div class="sub">{len(flat)} run{"s" if len(flat) != 1 else ""}, updated {html.escape(when)}</div>'
+        f'{_topnav("Experiments")}'
         f'</div></header>'
         f'<main class="wrap">'
         f'{matrix}'
@@ -354,6 +421,7 @@ def _build_index(worktree: Path, reports: list[tuple[str, Path]]) -> None:
     _build_homepage(worktree, n_reports=len(reports))
     _build_experiments(worktree, reports)
     _build_docs(worktree)
+    _build_prompts(worktree)
 
 
 def _build_docs(worktree: Path) -> None:
@@ -361,6 +429,138 @@ def _build_docs(worktree: Path) -> None:
     docs_src = REPO_ROOT / "scripts" / "_docs_page.html"
     if docs_src.exists():
         (worktree / "docs.html").write_text(docs_src.read_text())
+
+
+def _build_prompts(worktree: Path) -> None:
+    """Render prompts.html showing the system prompt, user message, and tools.
+
+    Subprocesses scripts/_dump_prompts.py so we don't have to import torch
+    into the publisher process.
+    """
+    dumper = REPO_ROOT / "scripts" / "_dump_prompts.py"
+    if not dumper.exists():
+        return
+    try:
+        out = subprocess.run(
+            ["uv", "run", "python", str(dumper)],
+            cwd=str(REPO_ROOT), check=True, capture_output=True, text=True,
+        )
+        data = json.loads(out.stdout)
+    except Exception as e:
+        print(f"[publish] could not dump prompts: {e}")
+        return
+
+    when = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _section(title: str, body: str, *, open_first: bool = False) -> str:
+        attr = " open" if open_first else ""
+        return (
+            f'<details class="prompt-section"{attr}>'
+            f'<summary>{html.escape(title)}</summary>'
+            f'<div class="prompt-body">{body}</div>'
+            f'</details>'
+        )
+
+    def _pre(text: str) -> str:
+        return f'<pre class="prompt-pre">{html.escape(text)}</pre>'
+
+    sections = [
+        _section(
+            "System prompt (default tool set)",
+            _pre(data["system_default"]),
+            open_first=True,
+        ),
+        _section(
+            "System prompt (all tools, including profile / disassemble / ert)",
+            _pre(data["system_all_tools"]),
+        ),
+        _section(
+            "First user message (problem statement)",
+            _pre(data["problem_message"]),
+        ),
+        _section(
+            "Turn-warning message (injected when budget runs low)",
+            _pre(data["turn_warning"]),
+        ),
+    ]
+
+    tool_blocks = []
+    for t in data["tools"]:
+        head = (
+            f'<code>{html.escape(t["name"])}</code>'
+            + (' <span class="default-pill">default</span>' if t["in_default_set"] else '')
+        )
+        body = (
+            f'<div class="tool-desc">{html.escape(t["description"])}</div>'
+            f'<div class="tool-schema-label">input_schema</div>'
+            f'<pre class="prompt-pre">{html.escape(json.dumps(t["input_schema"], indent=2))}</pre>'
+        )
+        tool_blocks.append(
+            f'<details class="tool-section">'
+            f'<summary>{head}</summary>'
+            f'<div class="prompt-body">{body}</div>'
+            f'</details>'
+        )
+
+    body = (
+        f'<header><div class="wrap"><h1>Prompts</h1>'
+        f'<div class="sub">Every prompt the agent receives. Updated {html.escape(when)}.</div>'
+        f'{_topnav("Prompts")}'
+        f'</div></header>'
+        f'<main class="wrap">'
+        f'<p class="intro">Generated from <code>build_system_prompt</code>, <code>build_problem_message</code>, and the tool registry. Click any section to expand.</p>'
+        f'<h2>Conversation prompts</h2>'
+        f'{"".join(sections)}'
+        f'<h2>Tool descriptions</h2>'
+        f'<p class="intro">Each entry below is one function declaration sent to the model. <code>default</code> means the tool is included when <code>tools = "default"</code> in the sweep TOML.</p>'
+        f'{"".join(tool_blocks)}'
+        f'</main>'
+    )
+    extra = """
+.intro{max-width:720px;margin:6px 0 12px;font-size:13.5px;line-height:1.6;opacity:.85}
+main.wrap h2{font-family:"neue-kabel",sans-serif;font-weight:900;font-size:32px;
+  color:var(--pri);margin:34px 0 14px;letter-spacing:-.02em}
+.prompt-section, .tool-section{
+  border:1px solid var(--pri15);background:var(--bg);margin:6px 0;
+}
+.prompt-section > summary, .tool-section > summary{
+  cursor:pointer;padding:11px 14px;font-size:14px;
+  border-bottom:1px solid transparent;list-style:none;
+  display:flex;align-items:center;gap:10px;
+}
+.prompt-section[open] > summary, .tool-section[open] > summary{
+  border-bottom:1px solid var(--pri15);background:var(--soft08);
+}
+.prompt-section > summary::before, .tool-section > summary::before{
+  content:"▸ ";color:var(--pri);opacity:.7;
+}
+.prompt-section[open] > summary::before, .tool-section[open] > summary::before{
+  content:"▾ ";
+}
+.prompt-section > summary::-webkit-details-marker,
+.tool-section > summary::-webkit-details-marker{display:none}
+.prompt-body{padding:12px 16px}
+.prompt-pre{
+  background:var(--soft08);padding:12px 14px;font-size:12.5px;line-height:1.55;
+  white-space:pre-wrap;word-break:break-word;
+  border-left:3px solid var(--pri);overflow-x:auto;
+}
+.tool-section > summary code{
+  font-size:14px;font-weight:600;color:var(--pri);background:none;padding:0;
+}
+.default-pill{
+  font-size:10px;border:1px solid var(--pri);color:var(--pri);
+  padding:1px 6px;border-radius:2px;letter-spacing:.04em;
+}
+.tool-desc{margin-bottom:10px;line-height:1.55;font-size:13px}
+.tool-schema-label{
+  font-size:10px;letter-spacing:.08em;text-transform:uppercase;opacity:.6;
+  margin:6px 0 4px;
+}
+"""
+    (worktree / "prompts.html").write_text(
+        _page("PopcornBench prompts", body, refresh=False, extra_css=extra)
+    )
 
 
 def _rebuild_reports(reports: list[tuple[str, Path]]) -> None:
