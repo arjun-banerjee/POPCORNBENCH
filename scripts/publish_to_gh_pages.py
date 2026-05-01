@@ -263,6 +263,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 <tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems</td><td>gpt-5.5, FW-GLM-5-1, Llama-4-Maverick, Kimi-K2.6</td></tr>
 <tr><td><code>full_l34</code></td><td>L3, L4, original + popcorn, all problems</td><td>same four</td></tr>
 <tr><td><code>ae_focus_popcorn</code></td><td>L1-L4 popcorn, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
+<tr><td><code>ae_focus_original</code></td><td>L1-L2 original, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
 </table>
 
 <h3>Planned figures</h3>
@@ -272,7 +273,8 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
   <li><b>Speedup vs SOL scatter, all problems.</b> One dot per (model, problem), colored by level, faceted by variant. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
   <li><b>Correctness rate stacked by tier on L2-popcorn.</b> Source: existing <code>cuda_l2pop_*</code> sweeps.</li>
   <li><b>SOL distribution by tier on L2-popcorn.</b> Source: existing L2-pop sweeps after the SOL clamp fix.</li>
-  <li><b>AlphaEvolve speedup vs best non-AE speedup, per problem.</b> Source: <code>ae_focus_popcorn</code> joined to <code>full_*</code>.</li>
+  <li><b>AlphaEvolve speedup vs best non-AE speedup, per problem.</b> Source: <code>ae_focus_popcorn</code> + <code>ae_focus_original</code> joined to <code>full_*</code>.</li>
+  <li><b>AlphaEvolve original-vs-popcorn paired bars, L1 and L2 only.</b> Source: <code>ae_focus_popcorn</code> + <code>ae_focus_original</code>, restricted to problems 1, 2, 10.</li>
   <li><b>Failure-mode breakdown per (model, level).</b> Stacked correct / wrong / compile_fail / timeout / error. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
 </ol>
 """
