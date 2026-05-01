@@ -116,6 +116,10 @@ class ToolContext:
     num_perf_trials: int = 100  # timing trials in submit_kernel
     timing_method: str = "cuda_event"
     verbose: bool = False
+    # Optional: when set, submit_kernel (and optionally profile_kernel) RPC
+    # to a per-GPU eval server instead of running locally. Decouples eval
+    # serialization from agent worker oversubscription. See eval_client.py.
+    eval_client: Any = None
 
     # Mutable: last profile result for delta comparison across iterations
     _last_profile_summary: Any = field(default=None, init=False, repr=False)
@@ -659,6 +663,14 @@ class SubmitKernelTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        # If the agent has an eval RPC client wired up (set by run_sweep.py
+        # when it spawns per-GPU eval servers), route the heavy correctness
+        # + perf-timing work to the server. Decouples eval lifetime from
+        # agent worker lifetime so a stuck eval doesn't starve other agents
+        # past their worker_timeout_s.
+        if ctx.eval_client is not None:
+            return ctx.eval_client.submit_kernel(ctx, kernel_code)
+
         build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
         result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
             original_model_src=ctx.ref_arch_src,

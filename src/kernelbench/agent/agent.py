@@ -129,6 +129,7 @@ class KernelAgent:
         verbose: bool = False,
         api_kind: str = "openai",
         save_path: str | None = None,
+        eval_client: Any = None,
     ) -> None:
         self.problem_id = problem_id
         self.level = level
@@ -169,6 +170,7 @@ class KernelAgent:
             num_perf_trials=num_perf_trials,
             timing_method=timing_method,
             verbose=verbose,
+            eval_client=eval_client,
         )
 
         # Per-run mutable state.

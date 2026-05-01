@@ -235,8 +235,16 @@ def run_one(
     run_dir: str,
     sem,
     perf_lock,
+    eval_request_q=None,
+    eval_manager=None,
 ) -> Optional[dict]:
-    """Run a single (model, level, problem) work item."""
+    """Run a single (model, level, problem) work item.
+
+    `eval_request_q` and `eval_manager`, if set, point at the per-GPU FIFO
+    eval queue and the Manager that owns it. submit_kernel calls then RPC
+    to the dedicated eval-server process for this GPU instead of running
+    locally — see eval_server.py.
+    """
     model_cfg = sweep["models"][work.model_idx]
     run_cfg = sweep["run"]
     agent_cfg = sweep["agent"]
@@ -244,8 +252,13 @@ def run_one(
     model_name = model_cfg["name"]
     api_kind = model_cfg.get("api_kind", "openai")
 
-    # Bind GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(work.device_id)
+    # GPU pinning: in single-GPU mode (the default) we bind the worker to its
+    # assigned device. In multi_gpu mode (sweep.comm.toml), we leave all GPUs
+    # visible so distributed kernels can init NCCL across multiple ranks.
+    par_cfg_outer = sweep.get("parallelism", {})
+    multi_gpu_mode = bool(par_cfg_outer.get("multi_gpu", False))
+    if not multi_gpu_mode:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(work.device_id)
     device = torch.device("cuda:0")
     if run_cfg.get("gpu_arch"):
         arch = run_cfg["gpu_arch"]
@@ -319,6 +332,20 @@ def run_one(
 
             precision = _force_backend_precision(run_cfg["backend"], run_cfg["precision"])
 
+            # Wire up the eval RPC client if the runner spawned per-GPU
+            # eval servers. The client routes submit_kernel through the
+            # FIFO queue so agents don't hold the GPU for minutes during
+            # perf trials — they push and immediately go back to making
+            # LLM calls on the next turn.
+            eval_client = None
+            if eval_request_q is not None and eval_manager is not None:
+                from kernelbench.agent.eval_client import EvalRPCClient
+                eval_client = EvalRPCClient(
+                    request_q=eval_request_q,
+                    manager=eval_manager,
+                    default_timeout_s=int(par_cfg.get("eval_rpc_timeout_s", 3600)),
+                )
+
             agent = KernelAgent(
                 problem_id=work.problem_id,
                 level=work.level,
@@ -344,13 +371,14 @@ def run_one(
                 verbose=False,
                 api_kind=api_kind,
                 save_path=traj_path,
+                eval_client=eval_client,
             )
 
-            # Wrap submit_kernel.execute with a per-GPU file lock so timing is
-            # never measured concurrently with another agent on the same device.
-            # File locks (fcntl.flock) auto-release on process death — unlike
-            # manager.Lock(), they cannot leak across worker crashes.
-            if perf_lock is not None and "submit_kernel" in agent.tool_map:
+            # Lock fallback: when the eval queue is NOT in use (e.g. legacy
+            # mode or someone running scripts/run_agent.py standalone), wrap
+            # submit_kernel.execute with the per-GPU lock so simultaneous
+            # agents on the same GPU don't race on perf timing.
+            if eval_client is None and perf_lock is not None and "submit_kernel" in agent.tool_map:
                 sk = agent.tool_map["submit_kernel"]
                 orig_execute = sk.execute
 
@@ -559,9 +587,20 @@ def main():
     # Build (model, level, variant, problem) matrix
     levels = run_cfg["levels"]
     subset = set(run_cfg.get("problem_subset") or [])
+    multi_gpu_mode = bool(par_cfg.get("multi_gpu", False))
+
+    # Problems that require all GPUs to evaluate (NCCL collectives, real
+    # tensor parallelism, pipeline parallelism). Skipped from any sweep
+    # that doesn't set [parallelism].multi_gpu = true; routed through
+    # configs/sweep.comm.toml instead.
+    MULTI_GPU_PROBLEMS = {
+        # (level, variant): set of problem_id
+        (2, "popcorn"): {2, 11, 18, 27, 34, 38},
+    }
 
     work_items: list[WorkItem] = []
     num_gpus = par_cfg["num_gpu_devices"]
+    n_skipped_multi_gpu = 0
     for variant in variants:
         for level in levels:
             ds = construct_kernelbench_dataset(
@@ -574,6 +613,19 @@ def main():
             )
             all_pids = ds.get_problem_ids()
             pids = [p for p in all_pids if (not subset) or (p in subset)]
+
+            # Filter the multi-GPU problems based on the run mode:
+            # - non-multi_gpu run: drop them (they would crash trying to
+            #   init NCCL with one visible GPU)
+            # - multi_gpu run: keep only them
+            mg_set = MULTI_GPU_PROBLEMS.get((int(level), variant), set())
+            if multi_gpu_mode:
+                pids = [p for p in pids if int(p) in mg_set]
+            else:
+                before = len(pids)
+                pids = [p for p in pids if int(p) not in mg_set]
+                n_skipped_multi_gpu += (before - len(pids)) * len(sweep["models"])
+
             for m_idx, _model in enumerate(sweep["models"]):
                 for pid in pids:
                     work_items.append(
@@ -600,6 +652,12 @@ def main():
           f"{len(sweep['models'])} models, levels={levels}, variants={variants}")
     print(f"[run_sweep] Workers: {num_gpus * par_cfg['agents_per_gpu']} "
           f"({num_gpus} GPUs x {par_cfg['agents_per_gpu']} per GPU)")
+    if multi_gpu_mode:
+        print(f"[run_sweep] multi_gpu=true: comm-kernel mode, all GPUs "
+              f"visible to each worker")
+    elif n_skipped_multi_gpu:
+        print(f"[run_sweep] skipped {n_skipped_multi_gpu} multi-GPU "
+              f"work items (run sweep.comm.toml separately to evaluate them)")
 
     # Spawn-mode required for CUDA in subprocesses
     mp.set_start_method("spawn", force=True)
@@ -613,18 +671,49 @@ def main():
         per_model_sems.append(manager.Semaphore(cap))
         print(f"  [{m['name']}] per-model concurrency cap = {cap}")
 
-    # Per-GPU perf locks — Manager-backed mp.Lock(), FIFO-ish via the Manager
-    # server process. Replaces fcntl.flock which under heavy contention woke
-    # all waiters and could starve agents past worker_timeout_s.
-    #
-    # Fast path: if agents_per_gpu == 1 there's no possible contention so we
-    # skip lock allocation entirely.
-    perf_locks: list
-    if par_cfg.get("perf_lock_per_gpu", True) and par_cfg["agents_per_gpu"] > 1:
+    # Per-GPU FIFO eval queues + dedicated eval-server processes.
+    # ----------------------------------------------------------------
+    # Each GPU gets one Manager().Queue() that all agents pinned to that GPU
+    # push submit_kernel requests into, plus one long-lived eval-server
+    # process that drains it in arrival order. Agents block on the response
+    # but do NOT hold the GPU during eval — they're free to run their next
+    # turn's LLM call while the eval is in flight on a different request.
+    # See src/kernelbench/agent/eval_server.py.
+    use_eval_queue = par_cfg.get("use_eval_queue", True)
+    multi_gpu_mode = bool(par_cfg.get("multi_gpu", False))
+    if multi_gpu_mode:
+        # Multi-GPU comm sweeps need the worker to see all GPUs at once,
+        # which means we cannot pin an eval server to one GPU. Disable the
+        # queue and fall back to the local lock path for these runs.
+        use_eval_queue = False
+
+    eval_request_qs: list = [None] * num_gpus
+    eval_server_procs: list = []
+    perf_locks: list = [None] * num_gpus
+
+    if use_eval_queue:
+        from kernelbench.agent.eval_server import run_eval_server
+        eval_request_qs = [manager.Queue() for _ in range(num_gpus)]
+        for gpu_id in range(num_gpus):
+            ready = manager.Event()
+            p = mp.Process(
+                target=run_eval_server,
+                args=(gpu_id, eval_request_qs[gpu_id], ready),
+                daemon=False,
+                name=f"eval_server_gpu{gpu_id}",
+            )
+            p.start()
+            eval_server_procs.append((p, ready))
+        # Wait for every server to import torch + tools and signal ready.
+        # ~5-10s on a cold venv; happens once per sweep.
+        for _, ready in eval_server_procs:
+            ready.wait(timeout=120)
+        print(f"  eval queue: {num_gpus} per-GPU FIFO server(s) ready")
+    elif par_cfg.get("perf_lock_per_gpu", True) and par_cfg["agents_per_gpu"] > 1:
+        # Legacy lock fallback (e.g. multi_gpu sweeps).
         perf_locks = [manager.Lock() for _ in range(num_gpus)]
         print(f"  perf-timing serialized per GPU via Manager locks ({num_gpus} GPUs)")
     else:
-        perf_locks = [None] * num_gpus
         if par_cfg["agents_per_gpu"] == 1:
             print("  perf-timing lock disabled (agents_per_gpu=1, no possible contention)")
 
@@ -657,6 +746,8 @@ def main():
                     run_dir,
                     per_model_sems[w.model_idx],
                     perf_locks[w.device_id],
+                    eval_request_qs[w.device_id],
+                    manager if use_eval_queue else None,
                 ): w
                 for w in work_items
             }
@@ -672,6 +763,22 @@ def main():
                     pbar.update(1)
     finally:
         stop_event.set()
+        # Drain any remaining queue items by signaling shutdown to each
+        # eval server. They exit on a None sentinel.
+        for q in eval_request_qs:
+            if q is not None:
+                try:
+                    q.put(None)
+                except Exception:
+                    pass
+        for p, _ in eval_server_procs:
+            try:
+                p.join(timeout=10)
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=5)
+            except Exception:
+                pass
         # Final report build
         try:
             from build_report import build_report

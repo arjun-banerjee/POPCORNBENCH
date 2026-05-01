@@ -257,11 +257,16 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 </ul>
 <p>A kernel is considered to dominate another only if it is at least as good on all three signals and strictly better on one. Models are then ranked by the size of their Pareto-optimal subset within each (level, variant).</p>
 
+<h3>Eval architecture</h3>
+<p>The harness decouples agent oversubscription from GPU contention via a per-GPU FIFO eval queue. Each GPU runs one dedicated eval-server process that drains a Manager-backed queue in arrival order; agents push <code>submit_kernel</code> requests and block on the response while their next-turn LLM call is free to run in parallel for other problems. With <code>agents_per_gpu</code> at 4-6 (vs. the previous 1-3) the GPU stays busy without locks starving any agent past <code>worker_timeout_s</code>.</p>
+<p>Multi-GPU communication kernels (NCCL collectives, real tensor parallelism, pipeline parallelism — six problems in L2 popcorn) need all GPUs visible to one worker, which is incompatible with per-GPU pinning, so they are skipped from the broad sweeps and run separately via <code>sweep.comm.toml</code>.</p>
+
 <h3>Sweeps that feed the figures</h3>
 <table class="plan-table">
 <tr><th>Run</th><th>Coverage</th><th>Models</th></tr>
-<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems</td><td>gpt-5.5, FW-GLM-5-1, Llama-4-Maverick, Kimi-K2.6</td></tr>
+<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems (excluding multi-GPU)</td><td>gpt-5.5, FW-GLM-5-1, Llama-4-Maverick, Kimi-K2.6</td></tr>
 <tr><td><code>full_l34</code></td><td>L3, L4, original + popcorn, all problems</td><td>same four</td></tr>
+<tr><td><code>comm_l2_popcorn</code></td><td>L2 popcorn multi-GPU subset (problems 2, 11, 18, 27, 34, 38)</td><td>same four</td></tr>
 <tr><td><code>ae_focus_popcorn</code></td><td>L1-L4 popcorn, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
 <tr><td><code>ae_focus_original</code></td><td>L1-L2 original, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
 </table>
@@ -275,10 +280,11 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 <tr><td>1</td><td><code>smoke</code></td><td><code>tmux new -d -s smoke 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.smoke_all.toml'</code></td><td>~15 min</td><td>nothing (alone)</td></tr>
 <tr><td>2</td><td><code>full</code></td><td><code>tmux new -d -s full 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.full.toml'</code></td><td>~5-6 hours (overnight)</td><td>nothing (alone)</td></tr>
 <tr><td>3</td><td><code>heavy</code></td><td><code>tmux new -d -s heavy 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.full_heavy.toml'</code></td><td>~24-28 hours</td><td>nothing (alone)</td></tr>
-<tr><td>4</td><td><code>aepop</code></td><td><code>tmux new -d -s aepop 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.ae_focus.toml'</code></td><td>~3-4 hours</td><td>nothing (alone)</td></tr>
-<tr><td>5</td><td><code>aeorig</code></td><td><code>tmux new -d -s aeorig 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.ae_focus_orig.toml'</code></td><td>~1.5-2 hours</td><td>nothing (alone)</td></tr>
+<tr><td>4</td><td><code>comm</code></td><td><code>tmux new -d -s comm 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.comm.toml'</code></td><td>~3-6 hours</td><td>nothing (alone, needs all GPUs)</td></tr>
+<tr><td>5</td><td><code>aepop</code></td><td><code>tmux new -d -s aepop 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.ae_focus.toml'</code></td><td>~3-4 hours</td><td>nothing (alone)</td></tr>
+<tr><td>6</td><td><code>aeorig</code></td><td><code>tmux new -d -s aeorig 'cd /scratch/tejas/PopcornBench &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python scripts/run_sweep.py configs/sweep.ae_focus_orig.toml'</code></td><td>~1.5-2 hours</td><td>nothing (alone)</td></tr>
 </table>
-<p>If step 5 has to be dropped for time, the popcorn AE results in step 4 are sufficient to make the AE-on-hard-problems argument. If steps 4 and 5 can swap GPU partitioning (full sweeps on GPUs 1-7, aeproxy pinned to GPU 0), AE runs become parallel with full_heavy. The configs as committed assume the full box.</p>
+<p>If step 6 has to be dropped for time, the popcorn AE run in step 5 is sufficient for the AE-on-hard-problems argument. Step 4 (comm) is a small set and can be deprioritized if the broad sweeps run long. Steps 5 and 6 use one GPU each, so with GPU partitioning (full sweeps on GPUs 1-7, aeproxy pinned to GPU 0) the AE runs could move parallel with full_heavy; the configs as committed assume the full box.</p>
 
 <h3>Planned figures</h3>
 <ol class="plan-figs">
@@ -290,6 +296,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
   <li><b>AlphaEvolve speedup vs best non-AE speedup, per problem.</b> Source: <code>ae_focus_popcorn</code> + <code>ae_focus_original</code> joined to <code>full_*</code>.</li>
   <li><b>AlphaEvolve original-vs-popcorn paired bars, L1 and L2 only.</b> Source: <code>ae_focus_popcorn</code> + <code>ae_focus_original</code>, restricted to problems 1, 2, 10.</li>
   <li><b>Failure-mode breakdown per (model, level).</b> Stacked correct / wrong / compile_fail / timeout / error. Source: <code>full_l12</code> + <code>full_l34</code>.</li>
+  <li><b>Communication kernels (separate panel).</b> Per-model speedup on the L2 popcorn comm subset, reported separately because they run in serial multi-GPU mode. Source: <code>comm_l2_popcorn</code>.</li>
 </ol>
 """
 
