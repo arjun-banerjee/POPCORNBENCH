@@ -307,7 +307,12 @@ class KernelAgent:
                     "tools": tool_schemas,
                 }
                 if self.reasoning_effort is not None:
-                    create_kwargs["reasoning"] = {"effort": self.reasoning_effort}
+                    create_kwargs["reasoning"] = {
+                        "effort": self.reasoning_effort,
+                        "summary": "auto",
+                    }
+                else:
+                    create_kwargs["reasoning"] = {"summary": "auto"}
 
                 response = self.client.responses.create(**create_kwargs)
             except Exception as e:
@@ -504,20 +509,12 @@ class KernelAgent:
                     }
                 )
 
-                # Args may contain a full kernel source; truncate for the
-                # trajectory record so logs don't balloon.
-                logged_args = {
-                    k: (
-                        v[:200] + f"... [truncated, full len={len(v)}]"
-                        if isinstance(v, str) and len(v) > 200
-                        else v
-                    )
-                    for k, v in args.items()
-                }
+                # Save full args (including kernel source) into the trajectory
+                # so reviewers can see exactly what the model produced.
                 executed_tool_calls.append(
                     ToolCall(
                         tool_name=tool_name,
-                        args=logged_args,
+                        args=dict(args),
                         result_text=tool_result.output,
                         success=tool_result.success,
                         metadata=tool_result.metadata,
@@ -882,18 +879,10 @@ class KernelAgent:
                     }
                 )
 
-                logged_args = {
-                    k: (
-                        v[:200] + f"... [truncated, full len={len(v)}]"
-                        if isinstance(v, str) and len(v) > 200
-                        else v
-                    )
-                    for k, v in args.items()
-                }
                 executed_tool_calls.append(
                     ToolCall(
                         tool_name=tool_name,
-                        args=logged_args,
+                        args=dict(args),
                         result_text=tool_result.output,
                         success=tool_result.success,
                         metadata=tool_result.metadata,

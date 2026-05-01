@@ -33,42 +33,50 @@ REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------------------
 
 _CSS = """
+@import url("https://use.typekit.net/bsk0vur.css");
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --g: #00553A;
+  /* popcorn palette: red + warm yellow on white, near-black body text */
+  --g: #901010;        /* primary brand red (was green; var name kept for diff sanity) */
   --w: #ffffff;
-  --r: #aa2222;
-  --y: #b08900;
-  --g08: rgba(0,85,58,0.08);
-  --g15: rgba(0,85,58,0.15);
-  --g35: rgba(0,85,58,0.35);
+  --fg: #1a1a1a;
+  --r: #ab1313;        /* fail / alert red */
+  --y: #b08900;        /* warn / amber */
+  --soft: #f8de8d;     /* warm yellow accent */
+  --g08: rgba(248,222,141,0.40);   /* soft yellow panel */
+  --g15: rgba(144,16,16,0.15);
+  --g35: rgba(144,16,16,0.35);
   --t: 80ms ease;
   --max: 1100px;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --mono: "calling-code", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --display: "neue-kabel", "calling-code", ui-sans-serif, system-ui, sans-serif;
 }
 
 html { background: var(--w); }
 body {
-  background: var(--w); color: var(--g);
+  background: var(--w); color: var(--fg);
   font-family: var(--mono);
-  font-size: 14px; line-height: 1.55; min-height: 100vh;
+  font-size: 15px; line-height: 1.6; min-height: 100vh;
 }
-a { color: var(--g); }
-a:hover { opacity: 0.6; }
+a { color: var(--r); text-decoration: none; }
+a:hover { opacity: 0.65; }
 
 .page-wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
 
 header { border-bottom: 1px solid var(--g); }
 header .page-wrap { padding-top: 36px; padding-bottom: 24px; }
 .site-title {
-  font-weight: 400; font-style: italic; font-size: 36px;
-  letter-spacing: -0.02em; line-height: 1; margin-bottom: 6px;
+  font-family: var(--display);
+  font-weight: 900; font-style: normal; font-size: 48px;
+  letter-spacing: -0.025em; line-height: 0.95; margin-bottom: 6px;
+  color: var(--g);
 }
-.site-title a { text-decoration: none; }
-.site-title a::before { content: "↑ "; opacity: 0.4; font-size: 22px; vertical-align: middle; }
-.site-title a:hover { opacity: 0.6; }
-.site-subtitle { font-size: 13px; opacity: 0.45; font-style: italic; }
+.site-title a { text-decoration: none; color: var(--g); }
+.site-title a::before { content: "↑ "; opacity: 0.45; font-size: 28px; vertical-align: middle; }
+.site-title a:hover { opacity: 0.7; }
+.site-subtitle { font-size: 13px; opacity: 0.55; font-style: italic; color: var(--g); }
 .header-links { margin-top: 12px; display: flex; gap: 14px; font-size: 12px; font-style: italic; }
 .header-links a { opacity: 0.55; text-decoration: none; }
 .header-links a:hover { opacity: 1; }
@@ -1043,9 +1051,12 @@ def _render_turn(t: dict) -> str:
             summary = ""
             for s in item.get("summary", []) or []:
                 summary += s.get("text", "") + "\n"
+            for c in item.get("content", []) or []:
+                if isinstance(c, dict):
+                    summary += c.get("text", "") + "\n"
             if summary.strip():
                 parts.append(_details("reasoning", summary, cls="reasoning",
-                                      open_=False))
+                                      open_=True))
         elif kind == "message":
             text = ""
             for c in item.get("content", []) or []:
@@ -1074,14 +1085,11 @@ def _render_turn(t: dict) -> str:
 
 
 def _render_function_call(name: str, args: dict) -> str:
-    # Truncate kernel_code so the page stays manageable
-    args_pretty = {}
-    for k, v in (args or {}).items():
-        if isinstance(v, str) and len(v) > 800:
-            v = v[:800] + f"\n... ({len(v)-800} more chars)"
-        args_pretty[k] = v
+    # Render the full args, including any kernel source. Long blocks are
+    # collapsed into <details> so the page stays scannable but reviewers can
+    # always click through to the full text.
     body = f'<span class="role-tag">call</span><b>{html.escape(name)}</b>\n' \
-           + html.escape(json.dumps(args_pretty, indent=2))
+           + html.escape(json.dumps(args or {}, indent=2))
     return _details(f"call → {name}", body, cls="tool-args", open_=False, raw=True)
 
 
