@@ -267,7 +267,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 </table>
 
 <h3>Run order</h3>
-<p>Each sweep is GPU-bound and contests the full 8xH100 box, so the four primary sweeps run sequentially. The aeproxy server and the gh-pages publisher run as background daemons throughout. We use tmux for everything so disconnecting from SSH does not kill the run; reattach later with <code>tmux attach -t &lt;name&gt;</code>.</p>
+<p>Each sweep is GPU-bound and contests the full 8xH100 box, so the four primary sweeps run sequentially. The aeproxy server and the gh-pages publisher run as background daemons throughout. Each step runs in a detached tmux session so SSH disconnects don't kill it.</p>
 <table class="plan-table">
 <tr><th>Step</th><th>tmux session</th><th>Command</th><th>Wall-clock</th><th>Parallel with</th></tr>
 <tr><td>0a (background)</td><td><code>aeproxy</code></td><td><code>tmux new -d -s aeproxy 'cd /scratch/tejas/sp26-ae-llm &amp;&amp; uv run python -m aeproxy.server'</code></td><td>persistent</td><td>everything (idle until step 4)</td></tr>
@@ -278,7 +278,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 <tr><td>4</td><td><code>aepop</code></td><td><code>tmux new -d -s aepop 'cd /scratch/tejas/PopcornBench &amp;&amp; uv run python scripts/run_sweep.py configs/sweep.ae_focus.toml'</code></td><td>~3-4 hours</td><td>nothing (alone)</td></tr>
 <tr><td>5</td><td><code>aeorig</code></td><td><code>tmux new -d -s aeorig 'cd /scratch/tejas/PopcornBench &amp;&amp; uv run python scripts/run_sweep.py configs/sweep.ae_focus_orig.toml'</code></td><td>~1.5-2 hours</td><td>nothing (alone)</td></tr>
 </table>
-<p>Common tmux commands: <code>tmux ls</code> lists sessions, <code>tmux attach -t full</code> reattaches to a running sweep, <code>Ctrl-b d</code> detaches without killing it, <code>tmux kill-session -t full</code> stops one. If step 5 has to be dropped for time, the popcorn AE results in step 4 are sufficient to make the AE-on-hard-problems argument. If steps 4 and 5 can swap GPU partitioning (full sweeps on GPUs 1-7, aeproxy pinned to GPU 0), AE runs become parallel with full_heavy. The configs as committed assume the full box.</p>
+<p>If step 5 has to be dropped for time, the popcorn AE results in step 4 are sufficient to make the AE-on-hard-problems argument. If steps 4 and 5 can swap GPU partitioning (full sweeps on GPUs 1-7, aeproxy pinned to GPU 0), AE runs become parallel with full_heavy. The configs as committed assume the full box.</p>
 
 <h3>Planned figures</h3>
 <ol class="plan-figs">
