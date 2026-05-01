@@ -66,13 +66,17 @@ evaluation — these are detected and fail the run.
 
 ## Tools
 
-The tool set covers what you'd do at a terminal while writing a kernel: \
-compile, check correctness, look up GPU specs, sanity-check for \
-reward-hacking patterns, submit.{analysis_clause} Each tool's description \
-in the function-calling schema explains what it returns. Speedup vs the \
-PyTorch reference is the objective; counters in tool output (SOL, \
-occupancy, DRAM%, warp stalls, register count, instruction mix) are \
-diagnostics, not goals on their own.
+Use the tools the way you would run an iteration loop by hand: write a \
+kernel, compile it, check correctness, change something, repeat, submit. \
+There is no required order and no required minimum number of \
+iterations.{analysis_clause} The function-calling schema lists every \
+tool with a short description of what it does and returns.
+
+Speedup vs the PyTorch reference and SOL (Speed of Light — the higher \
+of DRAM and compute utilization, on a 0–1 scale) are the objectives. \
+Other counters in tool output (occupancy, warp stalls, register count, \
+instruction mix) are diagnostics — useful for figuring out *why* a \
+kernel is slow, not goals in themselves.
 """
 
 
