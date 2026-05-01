@@ -64,31 +64,24 @@ fp16/bf16 use atol=rtol=1e-2. Do not use try/except fallbacks to the \
 reference, patch timing or RNG functions, or otherwise route around the \
 evaluation — these are detected and fail the run.
 
-## Working with the tools
+## Tools
 
-Use the tools the way you would run an iteration loop by hand: write a \
-kernel, compile it, check correctness, change something, repeat, submit. \
-There is no required order and no required minimum number of iterations. \
-Submit when you're confident the kernel is correct and well-optimized — \
-"well-optimized" means you've made the changes you can clearly justify, not \
-that you've used up your turn budget. If you don't have a concrete next \
-change in mind that you believe will help, submit.{analysis_note}
-
-Runtime vs the PyTorch reference is the objective. Counters that show up in \
-tool output (SOL, occupancy, DRAM%, warp stalls, register count, instruction \
-mix) are diagnostics: they help you reason about *why* a kernel is slow when \
-you're stuck. They are not goals on their own — a faster kernel with worse \
-counters beats a slower kernel with better ones.
+The tool set covers what you'd do at a terminal while writing a kernel: \
+compile, check correctness, look up GPU specs, sanity-check for \
+reward-hacking patterns, submit.{analysis_clause} Each tool's description \
+in the function-calling schema explains what it returns. Speedup vs the \
+PyTorch reference is the objective; counters in tool output (SOL, \
+occupancy, DRAM%, warp stalls, register count, instruction mix) are \
+diagnostics, not goals on their own.
 """
 
 
 _ANALYSIS_NOTE_WITH_PROFILING = (
-    " The analysis tools (`profile_kernel`, `disassemble_kernel`, "
-    "`ert_roofline`) are useful when you want runtime data to guide your "
-    "next change — what the bottleneck is, whether tensor cores are firing, "
-    "register pressure. If you already have a hypothesis, just try it. Each "
-    "profiling call takes a few seconds to a few minutes, so don't call them "
-    "on every iteration."
+    " You also have profiling and disassembly tools (`profile_kernel`, "
+    "`disassemble_kernel`, `ert_roofline`) that report runtime hardware "
+    "counters — DRAM bandwidth, warp stalls, occupancy, register usage, "
+    "instruction mix — and an empirical roofline benchmark; each "
+    "profiling call takes a few seconds to a few minutes."
 )
 
 
@@ -105,7 +98,7 @@ def build_system_prompt(
         backend_display=_backend_display(backend),
         max_turns=max_turns,
         max_tool_calls=max_tool_calls,
-        analysis_note=_ANALYSIS_NOTE_WITH_PROFILING if has_profiling else "",
+        analysis_clause=_ANALYSIS_NOTE_WITH_PROFILING if has_profiling else "",
     )
 
 
