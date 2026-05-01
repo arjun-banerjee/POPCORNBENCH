@@ -218,6 +218,68 @@ class KernelAgent:
         trajectory.add_turn = add_turn  # type: ignore[assignment]
         trajectory.finish = finish      # type: ignore[assignment]
 
+    def _ingest_endpoint_progress(self) -> list[dict[str, Any]]:
+        """Read new entries from {trajectory_basename}_aeprogress.jsonl.
+
+        Endpoint adapters (currently aeproxy) write one JSON line per
+        intermediate program they evaluate while a chat completion is in
+        flight. We pick those up at the end of each turn, convert them into
+        synthetic function_call items in the trajectory's response list, and
+        advance a cursor so we don't re-ingest them next turn.
+
+        Returns the list of synthesized response items (may be empty).
+        """
+        if not self.save_path:
+            return []
+        progress_path = self.save_path.replace(
+            "_trajectory.json", "_aeprogress.jsonl"
+        )
+        try:
+            if not os.path.isfile(progress_path):
+                return []
+            with open(progress_path) as f:
+                lines = f.readlines()
+        except Exception as e:
+            print(f"[Agent] could not read {progress_path}: {e}", flush=True)
+            return []
+
+        new_lines = lines[self._endpoint_progress_cursor:]
+        self._endpoint_progress_cursor = len(lines)
+
+        items: list[dict[str, Any]] = []
+        for raw in new_lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                e = json.loads(raw)
+            except Exception:
+                continue
+            kernel = e.get("kernel_src") or ""
+            outcome = (
+                "correct" if e.get("correct")
+                else "compiled" if e.get("compiled")
+                else "fail"
+            )
+            speedup = float(e.get("speedup") or 0.0)
+            elapsed = float(e.get("elapsed_s") or 0.0)
+            args_payload = {
+                "kernel_code": kernel,
+                "_outcome": outcome,
+                "_speedup": speedup,
+                "_elapsed_s": elapsed,
+                "_program": e.get("program_name", ""),
+            }
+            if e.get("error"):
+                args_payload["_error"] = e["error"]
+            items.append({
+                "type": "function_call",
+                "name": "evaluate_ae_candidate",
+                "arguments": json.dumps(args_payload),
+                "call_id": f"ae_call_{e.get('idx','?')}",
+            })
+        return items
+
     def _run_responses(self) -> KernelTrajectory:
         """Original Responses-API loop."""
         tag = self._tag()
@@ -241,6 +303,7 @@ class KernelAgent:
                 trajectory.save(self.save_path)
             except Exception as e:
                 print(f"[Agent] initial save failed: {e}", flush=True)
+        self._endpoint_progress_cursor = 0
 
         instructions = build_system_prompt(
             max_turns=self.max_turns,
@@ -616,6 +679,7 @@ class KernelAgent:
                 trajectory.save(self.save_path)
             except Exception as e:
                 print(f"[Agent] initial save failed: {e}", flush=True)
+        self._endpoint_progress_cursor = 0
 
         instructions = build_system_prompt(
             max_turns=self.max_turns,
@@ -778,6 +842,12 @@ class KernelAgent:
                 response_items.append(
                     {"type": "reasoning", "summary": [{"text": reasoning}]}
                 )
+            # Endpoint adapters (notably aeproxy) write per-step progress to
+            # {trajectory_basename}_aeprogress.jsonl while the chat completion
+            # is in flight. Ingest those entries here so the saved trajectory
+            # records every intermediate program AE produced — not just the
+            # final tool call.
+            response_items.extend(self._ingest_endpoint_progress())
             if asst_content:
                 response_items.append(
                     {

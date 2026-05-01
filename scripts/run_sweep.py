@@ -204,23 +204,25 @@ def _mark_trajectory_timed_out(traj_path: str) -> None:
 
 
 @contextlib.contextmanager
-def _gpu_perf_file_lock(lock_path: Optional[str]):
-    """Acquire an exclusive file lock for the duration of the with-block.
+def _gpu_perf_lock(lock):
+    """Acquire a multiprocessing.Manager().Lock() for the with-block.
 
-    `lock_path=None` is a no-op (used when agents_per_gpu == 1 — no possible
-    contention so we skip locking entirely)."""
-    if not lock_path:
+    `lock=None` is a no-op (used when agents_per_gpu == 1 — no possible
+    contention so we skip locking entirely).
+
+    Manager-backed locks are FIFO-ish (a server process owns the semaphore)
+    and don't suffer from the wake-all-waiters fairness issue that
+    fcntl.flock has under heavy contention. They auto-release if the holder
+    dies via the Manager's connection cleanup.
+    """
+    if lock is None:
         yield
         return
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+    lock.acquire()
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        yield
     finally:
-        os.close(fd)
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +234,7 @@ def run_one(
     sweep: dict,
     run_dir: str,
     sem,
-    perf_lock_path: Optional[str],
+    perf_lock,
 ) -> Optional[dict]:
     """Run a single (model, level, problem) work item."""
     model_cfg = sweep["models"][work.model_idx]
@@ -348,12 +350,12 @@ def run_one(
             # never measured concurrently with another agent on the same device.
             # File locks (fcntl.flock) auto-release on process death — unlike
             # manager.Lock(), they cannot leak across worker crashes.
-            if perf_lock_path is not None and "submit_kernel" in agent.tool_map:
+            if perf_lock is not None and "submit_kernel" in agent.tool_map:
                 sk = agent.tool_map["submit_kernel"]
                 orig_execute = sk.execute
 
                 def locked_execute(ctx, **kw):
-                    with _gpu_perf_file_lock(perf_lock_path):
+                    with _gpu_perf_lock(perf_lock):
                         return orig_execute(ctx, **kw)
 
                 sk.execute = locked_execute  # type: ignore[assignment]
@@ -611,23 +613,18 @@ def main():
         per_model_sems.append(manager.Semaphore(cap))
         print(f"  [{m['name']}] per-model concurrency cap = {cap}")
 
-    # Per-GPU perf locks — file-backed (fcntl.flock) so they auto-release on
-    # worker death. Locks are stored in a per-run subdirectory so concurrent
-    # sweeps in different run dirs don't collide.
+    # Per-GPU perf locks — Manager-backed mp.Lock(), FIFO-ish via the Manager
+    # server process. Replaces fcntl.flock which under heavy contention woke
+    # all waiters and could starve agents past worker_timeout_s.
     #
-    # Fast path: if agents_per_gpu == 1 there's never any contention possible,
-    # so we skip lock allocation entirely. This eliminates a whole class of
-    # potential hangs from the demo configs.
-    perf_lock_paths: list[Optional[str]]
+    # Fast path: if agents_per_gpu == 1 there's no possible contention so we
+    # skip lock allocation entirely.
+    perf_locks: list
     if par_cfg.get("perf_lock_per_gpu", True) and par_cfg["agents_per_gpu"] > 1:
-        lock_dir = os.path.join(run_dir, ".locks")
-        os.makedirs(lock_dir, exist_ok=True)
-        perf_lock_paths = [
-            os.path.join(lock_dir, f"gpu_{i}.lock") for i in range(num_gpus)
-        ]
-        print(f"  perf-timing serialized per GPU via file locks under {lock_dir}")
+        perf_locks = [manager.Lock() for _ in range(num_gpus)]
+        print(f"  perf-timing serialized per GPU via Manager locks ({num_gpus} GPUs)")
     else:
-        perf_lock_paths = [None] * num_gpus
+        perf_locks = [None] * num_gpus
         if par_cfg["agents_per_gpu"] == 1:
             print("  perf-timing lock disabled (agents_per_gpu=1, no possible contention)")
 
@@ -659,7 +656,7 @@ def main():
                     sweep,
                     run_dir,
                     per_model_sems[w.model_idx],
-                    perf_lock_paths[w.device_id],
+                    perf_locks[w.device_id],
                 ): w
                 for w in work_items
             }
