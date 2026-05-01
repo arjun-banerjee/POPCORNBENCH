@@ -176,8 +176,8 @@ a{color:var(--acc);text-decoration:none}
 a:hover{opacity:.65}
 header{border-bottom:1px solid var(--pri);padding-bottom:0;background:var(--bg)}
 header .wrap{padding:48px 24px 28px}
-h1{font-family:"orpheuspro",serif;font-weight:400;font-style:italic;font-size:54px;
-  letter-spacing:-.02em;color:var(--pri);line-height:1;margin-bottom:8px}
+h1{font-family:"neue-kabel",sans-serif;font-weight:900;font-style:normal;font-size:64px;
+  letter-spacing:-.025em;color:var(--pri);line-height:.95;margin-bottom:10px}
 .sub{font-family:"calling-code",sans-serif;font-style:italic;font-size:14px;
   color:var(--pri);opacity:.55;margin-top:4px}
 .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
@@ -239,7 +239,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 .hero-card{display:block;padding:22px 24px;border:2px solid var(--pri);background:var(--bg);
   color:var(--fg);text-decoration:none;transition:background var(--t),color var(--t);position:relative}
 .hero-card:hover{background:var(--soft);text-decoration:none}
-.hero-name{font-family:"orpheuspro",serif;font-weight:400;font-style:italic;font-size:26px;color:var(--pri);letter-spacing:-.01em}
+.hero-name{font-family:"neue-kabel",sans-serif;font-weight:700;font-style:normal;font-size:30px;color:var(--pri);letter-spacing:-.01em}
 .hero-hint{font-size:12.5px;opacity:.75;margin-top:6px}
 .hero-arrow{position:absolute;top:18px;right:22px;font-size:18px;color:var(--pri)}
 """
