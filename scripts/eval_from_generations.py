@@ -26,6 +26,11 @@ from kernelbench.eval import (
     KernelExecResult,
 )
 
+from kernelbench.hardware_translation_utils import (
+    read_source_kernel_for_problem,
+    resolve_benchmark_reference_kernel_src,
+    resolve_repo_path,
+)
 from kernelbench.utils import read_file, set_gpu_arch
 from tqdm import tqdm
 
@@ -141,6 +146,16 @@ class EvalConfig(Config):
         
         # Precision for computation: "fp32", "fp16", "bf16"
         self.precision = "fp32"
+
+        # Hardware translation (optional): directory of source kernels for timing
+        # ``speedup_vs_source`` (e.g. ``KernelBench/level5/kernels/a100`` with ``.cu``
+        # named like the problem stem).
+        self.hardware_translation_eval_source_dir = None
+        self.hardware_translation_eval_source_backend = None
+
+        # Optional expert baseline on the evaluation GPU: Python defining ``ModelNew``
+        # for the target architecture (e.g. wrapped ``kernels/h100/*.cu``).
+        self.benchmark_reference_kernel_dir = None
         
         # Number of samples per problem to evaluate for pass@k analysis
         self.num_samples_per_problem = 1  # Default to 1 sample per problem
@@ -298,6 +313,36 @@ def evaluate_single_sample(
     ref_arch_src = fetch_ref_arch_from_problem_id(
         dataset, problem_id, configs.dataset_src
     )
+    problem = dataset.get_problem_by_id(problem_id)
+    problem_name = problem.name
+
+    benchmark_src = resolve_benchmark_reference_kernel_src(
+        REPO_TOP_DIR,
+        getattr(configs, "benchmark_reference_kernel_dir", None),
+        problem_name,
+    )
+
+    source_kernel_src_eval = None
+    source_backend_eval = None
+    ht_src_dir = resolve_repo_path(
+        REPO_TOP_DIR,
+        getattr(configs, "hardware_translation_eval_source_dir", None),
+    )
+    if ht_src_dir and os.path.isdir(ht_src_dir):
+        sb = getattr(configs, "hardware_translation_eval_source_backend", None) or configs.backend
+        source_backend_eval = str(sb).lower()
+        if source_backend_eval != "pytorch":
+            try:
+                source_kernel_src_eval = read_source_kernel_for_problem(
+                    ht_src_dir, problem_name
+                )
+            except FileNotFoundError as e:
+                print(
+                    f"[WARNING] hardware_translation_eval_source_dir set but no source for "
+                    f"{problem_name}: {e}"
+                )
+                source_kernel_src_eval = None
+                source_backend_eval = None
 
     # fetch kernel from disk
     # Add database support in the future
@@ -324,6 +369,9 @@ def evaluate_single_sample(
             device=device,
             backend=configs.backend,
             precision=eval.get_torch_dtype_from_string(configs.precision),
+            source_kernel_src=source_kernel_src_eval,
+            source_backend=source_backend_eval,
+            benchmark_reference_kernel_src=benchmark_src,
         )
         return eval_result
     except Exception as e:

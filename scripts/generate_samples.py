@@ -9,6 +9,10 @@ from pydra import Config, REQUIRED
 
 from kernelbench.dataset import construct_kernelbench_dataset
 from kernelbench.eval import eval_kernel_against_ref
+from kernelbench.hardware_translation_utils import (
+    load_hardware_translation_auxiliary_txt,
+    read_source_kernel_for_problem,
+)
 from kernelbench.prompt_constructor_toml import (
     get_prompt_for_backend,
     get_custom_prompt,
@@ -108,10 +112,15 @@ class GenerationConfig(Config):
 
         # Hardware translation mode: re-optimize kernels from one GPU arch to
         # another (same DSL). Set prompt_option=hardware_translation and provide
-        # source_hardware_gpu_name (the GPU the source kernels were tuned for)
-        # plus hardware_gpu_name (the target GPU). Source kernels are loaded from
-        # source_kernel_dir or _translation_sources/{backend}/.
+        # source_hardware_gpu_name (e.g. 'A100') plus hardware_gpu_name (e.g. 'H100').
+        # Source kernels load from source_kernel_dir or _translation_sources/{backend}/;
+        # `.cu` is resolved via `<stem>.cu` matching each problem name. Optional `.txt`
+        # notes: hardware_translation_auxiliary_txt_path / hardware_translation_auxiliary_txt_dir.
         self.source_hardware_gpu_name = None
+
+        # Optional `.txt` injected into hardware_translation prompts (global file and/or per-problem ``<stem>.txt``).
+        self.hardware_translation_auxiliary_txt_path = None
+        self.hardware_translation_auxiliary_txt_dir = None
 
         self.check_kernel = True  # [experimental] optional static checker catching potential hacking patterns
 
@@ -151,14 +160,15 @@ def _resolve_source_kernel_src(
             "_translation_sources",
             source_backend,
         )
-    candidate = os.path.join(src_dir, problem.name)
-    if not os.path.exists(candidate):
+    try:
+        return read_source_kernel_for_problem(src_dir, problem.name)
+    except FileNotFoundError as e:
         raise FileNotFoundError(
             f"No source kernel for problem '{problem.name}' under {src_dir}. "
-            "Run scripts/build_translation_dataset.py to populate this directory."
-        )
-    with open(candidate, "r") as f:
-        return f.read()
+            "For `.cu` inputs, place ``<stem>.cu`` next to the problem stem or copy "
+            "files under ``_translation_sources/{backend}/``. "
+            "Run scripts/build_translation_dataset.py for DSL translation layouts."
+        ) from e
 
 
 def generate_sample_single(
@@ -213,6 +223,16 @@ def generate_sample_single(
         if not config.source_backend:
             config.source_backend = config.backend
         source_kernel_src = _resolve_source_kernel_src(config, problem, ref_arch_src)
+        aux_txt = load_hardware_translation_auxiliary_txt(
+            REPO_TOP_DIR,
+            auxiliary_txt_path=getattr(
+                config, "hardware_translation_auxiliary_txt_path", None
+            ),
+            auxiliary_txt_dir=getattr(
+                config, "hardware_translation_auxiliary_txt_dir", None
+            ),
+            problem_name=problem.name,
+        )
         custom_prompt = get_hardware_translation_prompt(
             ref_arch_src=ref_arch_src,
             source_kernel_src=source_kernel_src,
@@ -220,6 +240,7 @@ def generate_sample_single(
             source_gpu_name=config.source_hardware_gpu_name,
             target_gpu_name=config.hardware_gpu_name,
             precision=config.precision,
+            auxiliary_context_txt=aux_txt or None,
         )
     else:
         custom_prompt = get_prompt_for_backend(

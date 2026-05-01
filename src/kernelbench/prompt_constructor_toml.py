@@ -439,11 +439,20 @@ def render_prompt_by_option(
                     f"Component '{component}' requires source_gpu_name and gpu_name in context."
                 )
             prompt_parts.append(context[component])
+        elif component == "hardware_translation_auxiliary_txt_block":
+            aux = (context.get("hardware_translation_aux_txt") or "").strip()
+            if not aux:
+                continue
+            prompt_parts.append(
+                cfg.compose_blocks(["templates.common.hardware_translation_auxiliary_txt_block"])
+            )
         elif component.startswith("source_hardware_"):
             template_key = f"templates.hardware.{component}"
             prompt_parts.append(cfg.compose_blocks([template_key]))
-        elif component.startswith("hardware_"):
-            # Hardware components from templates.hardware
+        elif component.startswith("hardware_") and not component.startswith(
+            "hardware_translation_"
+        ):
+            # Hardware components from templates.hardware (not hardware_translation_* blocks)
             template_key = f"templates.hardware.{component}"
             prompt_parts.append(cfg.compose_blocks([template_key]))
         else:
@@ -586,26 +595,31 @@ def get_hardware_translation_prompt(
     target_gpu_name: str,
     option: str = "hardware_translation",
     precision: Optional[str] = None,
+    auxiliary_context_txt: Optional[str] = None,
 ) -> str:
     """
     Generate a hardware-translation prompt: re-optimize a kernel originally
     tuned for one GPU architecture to run efficiently on another.
 
     Unlike ``get_translation_prompt`` (which changes the DSL), this keeps the
-    same backend but changes the target hardware — e.g. an H100-tuned CUDA
-    kernel re-optimized for A100.
+    same backend but changes the target hardware — for example A100-tuned CUDA
+    ``.cu`` source re-optimized for H100.
 
     Args:
         ref_arch_src: PyTorch reference architecture (functional contract).
-        source_kernel_src: The existing kernel tuned for source_gpu_name.
+        source_kernel_src: The existing CUDA source tuned for ``source_gpu_name``
+            (typically contents of an ``.cu`` file).
         backend: The DSL / backend (same for source and target, e.g. "cuda").
         source_gpu_name: GPU name the source kernel was optimized for
-            (must exist in gpu_specs.py, e.g. "H100").
-        target_gpu_name: GPU name to re-optimize for (e.g. "A100").
+            (must exist in gpu_specs.py, e.g. "A100").
+        target_gpu_name: GPU name to re-optimize for (e.g. "H100").
         option: Prompt option name. Defaults to "hardware_translation".
         precision: Optional precision string (fp32, fp16, bf16).
+        auxiliary_context_txt: Optional extra instructions from one or more ``.txt``
+            files (build notes, API constraints); omitted from the prompt when empty.
     """
     backend_lower = backend.lower()
+    aux = (auxiliary_context_txt or "").strip()
     return render_prompt_by_option(
         prompts_toml=PROMPTS_TOML,
         backend=backend_lower,
@@ -614,6 +628,7 @@ def get_hardware_translation_prompt(
             "ref_arch_src": ref_arch_src,
             "source_kernel_src": source_kernel_src,
             "source_backend": backend_lower,
+            "hardware_translation_aux_txt": aux,
         },
         precision=precision,
         include_hardware=True,
@@ -749,16 +764,17 @@ def test_prompt():
     )
     log_prompt(translation_cuda_triton, scratch_dir, "translation_cuda_triton.txt")
 
-    # hardware translation prompt: H100-tuned CUDA -> A100
+    # hardware translation prompt: A100 `.cu`-style CUDA source -> H100
     hw_translation = get_hardware_translation_prompt(
         ref_arch_src=ref_arch_src,
         source_kernel_src=cuda_source,
         backend="cuda",
-        source_gpu_name="H100",
-        target_gpu_name="A100",
+        source_gpu_name="A100",
+        target_gpu_name="H100",
         precision="fp32",
+        auxiliary_context_txt="Example notes from a `.txt` sidecar (optional).",
     )
-    log_prompt(hw_translation, scratch_dir, "hardware_translation_h100_a100.txt")
+    log_prompt(hw_translation, scratch_dir, "hardware_translation_a100_h100.txt")
 
     # custom prompt defined in prompts.toml
     custom_prompt = get_custom_prompt(

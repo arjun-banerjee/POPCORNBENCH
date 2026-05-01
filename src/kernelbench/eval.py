@@ -137,6 +137,12 @@ class KernelExecResult(BaseModel):
     source_backend: Optional[str] = None
     speedup_vs_source: float = -1.0
 
+    # Optional timed baseline: Python ``ModelNew`` wrapping the target-GPU reference
+    # kernel (e.g. Level 5 ``kernels/h100`` expert CUDA wrapped for PyTorch).
+    hardware_reference_runtime: float = -1.0
+    hardware_reference_runtime_stats: dict = {}
+    speedup_vs_hardware_reference: float = -1.0
+
     # ── Extended metrics (populated when measure_performance=True) ──
     # GPU Memory Efficiency
     memory_stats: dict = {}  # peak_memory_bytes, ref_peak_memory_bytes, memory_ratio
@@ -447,6 +453,7 @@ def eval_kernel_against_ref(
     # implement ModelNew using the same Model interface as the PyTorch reference.
     source_kernel_src: Optional[str] = None,
     source_backend: Optional[str] = None,
+    benchmark_reference_kernel_src: Optional[str] = None,
     # Guard against potential reward hacking [optional but ongoing enhancement]
     check_for_excessive_speedup: bool = True,
     excessive_speedup_threshold: float = 10,  # flag if the kernel is more than <excessive_speedup_threshold>x faster than the reference
@@ -463,6 +470,9 @@ def eval_kernel_against_ref(
     backend: str, one of 'cuda', 'triton', 'tilelang', or 'cute'
     precision: torch.dtype for computation (note: tilelang only supports fp16)
     timing_method: str, method to time kernel, see timing.py for more details
+    source_kernel_src / source_backend: optional translation-mode timings (`speedup_vs_source`).
+    benchmark_reference_kernel_src: optional Python defining ModelNew for expert target-GPU
+        baseline (`hardware_reference_runtime`, `speedup_vs_hardware_reference`).
 
     ONGOING EFFORT to refactor and modularize this, and adding more tests for eval.
     """
@@ -967,6 +977,86 @@ def eval_kernel_against_ref(
                 try:
                     source_tempfile.close()
                     os.remove(source_tempfile.name)
+                except OSError:
+                    pass
+
+    # Optional: time a target-hardware expert/reference kernel (Python ModelNew).
+    if (
+        measure_performance
+        and benchmark_reference_kernel_src is not None
+        and kernel_exec_result is not None
+        and kernel_exec_result.correctness
+        and kernel_exec_result.runtime > 0
+    ):
+        hw_ref_tempfile = None
+        try:
+            benchmark_backend_lower = backend.lower()
+            benchmark_uses_tempfile = benchmark_backend_lower in [
+                "triton",
+                "tilelang",
+                "cute",
+                "helion",
+                "nki",
+                "pallas",
+                "numba",
+                "mojo",
+            ]
+            if benchmark_uses_tempfile:
+                HardwareRefModel, hw_ref_tempfile = load_custom_model_with_tempfile(
+                    benchmark_reference_kernel_src, entry_point="ModelNew"
+                )
+            else:
+                HardwareRefModel = load_custom_model(
+                    benchmark_reference_kernel_src, {}, build_dir
+                )
+            torch.cuda.synchronize(device=device)
+
+            with torch.no_grad():
+                set_seed(seed_num)
+                hw_ref_model = HardwareRefModel(*init_inputs)
+                hw_ref_model = hw_ref_model.to(device=device, dtype=precision)
+                torch.cuda.synchronize(device=device)
+
+            set_seed(seed_num)
+            hw_ref_inputs = get_inputs()
+            hw_ref_inputs = [
+                _process_input_tensor(x, device, benchmark_backend_lower, precision)
+                for x in hw_ref_inputs
+            ]
+
+            timing_fn = timing.get_timing_function(timing_method)
+            hw_ref_elapsed = timing_fn(
+                hw_ref_model,
+                hw_ref_inputs,
+                num_trials=num_perf_trials,
+                verbose=verbose,
+                device=device,
+            )
+            hw_ref_stats = timing.get_timing_stats(hw_ref_elapsed, device=device)
+            kernel_exec_result.hardware_reference_runtime = hw_ref_stats["mean"]
+            kernel_exec_result.hardware_reference_runtime_stats = hw_ref_stats
+            if kernel_exec_result.runtime > 0:
+                kernel_exec_result.speedup_vs_hardware_reference = (
+                    hw_ref_stats["mean"] / kernel_exec_result.runtime
+                )
+            if verbose:
+                print(
+                    f"[Eval] Hardware reference ({benchmark_backend_lower}) runtime: "
+                    f"{hw_ref_stats['mean']:.3f}, speedup_vs_hardware_reference: "
+                    f"{kernel_exec_result.speedup_vs_hardware_reference:.2f}x"
+                )
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Failed to time hardware reference kernel: {e}")
+            kernel_exec_result.metadata["hardware_reference_kernel_error"] = str(e)
+            kernel_exec_result.metadata["hardware_reference_kernel_error_name"] = (
+                get_error_name(e)
+            )
+        finally:
+            if hw_ref_tempfile is not None:
+                try:
+                    hw_ref_tempfile.close()
+                    os.remove(hw_ref_tempfile.name)
                 except OSError:
                     pass
 

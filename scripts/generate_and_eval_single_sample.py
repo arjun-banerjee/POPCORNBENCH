@@ -6,6 +6,10 @@ import json
 import modal
 
 from kernelbench.eval import eval_kernel_against_ref
+from kernelbench.hardware_translation_utils import (
+    load_hardware_translation_auxiliary_txt,
+    resolve_benchmark_reference_kernel_src,
+)
 from kernelbench.prompt_constructor_toml import (
     get_annotated_compile_prompt,
     get_custom_prompt,
@@ -101,6 +105,11 @@ class EvalConfig(Config):
         # source_hardware_gpu_name (the GPU the source kernel was tuned for) plus
         # hardware_gpu_name (the target GPU). source_kernel_path is still needed.
         self.source_hardware_gpu_name = None
+
+        self.hardware_translation_auxiliary_txt_path = None
+        self.hardware_translation_auxiliary_txt_dir = None
+        self.benchmark_reference_kernel_dir = None
+        self.benchmark_reference_kernel_path = None
 
         self.check_kernel = True  # [experimental] optional static checker catching potential hacking patterns
 
@@ -283,12 +292,12 @@ def main(config: EvalConfig):
         if not config.source_hardware_gpu_name:
             raise ValueError(
                 "prompt_option=hardware_translation requires source_hardware_gpu_name "
-                "(the GPU the source kernel was optimized for, e.g. 'H100')."
+                "(the GPU the source kernel was optimized for, e.g. 'A100')."
             )
         if not config.hardware_gpu_name:
             raise ValueError(
                 "prompt_option=hardware_translation requires hardware_gpu_name "
-                "(the target GPU to re-optimize for, e.g. 'A100')."
+                "(the target GPU to re-optimize for, e.g. 'H100')."
             )
         src_path = config.source_kernel_path
         if not os.path.isabs(src_path):
@@ -299,6 +308,16 @@ def main(config: EvalConfig):
             hw_source_kernel_src = f.read()
         source_kernel_src = hw_source_kernel_src
         source_backend = backend
+        aux_txt = load_hardware_translation_auxiliary_txt(
+            REPO_TOP_DIR,
+            auxiliary_txt_path=getattr(
+                config, "hardware_translation_auxiliary_txt_path", None
+            ),
+            auxiliary_txt_dir=getattr(
+                config, "hardware_translation_auxiliary_txt_dir", None
+            ),
+            problem_name=problem_name,
+        )
         custom_prompt = get_hardware_translation_prompt(
             ref_arch_src=ref_arch_src,
             source_kernel_src=hw_source_kernel_src,
@@ -306,6 +325,7 @@ def main(config: EvalConfig):
             source_gpu_name=config.source_hardware_gpu_name,
             target_gpu_name=config.hardware_gpu_name,
             precision=config.precision,
+            auxiliary_context_txt=aux_txt or None,
         )
     elif prompt_option == "annotated_compile":
         custom_prompt = get_annotated_compile_prompt(
@@ -363,6 +383,20 @@ def main(config: EvalConfig):
             f.write(custom_kernel)
 
     # 3. Evaluate Kernel
+    benchmark_src = None
+    br_path = getattr(config, "benchmark_reference_kernel_path", None)
+    if br_path:
+        bp = br_path if os.path.isabs(br_path) else os.path.join(REPO_TOP_DIR, br_path)
+        if os.path.isfile(bp):
+            with open(bp, encoding="utf-8") as bf:
+                benchmark_src = bf.read()
+    if benchmark_src is None:
+        benchmark_src = resolve_benchmark_reference_kernel_src(
+            REPO_TOP_DIR,
+            getattr(config, "benchmark_reference_kernel_dir", None),
+            problem_name,
+        )
+
     # NOTE: no need to wrap around process here as only a single sample
     # see batch eval for examples of process isolation
     kernel_exec_result = eval_kernel_against_ref(
@@ -377,6 +411,7 @@ def main(config: EvalConfig):
         precision=get_torch_dtype_from_string(config.precision),
         source_kernel_src=source_kernel_src,
         source_backend=source_backend,
+        benchmark_reference_kernel_src=benchmark_src,
     )
 
     print(
