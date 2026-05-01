@@ -386,11 +386,29 @@ class ProfileKernelTool(Tool):
         "scripts", "_profile_worker.py",
     )
 
+    # Per-tool-instance cache: kernel_src_hash -> ToolResult. Keyed by the
+    # exact kernel source the agent passes in, so repeated profile_kernel
+    # calls on the same code (common when an agent re-profiles after a
+    # non-functional edit) reuse the prior ncu run instead of paying the
+    # 30-300s tax again.
+    _profile_cache: dict[str, "ToolResult"] = {}
+
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        import hashlib
         import json
         import subprocess
         import sys
         import tempfile
+
+        cache_key = hashlib.sha1(kernel_code.encode("utf-8")).hexdigest()
+        if cache_key in self._profile_cache:
+            cached = self._profile_cache[cache_key]
+            return ToolResult(
+                tool_name=cached.tool_name,
+                success=cached.success,
+                output="(cached) " + cached.output,
+                metadata=cached.metadata,
+            )
 
         from kernelbench.profile import NSIGHT_AVAILABLE, check_ncu_available
         from kernelbench.agent.nsight_parser import (
@@ -437,7 +455,7 @@ class ProfileKernelTool(Tool):
                 [sys.executable, self._WORKER_SCRIPT, req_path],
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=900,
             )
 
             os.unlink(req_path)
@@ -468,7 +486,7 @@ class ProfileKernelTool(Tool):
             return ToolResult(
                 tool_name=self.name,
                 success=False,
-                output="profile_kernel FAILED: profiling timed out (300s).",
+                output="profile_kernel FAILED: profiling timed out (900s).",
                 metadata={"error": "timeout"},
             )
         except Exception as e:
@@ -492,7 +510,7 @@ class ProfileKernelTool(Tool):
         # Store for delta comparison on next invocation
         ctx._last_profile_summary = summary
 
-        return ToolResult(
+        result = ToolResult(
             tool_name=self.name,
             success=True,
             output=(
@@ -515,6 +533,8 @@ class ProfileKernelTool(Tool):
                 ),
             },
         )
+        self._profile_cache[cache_key] = result
+        return result
 
 
 # ---------------------------------------------------------------------------

@@ -189,8 +189,40 @@ NCU_METRICS = [
     "smsp__average_warps_issue_stalled_tex_throttle_per_issue_active.pct",
 ]
 
-# Backward-compatible alias used by tools.py / _profile_worker.py
-ROOFLINE_METRICS = NCU_METRICS
+FAST_NCU_METRICS = [
+    # ── Timing ──
+    "gpu__time_duration.sum",
+    # ── DRAM bandwidth (the dominant memory-bound signal) ──
+    "dram__bytes_read.sum.per_second",
+    "dram__bytes_write.sum.per_second",
+    # ── Occupancy ──
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    # ── Launch geometry ──
+    "launch__registers_per_thread",
+    "launch__shared_mem_per_block_allocated",
+    "launch__block_size",
+    "launch__grid_size",
+    # ── Coalescing ──
+    "l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio",
+    # ── Pipe utilization (compute saturation signal) ──
+    "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+    # ── L2 hit rate (cache effectiveness) ──
+    "lts__t_sector_hit_rate.pct",
+    # ── Top three warp-stall reasons ──
+    "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.pct",
+    "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.pct",
+    "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.pct",
+    # ── Eligible warps (latency-bound signal) ──
+    "smsp__warps_eligible.avg.per_cycle_active",
+]
+
+# Backward-compatible alias used by tools.py / _profile_worker.py.
+# Switched from the comprehensive 46-metric list to the trimmed 16-metric
+# fast set — ncu re-launches the kernel for each metric section, so cutting
+# the list ~3x cuts profile wall-clock ~3x and dramatically reduces the
+# 300s timeout failure rate on L3/L4 problems.
+ROOFLINE_METRICS = FAST_NCU_METRICS
 
 
 # ---------------------------------------------------------------------------
