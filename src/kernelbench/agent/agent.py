@@ -341,17 +341,12 @@ class KernelAgent:
             tool_calls_remaining = self.max_tool_calls - self._total_tool_calls
 
             if turns_remaining <= self.warn_turns_remaining and turn_idx > 0:
-                has_profiling = bool(
-                    {"profile_kernel", "disassemble_kernel", "ert_roofline"}
-                    & set(self.tool_names_enabled)
-                )
                 input_items.append(
                     {
                         "role": "user",
                         "content": build_turn_warning_message(
                             turns_remaining,
                             tool_calls_remaining,
-                            has_profiling_tools=has_profiling,
                         ),
                     }
                 )
@@ -722,17 +717,12 @@ class KernelAgent:
             turns_remaining = self.max_turns - turn_idx
             tool_calls_remaining = self.max_tool_calls - self._total_tool_calls
             if turns_remaining <= self.warn_turns_remaining and turn_idx > 0:
-                has_profiling = bool(
-                    {"profile_kernel", "disassemble_kernel", "ert_roofline"}
-                    & set(self.tool_names_enabled)
-                )
                 messages.append(
                     {
                         "role": "user",
                         "content": build_turn_warning_message(
                             turns_remaining,
                             tool_calls_remaining,
-                            has_profiling_tools=has_profiling,
                         ),
                     }
                 )

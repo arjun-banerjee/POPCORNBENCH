@@ -49,7 +49,6 @@ def main() -> int:
     turn_warning = build_turn_warning_message(
         turns_remaining=2,
         tool_calls_remaining=5,
-        has_profiling_tools=True,
     )
 
     tools_payload = []
