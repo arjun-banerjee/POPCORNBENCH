@@ -153,44 +153,208 @@ def _ensure_worktree(branch: str, worktree: Path) -> None:
     _run(["git", "reset", "--hard", f"origin/{branch}"], cwd=worktree, check=False)
 
 
-def _build_index(worktree: Path, reports: list[tuple[str, Path]]) -> None:
-    """Write a top-level index.html listing every published run."""
-    when = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    cards = []
-    for name, _ in sorted(reports, key=lambda x: x[0]):
-        cards.append(
-            f'<a class="card" href="{html.escape(name)}/index.html">'
-            f'<div class="name">{html.escape(name)}</div>'
-            f'<div class="hint">open report →</div></a>'
-        )
-    body = (
-        f'<header><h1>PopcornBench sweep reports</h1>'
-        f'<div class="meta">last published {html.escape(when)}</div></header>'
-        f'<div class="grid">{"".join(cards) or "<p>No reports yet.</p>"}</div>'
-    )
-    css = """
+# ---------------------------------------------------------------------------
+# Theme: popcorn-box colors. Used by every generated page.
+#   --bg:   white page background
+#   --fg:   body text (near-black)
+#   --pri:  primary brand red (headings, borders)
+#   --acc:  brighter red, used for links/hover
+#   --soft: warm yellow accent (panels, hover backgrounds)
+# ---------------------------------------------------------------------------
+_COMMON_CSS = """
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--g:#00553A;--w:#fff;--g08:rgba(0,85,58,.08)}
-html,body{background:var(--w);color:var(--g);
+:root{
+  --bg:#ffffff; --fg:#1a1a1a; --pri:#901010; --acc:#ab1313;
+  --soft:#f8de8d; --soft08:rgba(248,222,141,.4); --pri15:rgba(144,16,16,.15);
+  --pri08:rgba(144,16,16,.08); --pri35:rgba(144,16,16,.35); --t:80ms ease;
+}
+html,body{background:var(--bg);color:var(--fg);
   font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:14px;line-height:1.55}
-header{padding:36px 24px 24px;border-bottom:1px solid var(--g);max-width:900px;margin:0 auto}
-h1{font-weight:400;font-style:italic;font-size:32px;letter-spacing:-.02em}
-.meta{font-size:12px;font-style:italic;opacity:.45;margin-top:6px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
-  gap:1px;background:var(--g);max-width:900px;margin:24px auto;padding-bottom:1px}
-.card{background:var(--w);padding:18px 20px;text-decoration:none;color:var(--g);
-  display:flex;flex-direction:column;gap:6px;transition:background 80ms ease,color 80ms ease}
-.card:hover{background:var(--g);color:var(--w)}
-.name{font-size:15px}
-.hint{font-size:11px;font-style:italic;opacity:.55}
+a{color:var(--acc);text-decoration:none}
+a:hover{text-decoration:underline}
+header{border-bottom:2px solid var(--pri);padding-bottom:0;background:var(--bg)}
+header .wrap{padding:32px 24px 24px}
+h1{font-weight:700;font-size:32px;letter-spacing:-.02em;color:var(--pri)}
+.sub{font-size:13px;opacity:.7;margin-top:4px}
+.wrap{max-width:1000px;margin:0 auto;padding:0 24px}
+main.wrap{padding-top:28px;padding-bottom:48px}
+.section-head{font-size:11px;font-weight:600;letter-spacing:.08em;color:var(--pri);
+  text-transform:uppercase;margin-bottom:10px}
+nav.topnav{display:flex;gap:18px;margin-top:14px;font-size:13px}
+nav.topnav a{color:var(--pri);font-weight:600}
 """
-    page = (f"<!DOCTYPE html><html lang=en><head><meta charset=utf-8>"
-            f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-            f"<title>PopcornBench reports</title>"
-            f"<meta http-equiv=refresh content=120>"
-            f"<style>{css}</style></head><body>{body}</body></html>")
-    (worktree / "index.html").write_text(page)
+
+
+def _page(title: str, body: str, *, refresh: bool = False, extra_css: str = "") -> str:
+    refresh_meta = '<meta http-equiv=refresh content=120>' if refresh else ""
+    return (
+        f"<!DOCTYPE html><html lang=en><head><meta charset=utf-8>"
+        f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{html.escape(title)}</title>{refresh_meta}"
+        f"<style>{_COMMON_CSS}{extra_css}</style></head>"
+        f"<body>{body}</body></html>"
+    )
+
+
+def _build_homepage(worktree: Path, n_reports: int) -> None:
+    """Write the top-level index.html — short hero blurb + two link cards."""
+    when = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    blurb = (
+        "PopcornBench is an extension of KernelBench with a multi-model "
+        "agentic sweep harness for evaluating how well LLMs can write fast, "
+        "numerically equivalent CUDA / Triton / Tilelang kernels against a "
+        "PyTorch reference. Each run pairs a model with a level and problem "
+        "set, drives a tool-using agent loop with compile / correctness / "
+        "submit tools, and records per-problem speedups, fusion ratios, "
+        "energy, and roofline metrics."
+    )
+    cards = (
+        f'<a class="hero-card" href="experiments.html">'
+        f'<div class="hero-name">Experiments</div>'
+        f'<div class="hero-hint">{n_reports} sweep run{"s" if n_reports != 1 else ""} · per-model, per-problem reports</div>'
+        f'<div class="hero-arrow">→</div></a>'
+        f'<a class="hero-card" href="docs.html">'
+        f'<div class="hero-name">Docs</div>'
+        f'<div class="hero-hint">getting started · adding models · AlphaEvolve</div>'
+        f'<div class="hero-arrow">→</div></a>'
+    )
+    body = (
+        f'<header><div class="wrap"><h1>PopcornBench</h1>'
+        f'<div class="sub">multi-model kernel-benchmark harness · last published {html.escape(when)}</div>'
+        f'</div></header>'
+        f'<main class="wrap">'
+        f'<p class="blurb">{blurb}</p>'
+        f'<div class="hero-grid">{cards}</div>'
+        f'</main>'
+    )
+    extra = """
+.blurb{max-width:720px;margin:8px 0 30px;font-size:14.5px;line-height:1.7}
+.hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:8px}
+.hero-card{display:block;padding:22px 24px;border:2px solid var(--pri);background:var(--bg);
+  color:var(--fg);text-decoration:none;transition:background var(--t),color var(--t);position:relative}
+.hero-card:hover{background:var(--soft);text-decoration:none}
+.hero-name{font-size:18px;font-weight:700;color:var(--pri)}
+.hero-hint{font-size:12.5px;opacity:.75;margin-top:6px}
+.hero-arrow{position:absolute;top:18px;right:22px;font-size:18px;color:var(--pri)}
+"""
+    (worktree / "index.html").write_text(_page("PopcornBench", body, refresh=True, extra_css=extra))
     (worktree / ".nojekyll").write_text("")
+
+
+_VARIANT_COLS = [
+    ("single_turn", "single turn"),
+    ("multi_turn_default", "multi turn (default tools)"),
+    ("multi_turn_all", "multi turn (all tools)"),
+]
+
+
+def _classify_run(name: str) -> tuple[str | None, str | None]:
+    """Bucket a run name into a (row, column) for the comparison matrix.
+
+    Recognized rows are arbitrary level/variant tags — anything between
+    "cuda_" and the trailing variant suffix. Unrecognized names are bucketed
+    as (None, None) and shown only in the flat list.
+    """
+    for col_key, _ in _VARIANT_COLS:
+        suffix = "_" + col_key
+        if name.endswith(suffix):
+            row = name[len("cuda_"):-len(suffix)] if name.startswith("cuda_") else name[:-len(suffix)]
+            return row, col_key
+    return None, None
+
+
+def _build_experiments(worktree: Path, reports: list[tuple[str, Path]]) -> None:
+    """Render the experiments page: comparison matrix + flat list."""
+    when = _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    by_cell: dict[tuple[str, str], list[str]] = {}
+    rows_seen: list[str] = []
+    flat = sorted(name for name, _ in reports)
+    for name in flat:
+        row, col = _classify_run(name)
+        if row is None or col is None:
+            continue
+        if row not in rows_seen:
+            rows_seen.append(row)
+        by_cell.setdefault((row, col), []).append(name)
+    rows_seen.sort()
+
+    matrix = ""
+    if rows_seen:
+        head = "<th></th>" + "".join(f"<th>{html.escape(label)}</th>" for _, label in _VARIANT_COLS)
+        body_rows = []
+        for row in rows_seen:
+            cells = [f'<th class="row-head">{html.escape(row)}</th>']
+            for col_key, _ in _VARIANT_COLS:
+                names = by_cell.get((row, col_key), [])
+                if not names:
+                    cells.append('<td class="cell cell-empty">—</td>')
+                else:
+                    inner = "".join(
+                        f'<a href="{html.escape(n)}/index.html">'
+                        f'<span class="cell-name">{html.escape(n)}</span>'
+                        f'<span class="cell-hint">open →</span></a>'
+                        for n in names
+                    )
+                    cells.append(f'<td class="cell">{inner}</td>')
+            body_rows.append("<tr>" + "".join(cells) + "</tr>")
+        matrix = (
+            '<div class="section-head">Compare runs</div>'
+            f'<table class="matrix"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(body_rows)}</tbody></table>'
+        )
+
+    flat_cards = "".join(
+        f'<a class="flat-card" href="{html.escape(n)}/index.html">'
+        f'<span class="flat-name">{html.escape(n)}</span>'
+        f'<span class="flat-hint">→</span></a>'
+        for n in flat
+    ) or '<div class="cell-empty" style="padding:24px">No reports yet.</div>'
+
+    body = (
+        f'<header><div class="wrap"><h1>Experiments</h1>'
+        f'<div class="sub">{len(flat)} run{"s" if len(flat) != 1 else ""} · updated {html.escape(when)}</div>'
+        f'<nav class="topnav"><a href="index.html">← home</a><a href="docs.html">docs</a></nav>'
+        f'</div></header>'
+        f'<main class="wrap">'
+        f'{matrix}'
+        f'<div class="section-head" style="margin-top:32px">All runs</div>'
+        f'<div class="flat-grid">{flat_cards}</div>'
+        f'</main>'
+    )
+    extra = """
+.matrix{width:100%;border-collapse:collapse;border:1px solid var(--pri);margin-top:6px}
+.matrix th,.matrix td{padding:10px 14px;border:1px solid var(--pri15);font-size:13px;vertical-align:top}
+.matrix thead th{background:var(--pri);color:var(--bg);font-weight:600;font-size:12px;text-align:center;border-color:var(--pri)}
+.matrix .row-head{background:var(--soft08);font-weight:600;font-size:13px;white-space:nowrap;border-color:var(--pri35);color:var(--pri)}
+.cell{background:var(--bg)}
+.cell a{display:flex;flex-direction:column;gap:4px;padding:6px 8px;margin:-6px -8px;border:1px solid transparent;transition:background var(--t),border-color var(--t);color:var(--fg)}
+.cell a:hover{background:var(--soft);border-color:var(--pri35);text-decoration:none}
+.cell-name{font-size:12px;font-weight:500;word-break:break-word}
+.cell-hint{font-size:11px;opacity:.6;color:var(--acc)}
+.cell-empty{text-align:center;opacity:.45;background:var(--pri08)}
+.flat-grid{display:flex;flex-wrap:wrap;gap:1px;background:var(--pri);border:1px solid var(--pri)}
+.flat-card{background:var(--bg);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:background var(--t),color var(--t);min-width:260px;flex:1;color:var(--fg)}
+.flat-card:hover{background:var(--soft);text-decoration:none}
+.flat-name{font-size:13px;word-break:break-word}
+.flat-hint{font-size:12px;color:var(--acc);flex-shrink:0}
+"""
+    (worktree / "experiments.html").write_text(
+        _page("PopcornBench experiments", body, refresh=True, extra_css=extra)
+    )
+
+
+def _build_index(worktree: Path, reports: list[tuple[str, Path]]) -> None:
+    """Generate every static page on the site."""
+    _build_homepage(worktree, n_reports=len(reports))
+    _build_experiments(worktree, reports)
+    _build_docs(worktree)
+
+
+def _build_docs(worktree: Path) -> None:
+    """Write the docs.html page (getting started + adding models + AlphaEvolve)."""
+    docs_src = REPO_ROOT / "scripts" / "_docs_page.html"
+    if docs_src.exists():
+        (worktree / "docs.html").write_text(docs_src.read_text())
 
 
 def _rebuild_reports(reports: list[tuple[str, Path]]) -> None:

@@ -301,7 +301,10 @@ def run_one(
             problem = dataset.get_problem_by_id(work.problem_id)
 
             # OpenAI client (gated on per-model semaphore)
-            raw_client = OpenAI(api_key=api_key, base_url=model_cfg["base_url"])
+            client_kwargs = {"api_key": api_key, "base_url": model_cfg["base_url"]}
+            if "request_timeout_s" in model_cfg:
+                client_kwargs["timeout"] = float(model_cfg["request_timeout_s"])
+            raw_client = OpenAI(**client_kwargs)
             client = RateLimitedClient(raw_client, sem)
 
             # Tools + cache dir
