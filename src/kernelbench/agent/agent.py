@@ -34,6 +34,7 @@ Loop, in words:
 from __future__ import annotations
 
 import json
+import os
 import time
 import traceback
 from typing import Any
@@ -682,6 +683,25 @@ class KernelAgent:
                     "tools": tool_schemas,
                     "tool_choice": "auto",
                 }
+                # Annotate every chat-completion call with run metadata so
+                # endpoint-side adapters (e.g. aeproxy) can write progress
+                # files into the trajectory dir and the website can render
+                # per-candidate detail. Servers that don't recognize the
+                # field ignore it.
+                if self.save_path:
+                    create_kwargs["extra_body"] = {
+                        "popcornbench_run_meta": {
+                            "run_name": self.run_name,
+                            "level": self.level,
+                            "problem_id": self.problem_id,
+                            "model": self.model,
+                            "turn_id": turn_idx,
+                            "trajectory_dir": os.path.dirname(self.save_path),
+                            "trajectory_basename": os.path.splitext(
+                                os.path.basename(self.save_path)
+                            )[0],
+                        }
+                    }
                 response = self.client.chat.completions.create(**create_kwargs)
             except Exception as e:
                 err_msg = f"{type(e).__name__}: {e}"

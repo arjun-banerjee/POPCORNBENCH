@@ -278,6 +278,25 @@ details[open] > summary::before { content: "▾ "; }
 .turn-collapse > summary::before { content: "▸ "; opacity: 0.5; }
 .turn-collapse[open] > summary::before { content: "▾ "; }
 
+/* AlphaEvolve evolution log */
+.ae-progress {
+  border: 1px solid var(--g35); margin: 18px 0;
+  background: var(--soft); /* warm yellow accent so it stands out */
+}
+.ae-progress > summary {
+  padding: 12px 16px; cursor: pointer; font-size: 13px;
+  border-bottom: 1px solid var(--g35);
+}
+.ae-progress[open] > summary { border-bottom: 1px solid var(--g35); }
+.ae-list { padding: 8px 12px; background: var(--w); }
+.ae-cand { margin: 4px 0; }
+.ae-cand > summary {
+  padding: 6px 4px; font-size: 12px; display: flex; gap: 10px;
+  align-items: center; flex-wrap: wrap;
+}
+.ae-idx { font-weight: 500; opacity: 0.85; }
+.ae-meta { font-size: 11px; opacity: 0.55; font-style: italic; margin-left: auto; }
+
 .role-tag {
   display: inline-block;
   font-size: 10px; padding: 0 5px; margin-right: 6px;
@@ -840,10 +859,89 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str,
             f'<pre class="block">{html.escape(submitted)}</pre></details>'
         )
 
+    ae_progress_block = _render_ae_progress(d)
+
     body = (head + sitemap
             + f'<div class="page-wrap">{tldr}{metrics_html}{ref_block}'
-            f'{"".join(turns_html)}{kernel_block}</div>')
+            f'{ae_progress_block}{"".join(turns_html)}{kernel_block}</div>')
     return body
+
+
+def _render_ae_progress(d: dict) -> str:
+    """If aeprogress.jsonl sits next to this trajectory, render its candidates.
+
+    Each line is one AlphaEvolve candidate with its evaluation outcome and the
+    full evolved kernel source. The publisher rebuilds reports every cycle so
+    these update live as the AE search runs.
+    """
+    traj_path = d.get("_path")
+    if not traj_path:
+        return ""
+    progress_path = traj_path.replace("_trajectory.json", "_aeprogress.jsonl")
+    if not os.path.isfile(progress_path):
+        return ""
+
+    entries: list[dict] = []
+    try:
+        with open(progress_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return ""
+    if not entries:
+        return ""
+
+    n_compiled = sum(1 for e in entries if e.get("compiled"))
+    n_correct = sum(1 for e in entries if e.get("correct"))
+    best_speedup = max((e.get("speedup", 0.0) or 0.0) for e in entries)
+
+    rows = []
+    for e in entries:
+        idx = e.get("idx", "?")
+        compiled = bool(e.get("compiled"))
+        correct = bool(e.get("correct"))
+        speedup = float(e.get("speedup") or 0.0)
+        elapsed = float(e.get("elapsed_s") or 0.0)
+        if correct:
+            badge_cls, badge_text = "outcome-correct", f"correct · {speedup:.2f}x"
+        elif compiled:
+            badge_cls, badge_text = "outcome-incorrect", "compiled · incorrect"
+        else:
+            badge_cls, badge_text = "outcome-compile_fail", "compile/runtime fail"
+        err = e.get("error") or ""
+        kernel = e.get("kernel_src") or ""
+        n_lines = kernel.count("\n") + 1 if kernel else 0
+        program_name = e.get("program_name", "")
+        short_name = program_name.rsplit("/", 1)[-1] if program_name else f"#{idx}"
+        body_inner = (
+            (f'<div class="block tool-out fail" style="margin-bottom:6px"><b>error</b>\n{html.escape(err)}</div>'
+             if err else "")
+            + (f'<details><summary>kernel source ({n_lines:,} lines)</summary>'
+               f'<pre class="block">{html.escape(kernel)}</pre></details>' if kernel else "")
+        )
+        rows.append(
+            f'<details class="ae-cand"><summary>'
+            f'<span class="ae-idx">candidate {idx}</span> '
+            f'<span class="outcome-badge {badge_cls}">{badge_text}</span> '
+            f'<span class="ae-meta">@ {elapsed:.0f}s · {html.escape(short_name)}</span>'
+            f'</summary>{body_inner}</details>'
+        )
+
+    return (
+        '<details class="ae-progress" open>'
+        '<summary><b>AlphaEvolve evolution log</b> · '
+        f'{len(entries)} candidates · '
+        f'{n_compiled} compiled · {n_correct} correct · '
+        f'best {best_speedup:.2f}x</summary>'
+        f'<div class="ae-list">{"".join(rows)}</div>'
+        '</details>'
+    )
 
 
 # ---------------------------------------------------------------------------
