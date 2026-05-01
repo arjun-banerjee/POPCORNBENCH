@@ -46,9 +46,15 @@ def main() -> int:
         backend="cuda",
         precision="fp32",
     )
-    turn_warning = build_turn_warning_message(
+    # Two example states the agent can see late in a session: an early
+    # heads-up while there's still budget, and the final-turn nudge.
+    turn_warning_early = build_turn_warning_message(
         turns_remaining=2,
         tool_calls_remaining=5,
+    )
+    turn_warning_last = build_turn_warning_message(
+        turns_remaining=1,
+        tool_calls_remaining=1,
     )
 
     tools_payload = []
@@ -64,7 +70,8 @@ def main() -> int:
         "system_default": system_default,
         "system_all_tools": system_all,
         "problem_message": problem_msg,
-        "turn_warning": turn_warning,
+        "turn_warning_early": turn_warning_early,
+        "turn_warning_last": turn_warning_last,
         "tools": tools_payload,
     }
     json.dump(out, sys.stdout)

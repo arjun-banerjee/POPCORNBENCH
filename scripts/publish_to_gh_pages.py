@@ -503,7 +503,14 @@ def _build_prompts(worktree: Path) -> None:
         ),
         _section(
             "Turn-warning message (injected when budget runs low)",
-            _pre(data["turn_warning"]),
+            (
+                '<div class="prompt-label">Early — multiple turns still left'
+                ' (sample: 2 turns / 5 tool calls remaining)</div>'
+                + _pre(data["turn_warning_early"])
+                + '<div class="prompt-label">Last turn'
+                ' (sample: 1 turn / 1 tool call remaining)</div>'
+                + _pre(data["turn_warning_last"])
+            ),
         ),
     ]
 
@@ -580,6 +587,11 @@ main.wrap h2{font-family:"neue-kabel",sans-serif;font-weight:900;font-size:32px;
   font-size:10px;letter-spacing:.08em;text-transform:uppercase;opacity:.6;
   margin:6px 0 4px;
 }
+.prompt-label{
+  font-size:10px;letter-spacing:.08em;text-transform:uppercase;opacity:.6;
+  margin:6px 0 4px;
+}
+.prompt-label:not(:first-child){margin-top:14px}
 """
     (worktree / "prompts.html").write_text(
         _page("PopcornBench prompts", body, refresh=False, extra_css=extra)
