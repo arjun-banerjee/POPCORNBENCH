@@ -161,6 +161,8 @@ def _ensure_worktree(branch: str, worktree: Path) -> None:
 #   --acc:  brighter red, used for links/hover
 #   --soft: warm yellow accent (panels, hover backgrounds)
 # ---------------------------------------------------------------------------
+_TYPEKIT_LINK = '<link rel="stylesheet" href="https://use.typekit.net/bsk0vur.css">'
+
 _COMMON_CSS = """
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -169,19 +171,22 @@ _COMMON_CSS = """
   --pri08:rgba(144,16,16,.08); --pri35:rgba(144,16,16,.35); --t:80ms ease;
 }
 html,body{background:var(--bg);color:var(--fg);
-  font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:14px;line-height:1.55}
+  font-family:"calling-code",ui-monospace,Menlo,monospace;font-size:15px;line-height:1.6}
 a{color:var(--acc);text-decoration:none}
-a:hover{text-decoration:underline}
-header{border-bottom:2px solid var(--pri);padding-bottom:0;background:var(--bg)}
-header .wrap{padding:32px 24px 24px}
-h1{font-weight:700;font-size:32px;letter-spacing:-.02em;color:var(--pri)}
-.sub{font-size:13px;opacity:.7;margin-top:4px}
+a:hover{opacity:.65}
+header{border-bottom:1px solid var(--pri);padding-bottom:0;background:var(--bg)}
+header .wrap{padding:48px 24px 28px}
+h1{font-family:"orpheuspro",serif;font-weight:400;font-style:italic;font-size:54px;
+  letter-spacing:-.02em;color:var(--pri);line-height:1;margin-bottom:8px}
+.sub{font-family:"calling-code",sans-serif;font-style:italic;font-size:14px;
+  color:var(--pri);opacity:.55;margin-top:4px}
 .wrap{max-width:1000px;margin:0 auto;padding:0 24px}
-main.wrap{padding-top:28px;padding-bottom:48px}
-.section-head{font-size:11px;font-weight:600;letter-spacing:.08em;color:var(--pri);
-  text-transform:uppercase;margin-bottom:10px}
-nav.topnav{display:flex;gap:18px;margin-top:14px;font-size:13px}
-nav.topnav a{color:var(--pri);font-weight:600}
+main.wrap{padding-top:32px;padding-bottom:56px}
+.section-head{font-size:11px;font-style:italic;letter-spacing:.08em;color:var(--pri);
+  text-transform:uppercase;margin-bottom:12px;opacity:.65}
+nav.topnav{display:flex;gap:16px;margin-top:14px;font-size:13px;font-style:italic}
+nav.topnav a{color:var(--pri);opacity:.6;border-bottom:1px solid transparent;padding-bottom:1px}
+nav.topnav a:hover{opacity:1}
 """
 
 
@@ -191,6 +196,7 @@ def _page(title: str, body: str, *, refresh: bool = False, extra_css: str = "") 
         f"<!DOCTYPE html><html lang=en><head><meta charset=utf-8>"
         f"<meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{html.escape(title)}</title>{refresh_meta}"
+        f"{_TYPEKIT_LINK}"
         f"<style>{_COMMON_CSS}{extra_css}</style></head>"
         f"<body>{body}</body></html>"
     )
@@ -233,7 +239,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 .hero-card{display:block;padding:22px 24px;border:2px solid var(--pri);background:var(--bg);
   color:var(--fg);text-decoration:none;transition:background var(--t),color var(--t);position:relative}
 .hero-card:hover{background:var(--soft);text-decoration:none}
-.hero-name{font-size:18px;font-weight:700;color:var(--pri)}
+.hero-name{font-family:"orpheuspro",serif;font-weight:400;font-style:italic;font-size:26px;color:var(--pri);letter-spacing:-.01em}
 .hero-hint{font-size:12.5px;opacity:.75;margin-top:6px}
 .hero-arrow{position:absolute;top:18px;right:22px;font-size:18px;color:var(--pri)}
 """
