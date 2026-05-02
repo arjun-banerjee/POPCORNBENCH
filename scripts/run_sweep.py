@@ -729,6 +729,27 @@ def main():
     if rep_cfg.get("enabled", True):
         _start_report_thread(run_dir, int(rep_cfg.get("refresh_seconds", 30)), stop_event)
 
+    # Periodic queue-depth logger so it's obvious whether all GPUs are
+    # being kept busy or one queue is hogging all the work.
+    if use_eval_queue:
+        def _log_queue_depths():
+            while not stop_event.is_set():
+                try:
+                    depths = []
+                    for i, q in enumerate(eval_request_qs):
+                        if q is not None:
+                            try:
+                                depths.append((i, q.qsize()))
+                            except NotImplementedError:
+                                pass  # qsize unsupported on macOS
+                    if depths:
+                        msg = "  ".join(f"gpu{i}={d}" for i, d in depths)
+                        print(f"[eval_q]  queue depths: {msg}", flush=True)
+                except Exception:
+                    pass
+                stop_event.wait(60)
+        threading.Thread(target=_log_queue_depths, daemon=True).start()
+
     # Optional live HTTP server for the report.
     if rep_cfg.get("serve", True):
         try:

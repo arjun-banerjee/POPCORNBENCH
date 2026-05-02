@@ -73,6 +73,40 @@ def run_eval_server(
             ready_event.set()
         return
 
+    # Belt-and-suspenders: explicitly pin via torch.cuda.set_device too. If
+    # CUDA_VISIBLE_DEVICES took effect, this is a no-op (only one device is
+    # visible, and it's already cuda:0). If it did NOT take effect (e.g.
+    # parent's torch already initialized CUDA at script import time),
+    # set_device(gpu_id) still routes work to the right physical GPU.
+    visible = torch.cuda.device_count()
+    if visible == 1:
+        # Pinning worked: this process sees only one GPU, which is gpu_id.
+        torch.cuda.set_device(0)
+        physical_gpu = gpu_id
+    else:
+        # Pinning didn't take effect; fall back to set_device on the requested
+        # gpu_id. This also serves as a clear signal in the log.
+        torch.cuda.set_device(gpu_id)
+        physical_gpu = gpu_id
+        logger.warning(
+            "[eval_server gpu=%d] CUDA_VISIBLE_DEVICES=%s did not restrict "
+            "device count (saw %d devices); falling back to "
+            "torch.cuda.set_device(%d).",
+            gpu_id,
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            visible,
+            gpu_id,
+        )
+
+    try:
+        dev_name = torch.cuda.get_device_name(0)
+    except Exception:
+        dev_name = "?"
+    logger.info(
+        "[eval_server gpu=%d] pinned to physical GPU %d (%s), visible=%d",
+        gpu_id, physical_gpu, dev_name, visible,
+    )
+
     # Imports that must follow torch (and therefore CUDA_VISIBLE_DEVICES).
     from kernelbench.agent.tools import (
         ToolContext,
