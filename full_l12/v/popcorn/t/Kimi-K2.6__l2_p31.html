@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 31</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · full_l12</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-02 01:01:27 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 31</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · full_l12</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-02 01:03:33 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">31_FusedMLAAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -91,5 +91,112 @@ def get_inputs():
 
 def get_init_inputs():
     return []
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 49.5s · 9,081 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 49.5s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We&#x27;re dealing with a fused attention-like operation: for each sequence position t, we attend to all previous positions s&lt;=t. Keys and values are computed by projecting kv_latent via w_up_k and w_up_v. This is basically a batched, multi-head causal attention with dynamic k/v.
+
+We need to write a custom CUDA kernel and load it via torch.utils.cpp_extension.load_inline.
+
+First, let&#x27;s think about the algorithm and how to optimize.
+
+The reference is O(batch * seq_len^2 * num_heads * (rank + head_dim)). But note that for each t, we compute k and v for all s&lt;=t, then do dot product with q[b,t,h], softmax, etc.
+
+In a naive kernel, each thread or block handles one (b, h, t). Then within that, it loops over s from 0 to t, computing k and v on the fly.
+
+However, we can be smarter. Notice that the computation for a fixed (b, h) across all t can be computed incrementally.
+
+For each (b, h):
+- We have q of shape (seq_len, head_dim).
+- We have kv_latent of shape (seq_len, rank).
+- w_up_k[:, h] is (rank, head_dim).
+- w_up_v[:, h] is (rank, head_dim).
+
+The operation for each t:
+  logits_t[s] = q[b,t,h] dot (kv_latent[b,s] @ w_up_k[:,h]) * scale
+  values_t[s] = kv_latent[b,s] @ w_up_v[:,h]
+  attn_t = softmax over s=0..t of logits_t
+  out[b,t,h] = sum_{s=0..t} attn_t[s] * values_t[s]
+
+This is causal. We could compute an incremental prefix sum, but because softmax is non-linear (requires the max and sum of exponentials), we need to compute it carefully.
+
+However, seq_len is only 32. This is very small. Even a naive kernel that loops over s per (b,h,t) might be fine. But we need to be faster than the PyTorch reference. The reference uses Python loops and stacks tensors, which is extremely slow on GPU due to kernel launch overhead and memory allocation. So a single fused CUDA kernel will be orders of magnitude faster.
+
+But to get the most speed, we should handle the small seq_len by having each block handle one (b, h, t) or one (b, h) or even one (b, h, tile).
+
+Since seq_len=32, head_dim=16, rank=24, num_heads=4, batch=2. So total elements are tiny. The overhead of kernel launch might dominate if we launch too few blocks. We should launch enough blocks to saturate the GPU.
+
+If we launch one block per (b, h, t), that&#x27;s 2*4*32 = 256 blocks. On a modern GPU that might be okay, but each block does very little work. Each block needs to loop over up to 32 s. For each s, it does a matvec of rank x head_dim (24x16). That&#x27;s 24*16=384 multiply-adds. So total FLOPs per block ~ O(t * rank * head_dim) = up to 32*384 = 12288. That&#x27;s tiny. But still, 256 blocks of ~12k ops is ~3M FLOPs. Memory bandwidth is also small.
+
+Actually, wait: For each (b,h,t), we need to compute k_s and v_s for each s. Since w_up_k and w_up_v are shared across s for a given h, we could precompute something? Let&#x27;s re-express:
+
+Let K_s = kv_latent[b,s] @ w_up_k[:,h] -&gt; shape (head_dim,)
+Let V_s = kv_latent[b,s] @ w_up_v[:,h] -&gt; shape (head_dim,)
+
+So for fixed (b,h), K and V are just linear projections of kv_latent across the sequence. We could compute all K and V first: K = kv_latent @ w_up_k[:,h] -&gt; (seq_len, head_dim). Similarly V = kv_latent @ w_up_v[:,h] -&gt; (seq_len, head_dim). Then for each t, do causal attention with K[:t+1] and V[:t+1] and q[t].
+
+This is much more efficient because the projection per s would be reused across all t. The reference recomputes K_s and V_s for each t separately. But our kernel doesn&#x27;t have to follow the same operations, just produce equivalent output.
+
+So the optimized approach:
+1. For each (b, h), compute K[b,h,s,:] = kv_latent[b,s] @ w_up_k[:,h] and V[b,h,s,:] = kv_latent[b,s] @ w_up_v[:,h].
+2. Then for each (b, h, t), compute attention over s=0..t:
+   - logits[s] = dot(q[b,t,h], K[b,h,s]) * scale
+   - softmax
+   - out = sum_s attn[s] * V[b,h,s]
+
+Since seq_len is 32 and head_dim is 16, we can store K and V in shared memory or registers.
+
+But we can also fuse everything into one kernel. Since seq_len is small, we can have each block compute one (b, h). That block would:
+- Load w_up_k[:,h] and w_up_v[:,h] into shared memory (rank x head_dim = 24*16 = 384 floats = 1536 bytes). Or maybe registers.
+- Compute K_s and V_s for all s in seq_len. Since seq_len=32, head_dim=16, rank=24, we can store K and V in shared memory: 32*16*2 = 1024 floats = 4KB. That&#x27;s perfect.
+- Then for each t from 0 to seq_len-1, compute logits for s=0..t, softmax, and weighted sum of V.
+
+If each block handles one (b, h), we launch 2*4=8 blocks. That&#x27;s too few for GPU occupancy. Modern GPUs have many SMs (e.g., 80+). 8 blocks means most SMs are idle. But the problem likely runs on a GPU with many SMs. We need more parallelism.
+
+So we can assign multiple blocks per (b,h), perhaps each block handles a tile of t. Or each block handles one (b,h,t) but do the projection K,V on the fly? Let&#x27;s think.
+
+If we launch one block per (b,h,t): 256 blocks. Each block&#x27;s work:
+- Loop s=0..t:
+  - Compute k = kv_latent[b,s] @ w_up_k[:,h] (rank x head_dim -&gt; 24*16 = 384 MADs). Since kv_latent is loaded from global memory.
+  - Compute v = kv_latent[b,s] @ w_up_v[:,h] (384 MADs).
+  - Compute dot(q[b,t,h], k) (16 MADs).
+  - Store v and logit.
+- Then softmax over t+1 elements.
+- Weighted sum of v&#x27;s.
+
+Total MADs per block: (t+1)*(384+384+16) + (t+1) (softmax + sum). For t=31, ~793*32 ≈ 25k MADs. 256 blocks =&gt; ~6.5M MADs. That&#x27;s tiny but still much larger than Python overhead. On GPU, each block can run very fast.
+
+But the problem is memory: for each block, we load q[b,t,h] once, and for each s we load kv_latent[b,s] (24 floats) and w_up_k/w_up_v from constant/shared memory. Since w_up_k and w_up_v are shared per h across all blocks, but if each block loads them independently from global memory, it&#x27;s okay because they are tiny (24*16*4*2 = 3072 bytes per h, total ~12KB). They will likely stay in L2 cache.
+
+Alternatively, each thread block can load w_up_k and w_up_v into shared memory.
+
+Given seq_len=32 is small, we can have each block handle a chunk of t&#x27;s or a chunk of b&#x27;s.
+
+Actually, we can process each (b,h) with a single warp or a small block. To get enough blocks, we can process multiple (b,h) per block? No, that reduces parallelism. Wait, we want many blocks. The maximum independent units are batch * num_heads * seq_len = 256. If we need more, we could also split head_dim across threads, but head_dim=16 is small.
+
+Alternatively, we could have each warp handle one (b,h,t), and a block contain multiple warps handling different (b,h,t). But that&#x27;s more complex. Let&#x27;s start with one block per (b,h,t). With 256 blocks, if we use a block size of, say, 32 or 64 threads, that&#x27;s 256 blocks. A GPU with 80 SMs can handle 80 blocks concurrently. 256 blocks is enough to fill the GPU if each block takes some time.
+
+But each block does ~25k MADs. A GPU can do ~20 TFLOPS, so each block takes ~1.2 microseconds? Actually, 25k MADs is 50k FLOPs. GPU FP32 throughput is maybe 20e12 FLOP/s, so one block takes 2.5e-9 seconds? That&#x27;s way too small; memory latency will dominate. So we need more work per block.
+
+Thus, fusing the projection for all t in a (b,h) is better. If each block handles one (b,h), it computes all K and V for seq_len positions (2 * 32 * 384 = 24k MADs), then computes attention for all 32 t (each t does softmax over up to 32 and sum). The attention part is memory-bound but small. Total MADs per block: 24k + 32*(softmax+sum). Softmax per t: t+1 dot products (already computed) but we still need to compute exp and sum. That&#x27;s negligible.
+
+So total work per block is ~25k MADs. Still small, but at least we launch only 8 blocks. 8 blocks on 80 SMs is terrible. However, maybe the GPU is smaller? Let&#x27;s check specs. I can call get_gpu_specs. Let&#x27;s do that.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
 </body></html>
