@@ -701,28 +701,42 @@ def main():
     if use_eval_queue:
         from kernelbench.agent.eval_server import run_eval_server
         eval_request_qs = [manager.Queue() for _ in range(num_gpus)]
-        # Each entry is a dict so the supervisor can update `proc` after a
-        # respawn without invalidating the rest of the bookkeeping.
         eval_server_recs: list = []
-        for gpu_id in range(num_gpus):
-            ready = manager.Event()
-            p = mp.Process(
-                target=run_eval_server,
-                args=(gpu_id, eval_request_qs[gpu_id], ready),
-                daemon=False,
-                name=f"eval_server_gpu{gpu_id}",
-            )
-            p.start()
-            eval_server_recs.append({
-                "proc": p,
-                "gpu_id": gpu_id,
-                "request_q": eval_request_qs[gpu_id],
-                "ready": ready,
-                "respawns": 0,
-            })
-            eval_server_procs.append((p, ready))  # legacy tuple list for shutdown
-        # Wait for every server to import torch + tools and signal ready.
-        # ~5-10s on a cold venv; happens once per sweep.
+
+        # Save the parent's current CUDA_VISIBLE_DEVICES so we can restore
+        # it after spawning. We deliberately set the env var to the target
+        # GPU BEFORE each spawn so the child inherits the right value at
+        # process-creation time, when torch's CUDA init is guaranteed to
+        # see only one device. Setting the env var inside the child after
+        # spawn was unreliable because the spawn-child re-imports
+        # run_sweep.py, and any code path that touches torch.cuda before
+        # our function runs locks in the device topology.
+        _saved_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        try:
+            for gpu_id in range(num_gpus):
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                ready = manager.Event()
+                p = mp.Process(
+                    target=run_eval_server,
+                    args=(gpu_id, eval_request_qs[gpu_id], ready),
+                    daemon=False,
+                    name=f"eval_server_gpu{gpu_id}",
+                )
+                p.start()
+                eval_server_recs.append({
+                    "proc": p,
+                    "gpu_id": gpu_id,
+                    "request_q": eval_request_qs[gpu_id],
+                    "ready": ready,
+                    "respawns": 0,
+                })
+                eval_server_procs.append((p, ready))
+        finally:
+            if _saved_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cvd
+
         for rec in eval_server_recs:
             rec["ready"].wait(timeout=120)
         print(f"  eval queue: {num_gpus} per-GPU FIFO server(s) ready")
@@ -752,24 +766,33 @@ def main():
                 for rec in eval_server_recs:
                     p = rec["proc"]
                     if not p.is_alive():
-                        # Reap and respawn.
                         try:
                             p.join(timeout=1)
                         except Exception:
                             pass
                         rec["respawns"] += 1
+                        # Same env-var trick as the initial spawn: set
+                        # CUDA_VISIBLE_DEVICES in the parent so the child
+                        # inherits it at process creation time.
+                        _saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+                        os.environ["CUDA_VISIBLE_DEVICES"] = str(rec["gpu_id"])
                         new_ready = manager.Event()
-                        new_p = mp.Process(
-                            target=_run_eval_server,
-                            args=(rec["gpu_id"], rec["request_q"], new_ready),
-                            daemon=False,
-                            name=f"eval_server_gpu{rec['gpu_id']}",
-                        )
-                        new_p.start()
+                        try:
+                            new_p = mp.Process(
+                                target=_run_eval_server,
+                                args=(rec["gpu_id"], rec["request_q"], new_ready),
+                                daemon=False,
+                                name=f"eval_server_gpu{rec['gpu_id']}",
+                            )
+                            new_p.start()
+                        finally:
+                            if _saved is None:
+                                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                            else:
+                                os.environ["CUDA_VISIBLE_DEVICES"] = _saved
                         new_ready.wait(timeout=120)
                         rec["proc"] = new_p
                         rec["ready"] = new_ready
-                        # Track the new process for shutdown too.
                         eval_server_procs.append((new_p, new_ready))
                         print(
                             f"[eval_q] gpu={rec['gpu_id']} eval server "

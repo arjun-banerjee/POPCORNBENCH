@@ -40,9 +40,13 @@ _CUDA_FATAL_PATTERNS = (
     "an illegal instruction was encountered",
     "device-side assert",
     "misaligned address",
+    "operation not supported on global/shared",
+    "invalidaddressspace",
     "cudaerrorillegaladdress",
     "cudaerrorillegal",
     "cudaerrorlaunchfailure",
+    "cudaerrorinvalidaddressspace",
+    "an unspecified internal error",
 )
 
 
