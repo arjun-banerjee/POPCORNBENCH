@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import queue as _queue
+import time
 import uuid
 from typing import Any
 
@@ -95,31 +96,38 @@ class EvalRPCClient:
                 metadata={"error": str(e)},
             )
 
-        # Drain the response queue until we see OUR id. Defensive: under
-        # normal operation each agent has its own response queue and never
-        # sees a stranger's reply, but on a sweep restart a stale entry
-        # could linger. Skip those instead of treating them as ours.
-        deadline_s = self._default_timeout_s
+        # Drain the response queue until we see OUR id. Defensive cases:
+        #   1. On a sweep restart a stale entry could linger from a prior
+        #      worker — different rid, just skip it.
+        #   2. If a SIGALRM (work-item soft timeout) fires while we're
+        #      blocked inside a Manager-queue get(), the proxy's recv() is
+        #      interrupted mid-protocol and the underlying socket is left
+        #      in a half-read state. Subsequent get() calls then return
+        #      None (or other garbage that won't unpack as a 3-tuple).
+        #      We can't fix the corruption from here, but we can prevent
+        #      it from poisoning every later RPC for this worker: skip
+        #      malformed payloads and keep waiting against an absolute
+        #      deadline, so we still time out cleanly.
+        end_at = time.monotonic() + self._default_timeout_s
         while True:
+            remaining = end_at - time.monotonic()
+            if remaining <= 0:
+                return _timeout_result(kind, self._default_timeout_s, return_aux)
             try:
-                payload = self._response_q.get(timeout=deadline_s)
+                payload = self._response_q.get(timeout=remaining)
             except _queue.Empty:
-                err = f"{kind}_kernel FAILED: eval server did not respond within {self._default_timeout_s}s"
-                logger.warning("[eval_client] %s", err)
-                result = ToolResult(
-                    tool_name=f"{kind}_kernel",
-                    success=False,
-                    output=err,
-                    metadata={"error": "eval_rpc_timeout"},
-                )
-                if return_aux:
-                    return result, None
-                return result
+                return _timeout_result(kind, self._default_timeout_s, return_aux)
 
-            try:
-                rid_resp, status, data = payload
-            except Exception as e:
-                return _err_result(kind, f"malformed response: {e}", return_aux)
+            if not isinstance(payload, tuple) or len(payload) != 3:
+                logger.warning(
+                    "[eval_client] discarding malformed payload (%r) "
+                    "while waiting for %s; queue may be poisoned by a "
+                    "prior signal-interrupted get()",
+                    type(payload).__name__, rid,
+                )
+                continue
+
+            rid_resp, status, data = payload
 
             if rid_resp == rid:
                 break
@@ -151,13 +159,15 @@ class EvalRPCClient:
         return result
 
 
-def _err_result(kind: str, msg: str, return_aux: bool):
+def _timeout_result(kind: str, timeout_s: int, return_aux: bool):
     from kernelbench.agent.tools import ToolResult
+    err = f"{kind}_kernel FAILED: eval server did not respond within {timeout_s}s"
+    logger.warning("[eval_client] %s", err)
     result = ToolResult(
         tool_name=f"{kind}_kernel",
         success=False,
-        output=f"{kind}_kernel FAILED: {msg}",
-        metadata={"error": msg},
+        output=err,
+        metadata={"error": "eval_rpc_timeout"},
     )
     if return_aux:
         return result, None
