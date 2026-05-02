@@ -845,11 +845,15 @@ def _render_tier_picker(d: dict, current_run: str,
     `sibling_tiers` is {tier: run_name}. Links use relative paths that
     work both in the local report (one level up) and on gh-pages (where
     sibling runs are siblings at the gh-pages root).
+
+    Always rendered when the current run matches a tier-naming scheme
+    (l12_single / l12_default / l12_all / l34_*), even if no siblings
+    are on disk yet — missing tiers render as disabled tabs so the
+    structure is visible from the first run.
     """
-    if not sibling_tiers:
-        return ""
     current_row, current_tier = _classify_run_for_tier(current_run)
     if current_tier is None:
+        # The run name doesn't match our tier scheme; nothing to render.
         return ""
     # Always include the current run as the "active" tile, even if it isn't
     # in sibling_tiers (it isn't, since we discovered siblings only).
