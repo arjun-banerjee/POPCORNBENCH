@@ -28,6 +28,57 @@ from typing import Any
 REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# Tier picker: kept in sync with publish_to_gh_pages.py._classify_run.
+# Each entry is (suffix, label). The suffix matches the tail of a run name;
+# everything before the suffix is the "row" (e.g. l12, l34).
+_TIER_SUFFIXES = (
+    ("_single", "single"),
+    ("_default", "default"),
+    ("_all", "all"),
+)
+
+
+def _classify_run_for_tier(name: str) -> tuple[str | None, str | None]:
+    """Return (row, tier) if `name` matches the new naming, else (None, None)."""
+    for suffix, tier in _TIER_SUFFIXES:
+        if name.endswith(suffix):
+            row = name[: -len(suffix)]
+            if row.startswith("cuda_"):
+                row = row[len("cuda_"):]
+            return row, tier
+    return None, None
+
+
+def _discover_sibling_tiers(run_dir: str, run_name: str) -> dict[str, str]:
+    """Return {tier_label: sibling_run_name} for sibling runs sharing this row.
+
+    Looks at the parent directory of `run_dir` (typically `runs/`) for other
+    run dirs whose name matches the same row prefix. Used to render the
+    tier-picker on each trajectory page so reviewers can jump from
+    `l12_default` to `l12_single` or `l12_all` for the same problem with
+    one click.
+    """
+    row, _ = _classify_run_for_tier(run_name)
+    if row is None:
+        return {}
+    parent = os.path.dirname(os.path.abspath(run_dir))
+    if not os.path.isdir(parent):
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for entry in os.listdir(parent):
+            sib_row, sib_tier = _classify_run_for_tier(entry)
+            if sib_row == row and sib_tier is not None:
+                # Only include if a report dir exists, since the tier-picker
+                # links assume the gh-pages layout where sibling reports
+                # live as siblings under the root.
+                if os.path.isdir(os.path.join(parent, entry)):
+                    out[sib_tier] = entry
+    except OSError:
+        pass
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Style — distilled from mlab/bv-registry/web/style.css
 # ---------------------------------------------------------------------------
@@ -277,6 +328,30 @@ details[open] > summary::before { content: "▾ "; }
 .turn-collapse[open] > summary { opacity: 1; }
 .turn-collapse > summary::before { content: "▸ "; opacity: 0.5; }
 .turn-collapse[open] > summary::before { content: "▾ "; }
+
+/* tier-picker — cross-tier nav for the same problem */
+.tier-picker {
+  display: flex; align-items: center; gap: 8px;
+  margin: 14px 0 6px;
+  font-size: 12px;
+}
+.tier-picker-label {
+  font-style: italic; opacity: 0.55; letter-spacing: 0.06em;
+  margin-right: 4px;
+}
+.tier-tab {
+  padding: 4px 12px; border: 1px solid var(--g35);
+  text-decoration: none; color: var(--g);
+  font-size: 13px; transition: background var(--t), color var(--t);
+}
+.tier-tab:hover { background: var(--soft); }
+.tier-tab.current {
+  background: var(--g); color: var(--bg); border-color: var(--g);
+  font-weight: 600;
+}
+.tier-tab.disabled {
+  opacity: 0.32; cursor: not-allowed; font-style: italic;
+}
 
 /* AlphaEvolve evolution log */
 .ae-progress {
@@ -763,8 +838,67 @@ def _safe_filename(s: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)
 
 
+def _render_tier_picker(d: dict, current_run: str,
+                        sibling_tiers: dict[str, str]) -> str:
+    """Render the cross-tier nav strip on a trajectory page.
+
+    `sibling_tiers` is {tier: run_name}. Links use relative paths that
+    work both in the local report (one level up) and on gh-pages (where
+    sibling runs are siblings at the gh-pages root).
+    """
+    if not sibling_tiers:
+        return ""
+    current_row, current_tier = _classify_run_for_tier(current_run)
+    if current_tier is None:
+        return ""
+    # Always include the current run as the "active" tile, even if it isn't
+    # in sibling_tiers (it isn't, since we discovered siblings only).
+    tiers_to_show = dict(sibling_tiers)
+    tiers_to_show[current_tier] = current_run
+
+    variant = d.get("_variant", "default")
+    model = d.get("model_name") or d["_model_dir"]
+    traj_id = _trajectory_id(d)
+    # From a trajectory page at:
+    #   {root}/{run_name}/v/{variant}/t/{traj_id}.html
+    # the path to the sibling run's same trajectory is:
+    #   ../../../../{sibling}/v/{variant}/t/{traj_id}.html
+    parts = []
+    for tier_key in ("single", "default", "all"):
+        sibling_run = tiers_to_show.get(tier_key)
+        label = {
+            "single": "single",
+            "default": "default",
+            "all": "all",
+        }[tier_key]
+        if sibling_run is None:
+            parts.append(
+                f'<span class="tier-tab disabled">{label}</span>'
+            )
+        elif tier_key == current_tier:
+            parts.append(
+                f'<span class="tier-tab current">{label}</span>'
+            )
+        else:
+            href = (
+                f'../../../../{html.escape(sibling_run)}/v/'
+                f'{html.escape(_safe_filename(variant))}/t/'
+                f'{html.escape(traj_id)}.html'
+            )
+            parts.append(
+                f'<a class="tier-tab" href="{href}">{label}</a>'
+            )
+    return (
+        '<div class="tier-picker">'
+        '<span class="tier-picker-label">tier:</span>'
+        + "".join(parts) +
+        '</div>'
+    )
+
+
 def _render_trajectory(d: dict, run_name: str, generated_at: str,
-                       by_variant: dict[str, list[dict]] | None = None) -> str:
+                       by_variant: dict[str, list[dict]] | None = None,
+                       sibling_tiers: dict[str, str] | None = None) -> str:
     fr = d.get("final_result") or {}
     sp = _speedup(d)
     sp_str = f"{sp:.2f}x" if sp is not None else "—"
@@ -861,8 +995,10 @@ def _render_trajectory(d: dict, run_name: str, generated_at: str,
 
     ae_progress_block = _render_ae_progress(d)
 
+    tier_picker = _render_tier_picker(d, run_name, sibling_tiers or {})
+
     body = (head + sitemap
-            + f'<div class="page-wrap">{tldr}{metrics_html}{ref_block}'
+            + f'<div class="page-wrap">{tier_picker}{tldr}{metrics_html}{ref_block}'
             f'{ae_progress_block}{"".join(turns_html)}{kernel_block}</div>')
     return body
 
@@ -1235,6 +1371,10 @@ def build_report(run_dir: str) -> None:
     run_name = os.path.basename(os.path.normpath(run_dir))
     report_dir = os.path.join(run_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
+    sibling_tiers = _discover_sibling_tiers(run_dir, run_name)
+    if sibling_tiers:
+        _siblings_str = ", ".join(f"{t}->{n}" for t, n in sibling_tiers.items())
+        print(f"[build_report] sibling tiers for cross-tier nav: {_siblings_str}")
 
     # CSS
     with open(os.path.join(report_dir, "style.css"), "w") as f:
@@ -1278,7 +1418,9 @@ def build_report(run_dir: str) -> None:
 
         # per-trajectory pages
         for d in vtrajs:
-            body = _render_trajectory(d, run_name, generated_at, by_variant=by_variant)
+            body = _render_trajectory(d, run_name, generated_at,
+                                      by_variant=by_variant,
+                                      sibling_tiers=sibling_tiers)
             path = os.path.join(vdir, "t", f"{_trajectory_id(d)}.html")
             with open(path, "w") as f:
                 f.write(_page(f"L{d.get('level')} P{d.get('problem_id')} · {variant}",
