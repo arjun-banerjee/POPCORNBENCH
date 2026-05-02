@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 50</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · full_l12</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-02 03:49:12 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 50</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · full_l12</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-02 03:51:20 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">50_HiddenMarkovForward.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -89,5 +89,889 @@ def get_inputs():
 
 def get_init_inputs():
     return [num_states, num_obs]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 145.9s · 55,296 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 145.9s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to replace PyTorch forward with a custom CUDA kernel. The reference is a Hidden Markov Model forward algorithm in log-space. It does:
+
+- normalize log_init (S) and log_trans (S,S) and log_emit (S, O).
+- For each batch element b and time t:
+    - log_alpha_{b,s} initially is log_pi[s] + log_B[s, obs_{b,0}]
+    - For t=1..T-1:
+        - compute new log_alpha_{b,j} = logsumexp_i (log_alpha_{b,i} + log_A[i,j]) + log_B[j, obs_{b,t}]
+- final log_lik = logsumexp_s log_alpha_{b,s}
+
+We have S=16, O=64, T=128, B=64. These are small dimensions, but there is a sequential loop over T. Computation per step is B * S * S add + logsumexp over S. So total operations ~ B * T * S^2 ~ 64*128*256 = 2,097,152 operations. Memory is small (S^2=256, S*O=1024). So bottleneck is likely kernel launch overhead and sequential dependencies. Need to write a fused CUDA kernel that performs the entire forward pass for all batch elements, to avoid Python loop and multiple kernel launches.
+
+Possibly we can process one time step per kernel launch, but ideally a single kernel launch that loops over T internally. Since T=128 and dimensions small, maybe one block per batch element (B=64), with threads across S (16). Use shared memory for log_A (S,S), log_emit for current observations maybe reading from global. Use warp-level reductions for logsumexp.
+
+We need to ensure numerical equivalence. logsumexp using max-subtraction trick.
+
+The parameters are nn.Parameter (torch tensors). In ModelNew forward, we can fetch self.log_init, self.log_trans, self.log_emit, call _normalize_log maybe on CPU or in CUDA. The normalization can be done on CPU because small, and then passed to kernel. However, _normalize_log uses logsumexp which is straightforward. Then call custom CUDA op with observations and normalized params.
+
+We need to write a custom CUDA kernel using torch.utils.cpp_extension.load_inline.
+
+Plan:
+
+ModelNew class:
+- __init__ same as Model.
+- In forward:
+    - Compute log_pi, log_A, log_B via _normalize_log (PyTorch ops). They are small; can do on CPU or GPU.
+    - Ensure they are contiguous float32 tensors.
+    - Call cuda extension forward_hmm(observations, log_pi, log_A, log_B) -&gt; log_lik (B,).
+    
+CUDA kernel:
+We have B batch, T time, S states.
+Observations: int64 tensor (B, T) maybe int32? In reference, observations are long tensor (int64). Kernel can accept int64 or int32 indices. In CUDA, long long. Since O=64 small, we could pass as int.
+
+log_A: (S,S) float.
+log_B: (S,O) float.
+log_pi: (S,) float.
+
+Algorithm per batch element b:
+    - Load log_pi into registers or shared memory.
+    - For t=0:
+        - o = observations[b,0]
+        - for s in 0..S-1:
+            alpha_s = log_pi[s] + log_B[s, o]
+        - store alpha vector in registers or shared mem.
+    - For t=1..T-1:
+        - o = observations[b,t]
+        - For each next state j (0..S-1):
+            - compute max over i of alpha_i + log_A[i,j]
+            - compute logsumexp = max + log(sum_i exp(alpha_i + log_A[i,j] - max))
+            - new_alpha_j = logsumexp + log_B[j, o]
+        - swap alpha and new_alpha.
+    - After loop, compute logsumexp over alpha_i to get log_lik[b].
+
+Parallelism:
+- Since S=16 small, maybe assign one thread per state j (16 threads). Each block handles one batch element. So blockDim.x = S (or maybe 32 for warp). Use 32 threads but only first S active. Blocks = B.
+- Use shared memory per block for:
+    - alpha_i (S floats)
+    - new_alpha_j (S floats)
+    - log_A_transposed? Since each thread j needs alpha_i + log_A[i,j] for all i. To avoid bank conflicts, perhaps store log_A in shared memory as (S,S). Since S=16, it&#x27;s tiny. Load from global to shared once per block.
+- Also need log_B. O=64, S=16. Could load full log_B into shared? That&#x27;s 1024 floats ~ 4KB. Fine. Or each thread loads log_B[j, o] on demand.
+
+Since observations differ per batch element, we need for each t to read observation for each block. We can store observations in global memory and each thread reads the same obs index.
+
+Because T=128, we have 64 blocks, each of 16 threads. GPU occupancy is high.
+
+Using single kernel with a loop over t.
+
+Implementation details:
+- Observations as int64_t* obs; shape (B,T). Index: b*T + t.
+- log_A as float* A; shape (S,S). row-major: i*S + j.
+- log_B as float* Bmat; shape (S,O). row-major: s*O + o.
+- log_pi as float* pi; shape (S,).
+
+Per block:
+    - Allocate __shared__ float s_alpha[STATES];
+    - __shared__ float s_new_alpha[STATES];
+    - __shared__ float s_A[STATES*STATES];
+    - Optionally __shared__ float s_B[STATES*NUM_OBS]; but we can just read global.
+    
+    - Thread idx &lt; STATES:
+        - Load s_A[i*S + tid] for i=0..S-1? Better have all threads cooperatively load A. Since S*S=256, with 16 threads, each loads 16 elements. Use for loop.
+        - Also maybe load log_pi into s_alpha? Could load into s_alpha[tid] = pi[tid].
+    - __syncthreads();
+
+    - Read obs_0 = obs[b*T + 0];
+    - s_alpha[tid] = s_pi[tid] + Bmat[tid*O + obs_0]; // if we store pi in shared.
+
+    - __syncthreads(); // maybe not needed if only thread tid writes s_alpha[tid].
+
+    - For t=1..T-1:
+        - obs_t = obs[b*T + t];
+        - Compute max_val over i: manually unroll or loop i=0..S-1:
+            max_val = -INFINITY;
+            sum = 0;
+            for i=0..S-1:
+                val = s_alpha[i] + s_A[i*S + tid];
+                if (val &gt; max_val) max_val = val;
+            // second loop
+            for i=0..S-1:
+                sum += expf(val - max_val); // careful compute val again
+            lse = max_val + logf(sum);
+            s_new_alpha[tid] = lse + Bmat[tid*O + obs_t];
+        - __syncthreads();
+        - swap pointers: tmp = s_alpha; s_alpha = s_new_alpha; // use two arrays and index.
+
+    - After loop:
+        - Compute logsumexp of s_alpha.
+        - Since S=16, do warp reduction. Since block has only up to 32 threads, we can do __shfl.
+        - Or use shared mem reduction.
+        - Thread 0 writes result to out[b].
+
+We need to ensure numerical stability: use -INFINITY initial max. Use expf.
+
+Potential optimization:
+- Since S is small (16), unroll loops? loops of 16 are fine.
+- Use float4 loads? Not necessary.
+- Could process multiple batch elements per block to increase occupancy, e.g., 4 batch elements per block, 16 threads per element. But blockDim = 64? Might be okay. However 64 blocks of 16 threads is 1024 threads total. GPU can run many blocks concurrently. Occupancy doesn&#x27;t matter much for such small total work? Actually 2M ops is tiny, memory bandwidth maybe not limiting. Kernel launch overhead dominates. One kernel is best.
+
+We must check correctness and compile.
+
+Write wrapper:
+
+std::vector&lt;torch::Tensor&gt; forward_hmm(torch::Tensor observations, torch::Tensor log_pi, torch::Tensor log_A, torch::Tensor log_B) {
+    // observations: (B, T) int64
+    // log_pi: (S) float
+    // log_A: (S,S) float
+    // log_B: (S,O) float
+    // returns log_lik: (B) float
+}
+
+Need to handle device. If inputs are CPU, need to move? We&#x27;ll just assume CUDA, but can handle by moving if needed. The reference parameters are on default device (likely CUDA). Observations from get_inputs are CPU? We can convert.
+
+Since ModelNew likely runs on CUDA, and observations may be on CPU, we can do .cuda() or just ensure everything on same device as observations. We&#x27;ll call .to(observations.device) for parameters.
+
+But if parameters are nn.Parameter on CPU (since model not moved), they will be on CPU. In typical usage, model is moved to CUDA before forward. We can handle by checking device and moving if necessary.
+
+Let&#x27;s write the inline CUDA code.
+
+One subtlety: log_A after normalization is row-normalized: log_A[i,j] = log P(j | i). In kernel, we use s_A[i*S + j].
+
+Observations: long tensor. In CUDA, we can cast to int64_t.
+
+Need to include &lt;float.h&gt; for INFINITY? Or &lt;math.h&gt;. Use -1e30? Better use -CUDART_INF_F if include &lt;cuda_runtime.h&gt;. But using logf and expf with INFINITY works. We can define const float NEG_INF = -1e30f? But since values are log probabilities, they can be as low as -log(S) - ... Might be around -10 to 0. -1e30 is safe. However, subtraction with NEG_INF in exp leads to zero. But to be safe, use something like -1e20f or INFINITY negative. We can define const float NEG_INF = -1e20f; but max over actual values will be &gt; -1e20, so safe. Actually if some transition prob is zero, log is -inf. But after _normalize_log, all rows have finite values because it&#x27;s log(softmax) of parameters initialized to zeros. If parameters can be arbitrary, _normalize_log ensures that values are log of probabilities (sum to 1), so finite? Actually if parameter is -inf, logsumexp handles it. log_softmax of -inf gives -inf. But with default zeros, it&#x27;s finite. To be safe, handle -inf as NEG_INF. Let&#x27;s just use INFINITY negative: -CUDART_INF_F or -1e30f. Since exp(-1e30) underflows to 0, which is fine.
+
+Better: use the technique:
+
+float max_val = -1e30f; // or -CUDART_INF_F
+for loop:
+    float val = s_alpha[i] + s_A[i*S + tid];
+    if (val &gt; max_val) max_val = val;
+float sum = 0.0f;
+for loop:
+    float val = s_alpha[i] + s_A[i*S + tid];
+    sum += expf(val - max_val);
+float lse = max_val + logf(sum);
+
+If all val are -inf, max_val stays -inf, sum=0, logf(0) = -inf, lse = -inf + (-inf) = nan? Actually -inf + log(0) where log(0) = -inf =&gt; result is -inf in IEEE? But in CUDA, logf(0) returns -inf, and -inf + -inf = -inf. Might be okay. But to avoid nan, ensure max_val is not -inf. Since initial parameters may not produce -inf, but to be robust, we could compute max_val by checking if val is finite. But not needed.
+
+Given small dimensions, we can also process the alpha update by transposing log_A? Since each thread j reads A[i][j] for all i. Row-major global memory access by threads: thread j accesses A[i*S + j]. For fixed i, threads read contiguous memory (coalesced). Good. For each i, we read S contiguous floats. So memory access is fine.
+
+Shared memory for log_A: we load from global to shared cooperatively. Each thread loads several elements. Since we need S*S=256 floats, with blockDim.x threads (say 16), each loads 16. We&#x27;ll write loop for idx = tid; idx &lt; S*S; idx += blockDim.x, load s_A[idx] = A[idx].
+
+Similarly log_B if loaded to shared: size S*O = 1024. Could load but not needed.
+
+Let&#x27;s design kernel:
+
+template&lt;int STATES, int NUM_OBS&gt;
+__global__ void hmm_forward_kernel(
+    const int64_t* __restrict__ observations,
+    const float* __restrict__ log_pi,
+    const float* __restrict__ log_A,
+    const float* __restrict__ log_B,
+    float* __restrict__ out,
+    int B, int T, int S, int O) {
+    
+    // block per batch element
+    int b = blockIdx.x;
+    if (b &gt;= B) return;
+    
+    int tid = threadIdx.x;
+    if (tid &gt;= STATES) return; // only first STATES threads active
+    
+    extern __shared__ float smem[];
+    float* s_A = smem;                         // S*S
+    float* s_alpha = smem + STATES * STATES;   // S
+    float* s_new_alpha = s_alpha + STATES;     // S
+    
+    // cooperative load of A
+    int total_A = STATES * STATES;
+    for (int idx = tid; idx &lt; total_A; idx += blockDim.x) {
+        s_A[idx] = log_A[idx];
+    }
+    __syncthreads();
+    
+    // initial alpha
+    int64_t o0 = observations[b * T + 0];
+    s_alpha[tid] = log_pi[tid] + log_B[tid * O + (int)o0];
+    __syncthreads();
+    
+    // iterate time steps
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = observations[b * T + t];
+        // compute logsumexp_i(alpha_i + A[i,tid])
+        float max_val = -1e30f;
+        #pragma unroll
+        for (int i = 0; i &lt; STATES; ++i) {
+            float val = s_alpha[i] + s_A[i * STATES + tid];
+            if (val &gt; max_val) max_val = val;
+        }
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i &lt; STATES; ++i) {
+            float val = s_alpha[i] + s_A[i * STATES + tid];
+            sum += expf(val - max_val);
+        }
+        float lse = max_val + logf(sum);
+        s_new_alpha[tid] = lse + log_B[tid * O + (int)ot];
+        __syncthreads();
+        // swap
+        float* tmp = s_alpha;
+        s_alpha = s_new_alpha;
+        s_new_alpha = tmp;
+    }
+    
+    // final logsumexp over alpha
+    float val = s_alpha[tid];
+    // warp reduce
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        float other = __shfl_down_sync(0xFFFFFFFF, val, offset);
+        // max then sum? We need full logsumexp.
+    }
+}
+
+But warp reduction for logsumexp is slightly tricky: we need to reduce across 16 values. We can do sequential logsumexp using shared memory. Since S=16, just have tid 0 compute it using a loop:
+
+    if (tid == 0) {
+        float max_val = -1e30f;
+        for (int i=0;i&lt;STATES;i++) {
+            if (s_alpha[i] &gt; max_val) max_val = s_alpha[i];
+        }
+        float sum = 0.0f;
+        for (int i=0;i&lt;STATES;i++) {
+            sum += expf(s_alpha[i] - max_val);
+        }
+        out[b] = max_val + logf(sum);
+    }
+
+Only one thread does it; negligible overhead.
+
+Simplify: after loop, __syncthreads(); then thread 0 computes final lse and writes. That&#x27;s fine.
+
+Shared memory size: STATES*STATES + 2*STATES floats. With STATES=16 -&gt; 256+32 = 288 floats ~ 1152 bytes. Very small.
+
+But blockDim.x may be STATES or larger? If we set blockDim.x=STATES (16), warp is half-warp. Fine.
+
+Because blockDim.x is 16, __shfl works but we can avoid it.
+
+One question: The log_pi, log_A, log_B are normalized on CPU in forward. But if they are CUDA tensors, normalization is on GPU. Fine. Then kernel reads them from global. Could we fuse normalization into kernel? Not necessary because small.
+
+We need to write the host wrapper function. Use ATen.
+
+```cpp
+torch::Tensor forward_hmm(
+    torch::Tensor observations,
+    torch::Tensor log_pi,
+    torch::Tensor log_A,
+    torch::Tensor log_B) {
+    
+    int B = observations.size(0);
+    int T = observations.size(1);
+    int S = log_pi.size(0);
+    int O = log_B.size(1);
+    
+    auto out = torch::empty({B}, log_pi.options());
+    
+    // Ensure contiguous
+    observations = observations.contiguous();
+    log_pi = log_pi.contiguous();
+    log_A = log_A.contiguous();
+    log_B = log_B.contiguous();
+    
+    const int threads = S;
+    const int blocks = B;
+    
+    size_t smem_size = (S * S + 2 * S) * sizeof(float);
+    
+    AT_DISPATCH_FLOATING_TYPES(log_pi.scalar_type(), &quot;hmm_forward&quot;, [&amp;] {
+        hmm_forward_kernel&lt;16, 64&gt;&lt;&lt;&lt;blocks, threads, smem_size, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+            observations.data_ptr&lt;int64_t&gt;(),
+            log_pi.data_ptr&lt;float&gt;(),
+            log_A.data_ptr&lt;float&gt;(),
+            log_B.data_ptr&lt;float&gt;(),
+            out.data_ptr&lt;float&gt;(),
+            B, T, S, O
+        );
+    });
+    
+    return out;
+}
+```
+
+But hmm_forward_kernel template params 16 and 64. We can pass S and O as template or runtime. Since they are fixed in reference (num_states=16, num_obs=64), but ModelNew must accept same constructor arguments, so S and O could vary. However the reference uses fixed numbers in get_init_inputs: [16,64]; and the test harness likely uses those exact values. But ModelNew __init__ accepts num_states and num_obs. We can either write generic kernel handling runtime S and O, or write a generic kernel with runtime S but use template unrolling conditionally. Since S is small (16), it&#x27;s fine to have runtime loops without template. But we can also use template for compile-time unrolling if performance matters. However S is variable. We could dispatch using a switch on S. But S is up to maybe 16? Not sure. Better to write a generic kernel with runtime S, using shared memory size based on S.
+
+But if we use template for STATES and NUM_OBS, we need to instantiate for possible S and O. Since these come from constructor arguments, not constexpr. However in test harness, they often pass fixed values, and the kernel can be called with those. We could write kernel that takes runtime S and O but still loops. That&#x27;s fine.
+
+Let&#x27;s write generic kernel:
+
+```cpp
+__global__ void hmm_forward_kernel(
+    const int64_t* __restrict__ observations,
+    const float* __restrict__ log_pi,
+    const float* __restrict__ log_A,
+    const float* __restrict__ log_B,
+    float* __restrict__ out,
+    int B, int T, int S, int O) {
+    //...
+}
+```
+
+Loop over i from 0 to S-1.
+
+But then if S is not known at compile time, #pragma unroll can&#x27;t unroll. But S=16 is small, loop overhead is okay.
+
+However, we need to decide blockDim.x. Set blockDim.x = S (or next power of two?). If S=16, block has 16 threads. To ensure occupancy, maybe set blockDim.x = 32 and have each thread handle one state, but only first S active. __syncthreads() is fine as long as all threads in block call it. If blockDim.x=32, all 32 threads must call __syncthreads. The extra threads should not write to shared memory out of bounds but they still must participate. If we have blockDim.x=32, we need tid &lt; S condition only around loads, but __syncthreads must be called by all threads. So we can have:
+
+int tid = threadIdx.x;
+bool active = tid &lt; S;
+
+Use if (active) { ... } and then __syncthreads() with all threads.
+
+But __syncthreads inside a conditional is okay only if all threads in block take the same branch or it&#x27;s not conditional. Actually __syncthreads() must be called by all threads in the block. If some threads are skipped by an if, it&#x27;s undefined behavior. So we must not put __syncthreads inside an if (active) block. We can compute values with active, then call __syncthreads after the if.
+
+Pattern:
+
+for t:
+    // compute new alpha for active threads
+    if (active) {
+         float max_val = ...;
+         float sum = ...;
+         s_new_alpha[tid] = ...;
+    }
+    __syncthreads();
+    // swap pointers all threads (or only active, but swap is just pointer assignment)
+    if (active) { ... } // pointer swap is local variable, no need for all threads.
+    // but we need to ensure s_alpha is visible to all active threads next iteration. Since active threads are only first S, the rest don&#x27;t matter. But __syncthreads was already called.
+    // pointer swap can be done by any thread, but we can just do it in a shared mem index or by all threads.
+    // Let&#x27;s just do the swap with temp; all threads can compute the same pointer addresses (trivial). Actually pointer variables are in registers per thread. If active threads do swap, it&#x27;s fine.
+    __syncthreads(); // maybe not needed.
+
+Better: set blockDim.x = S exactly. Then all threads are active. Since S=16, block size 16. This is fine. Occupancy: each SM can handle up to 2048 threads, block size 16 means 128 blocks per SM. We only have B=64 blocks total, so some SMs will be idle but enough parallelism. Occupancy might be limited by register usage but shared memory is tiny. Should be fine.
+
+Thus set blockDim.x = S.
+
+But if S is e.g. 32, block size 32, still fine.
+
+General case: blockDim.x = S. But if S &gt; 1024? Not possible for HMM with small states. Acceptable.
+
+I think blockDim.x = num_states is fine.
+
+Now, for the kernel code, we need to handle the case where observations may be int32 or int64. The reference says integer observation indices (as long tensor), which is int64 on CPU, but could be int64 on GPU. Let&#x27;s accept int64_t and maybe handle int32 for safety. In wrapper, we can cast observations to int64_t if needed, or write a dispatch for scalar type of observations.
+
+Simpler: in wrapper, do `observations = observations.to(torch::kLong);` or just access `observations.data_ptr&lt;int64_t&gt;()` after checking scalar type. If it&#x27;s int32, test will fail. Since `torch.randint` returns LongTensor by default? Actually `torch.randint(0, num_obs, (batch_size, seq_len))` returns a `torch.LongTensor`. So it&#x27;s int64. Good.
+
+We need to compile using `torch.utils.cpp_extension.load_inline`. The code should define a function `forward_hmm`. Do not include pybind11 module.
+
+ModelNew class:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&#x27;&#x27;&#x27;
+... CUDA code ...
+&#x27;&#x27;&#x27;
+
+cpp_source = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void hmm_forward_kernel(...) { ... }
+
+torch::Tensor forward_hmm(torch::Tensor observations, torch::Tensor log_pi, torch::Tensor log_A, torch::Tensor log_B) {
+    ...
+}
+&#x27;&#x27;&#x27;
+
+hmm_cuda = load_inline(
+    name=&#x27;hmm_cuda&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;forward_hmm&#x27;],
+    extra_cuda_cflags=[&#x27;--use_fast_math&#x27;, &#x27;-O3&#x27;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_states, num_obs):
+        super().__init__()
+        self.num_states = num_states
+        self.num_obs = num_obs
+        self.log_init = nn.Parameter(torch.zeros(num_states))
+        self.log_trans = nn.Parameter(torch.zeros(num_states, num_states))
+        self.log_emit = nn.Parameter(torch.zeros(num_states, num_obs))
+
+    def _normalize_log(self, x, dim=-1):
+        return x - torch.logsumexp(x, dim=dim, keepdim=True)
+
+    def forward(self, observations: torch.Tensor) -&gt; torch.Tensor:
+        device = observations.device
+        log_pi = self._normalize_log(self.log_init).to(device=device, dtype=torch.float32)
+        log_A = self._normalize_log(self.log_trans, dim=-1).to(device=device, dtype=torch.float32)
+        log_B = self._normalize_log(self.log_emit, dim=-1).to(device=device, dtype=torch.float32)
+
+        if observations.dtype != torch.int64:
+            observations = observations.to(torch.int64)
+        observations = observations.to(device=device)
+
+        return hmm_cuda.forward_hmm(observations, log_pi, log_A, log_B)
+```
+
+Wait, `load_inline` uses `cpp_sources` and `cuda_sources`? The function signature is `load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cuda_cflags=None, extra_cflags=None, verbose=False, ...)` Actually in torch.utils.cpp_extension.load_inline, the arguments are:
+```
+load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cuda_cflags=None, extra_cflags=None, verbose=False, with_cuda=None, ...)
+```
+Yes.
+
+We can put all code in `cpp_sources`, and kernel in `cuda_sources`. Or put everything in `cpp_sources` with inline CUDA? Usually `cpp_sources` is the host C++ code, and `cuda_sources` is the `.cu` code.
+
+Better to put everything in `cpp_sources` and not use `cuda_sources` if we include CUDA code via `cuda_sources`. But the kernel needs `__global__`, so must be in `.cu` source or compiled with nvcc. `load_inline` compiles `cpp_sources` with the C++ compiler and `cuda_sources` with nvcc. So we need to put `__global__` in `cuda_sources`. The host wrapper can be in either, but to call kernel it must be in `cuda_sources` or included. Let&#x27;s put everything in `cuda_sources` and leave `cpp_sources` empty? Actually `cpp_sources` is required (must be string or list). We can put the host wrapper and includes in `cpp_sources`, and the kernel in `cuda_sources`. That should work: `cpp_sources` compiled by host compiler but includes torch/extension.h; `cuda_sources` compiled by nvcc and linked. Since the host wrapper calls the kernel, it needs the kernel declared. We can forward declare in `cpp_sources` or include a header. However `load_inline` concatenates the sources? No, they are compiled separately as .cpp and .cu files. So we need a declaration of the kernel in the .cpp file, or put the wrapper in the .cu file. Easiest: put everything (host wrapper + kernel) in `cuda_sources`, and `cpp_sources` can be empty or just `#include &lt;torch/extension.h&gt;`? But `functions` argument lists the functions to bind, and they need to be in the compile unit. If we put the wrapper in `cuda_sources`, it will be compiled as `.cu` and exported. `cpp_sources` can be empty string or omitted? Actually `load_inline` requires `cpp_sources` argument but it can be `&quot;&quot;`. I think it can be empty. Let&#x27;s check: signature is `load_inline(name, cpp_sources, cuda_sources=None, ...)`. `cpp_sources` is positional mandatory. It can be empty string.
+
+But to be safe, we can put the host wrapper in `cpp_sources` and declare the kernel as `void hmm_forward_kernel(...)` (without `__global__`) in the .cpp, and define it in `cuda_sources`. However `__global__` functions have external linkage, and CUDA&#x27;s host compiler may not understand `__global__`. So we declare as `void hmm_forward_kernel(...)` in the .cpp, and call it with `&lt;&lt;&lt;...&gt;&gt;&gt;`. That&#x27;s valid as long as we compile with nvcc and link. Actually calling `&lt;&lt;&lt;...&gt;&gt;&gt;` from a `.cpp` file compiled by host compiler is not allowed unless using CUDA clang or something. In PyTorch&#x27;s load_inline, if `cpp_sources` is compiled by g++ and `cuda_sources` by nvcc, you cannot use `&lt;&lt;&lt;&gt;&gt;&gt;` in `.cpp`. So we must put the wrapper (which uses `&lt;&lt;&lt;&gt;&gt;&gt;`) in the `.cu` file (`cuda_sources`). The `cpp_sources` can be empty or contain helper code not using CUDA syntax. We can just put everything in `cuda_sources` and pass empty `cpp_sources`.
+
+Let&#x27;s check typical usage:
+
+```python
+hmm_cuda = load_inline(
+    name=&#x27;hmm_cuda&#x27;,
+    cpp_sources=&#x27;&#x27;,
+    cuda_sources=cuda_code,
+    functions=[&#x27;forward_hmm&#x27;],
+    extra_cuda_cflags=[&#x27;--use_fast_math&#x27;, &#x27;-O3&#x27;],
+)
+```
+
+This should compile the CUDA code as a .cu file, and since it includes `&lt;torch/extension.h&gt;` and defines `forward_hmm`, pybind11 will pick it up.
+
+Need to make sure we include the necessary headers in cuda_sources.
+
+One more thing: `load_inline` might require `with_cuda=True` if cpp_sources is empty. Actually it infers from cuda_sources. We&#x27;ll set `with_cuda=True` or just provide cuda_sources.
+
+Now, performance considerations:
+
+- Using `-O3` and `--use_fast_math` should speed up expf and logf.
+- One kernel launch reduces overhead significantly.
+- Could we further optimize by having each block compute multiple batch elements? E.g., block processes 4 batch elements sequentially, using S threads per element? That would increase arithmetic intensity per block but reduce total blocks (64-&gt;16). However GPU has many SMs, so reducing blocks too much might underutilize GPU. But with B=64 and blockDim=16, total threads = 1024, which is less than one SM&#x27;s capacity. So GPU is barely used. Each block has a sequential loop over T=128, which is not fully latency-hidden. If we increase work per block to process e.g. 4 batch elements (blockDim=16, each thread handles 4 batch elements in a loop), then blocks = 16, total threads = 256, which is even less. Not good.
+
+Better: have each block process one batch element with more threads to parallelize the inner loop. Since S=16, we can assign 32 threads per batch element, with thread j processing state j (only 16 used). The rest can help with memory loads or reduction. Or we can use more threads to compute the matrix multiplication more efficiently. For each next state j, we need to compute logsumexp_i(alpha_i + A[i,j]). This is essentially a matrix-vector multiplication in log-space (log-sum-exp). We could compute the values alpha_i + A[i,j] by having each thread compute a partial max, then reduce across threads. But S=16, so no need.
+
+Alternatively, we could process multiple time steps in shared memory if we precompute emissions for all time steps? Observations are per batch element; we could load the observation sequence into shared memory (T=128 ints) and reuse. That&#x27;s fine.
+
+Another idea: process multiple batch elements per block by using 2D grid. E.g., gridDim.x = B, gridDim.y = something. Not helpful.
+
+Given the problem size, speedup may be modest but we should still beat PyTorch reference because reference launches many kernels: each iteration of the loop calls `unsqueeze`, addition, `logsumexp`, indexing, addition. That&#x27;s per time step: 5-6 kernel launches. Over 128 steps =&gt; ~700 kernel launches for B=64. That&#x27;s huge overhead. A single fused kernel should easily be much faster.
+
+We need to ensure numerical equivalence. `torch.logsumexp` uses stable reduction with max. Our kernel uses the same. Differences may arise from ordering of operations and use of `expf` vs `exp`, `logf` vs `log`. But tolerance is 1e-4 for fp32. Using fast math might cause slightly larger errors, but within 1e-4? `--use_fast_math` can be less accurate but usually within 1e-5 for exp/log. We might want to remove `--use_fast_math` to be safe, or keep it and test. Let&#x27;s test without it first, then maybe add.
+
+We need to handle potential CUDA errors: check tensor dimensions, ensure contiguous. We can use `TORCH_CHECK`.
+
+Let&#x27;s write the code.
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 16
+#endif
+
+__global__ void hmm_forward_kernel(
+    const int64_t* __restrict__ observations,
+    const float* __restrict__ log_pi,
+    const float* __restrict__ log_A,
+    const float* __restrict__ log_B,
+    float* __restrict__ out,
+    int B,
+    int T,
+    int S,
+    int O) {
+    
+    int b = blockIdx.x;
+    if (b &gt;= B) return;
+    
+    int tid = threadIdx.x;
+    if (tid &gt;= S) return;
+    
+    extern __shared__ float smem[];
+    float* s_A = smem;                 // S*S
+    float* s_alpha = smem + S * S;     // S
+    float* s_new_alpha = s_alpha + S;  // S
+    
+    // Load transition matrix into shared memory
+    int total_A = S * S;
+    for (int idx = tid; idx &lt; total_A; idx += blockDim.x) {
+        s_A[idx] = log_A[idx];
+    }
+    __syncthreads();
+    
+    // Initialize alpha for t=0
+    int64_t o0 = observations[b * T + 0];
+    s_alpha[tid] = log_pi[tid] + log_B[tid * O + (int)o0];
+    __syncthreads();
+    
+    // Forward recursion
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = observations[b * T + t];
+        float max_val = -1e30f;
+        for (int i = 0; i &lt; S; ++i) {
+            float val = s_alpha[i] + s_A[i * S + tid];
+            if (val &gt; max_val) max_val = val;
+        }
+        float sum = 0.0f;
+        for (int i = 0; i &lt; S; ++i) {
+            float val = s_alpha[i] + s_A[i * S + tid];
+            sum += expf(val - max_val);
+        }
+        float lse = max_val + logf(sum);
+        s_new_alpha[tid] = lse + log_B[tid * O + (int)ot];
+        __syncthreads();
+        
+        // swap
+        float* tmp = s_alpha;
+        s_alpha = s_new_alpha;
+        s_new_alpha = tmp;
+    }
+    
+    // Final logsumexp
+    __syncthreads();
+    if (tid == 0) {
+        float max_val = -1e30f;
+        for (int i = 0; i &lt; S; ++i) {
+            float v = s_alpha[i];
+            if (v &gt; max_val) max_val = v;
+        }
+        float sum = 0.0f;
+        for (int i = 0; i &lt; S; ++i) {
+            sum += expf(s_alpha[i] - max_val);
+        }
+        out[b] = max_val + logf(sum);
+    }
+}
+```
+
+Wait: if we have `if (tid &gt;= S) return;`, then threads with tid &gt;= S will not reach __syncthreads(), causing deadlock. So we cannot early return. Instead, we should ensure blockDim.x == S exactly, or if blockDim.x &gt; S, conditionally compute but always call __syncthreads.
+
+Given we can set blockDim.x = S, all threads will be active and tid &lt; S always. So we can just assert blockDim.x == S.
+
+In host wrapper:
+
+```cpp
+TORCH_CHECK(S &lt;= 1024, &quot;num_states too large&quot;);
+const int threads = S;
+const int blocks = B;
+size_t smem_size = (S * S + 2 * S) * sizeof(float);
+```
+
+With blockDim.x = S, all threads are active. So no need for early return.
+
+But what if S is not a multiple of warp size? S=16, fine. In general, blockDim.x = S may be e.g. 15, which is okay but not optimal. Fine.
+
+Let&#x27;s refine kernel: no early return.
+
+```cpp
+__global__ void hmm_forward_kernel(...) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int S = ...; // passed as arg
+    // blockDim.x must be S
+    // ...
+}
+```
+
+We trust host wrapper launches with correct block size.
+
+Compute shared memory: need s_A (S*S), s_alpha (S), s_new_alpha (S). Since S is dynamic, we can allocate `extern __shared__ float smem[];` with size passed in kernel launch. That&#x27;s fine.
+
+Now potential optimization: loading log_pi into shared memory? Not needed, each tid loads log_pi[tid] once.
+
+Load log_B? O=64, S=16 =&gt; 1024 floats. We can load all of log_B into shared memory per block? That would reduce global memory loads for each time step. Currently each step loads `log_B[tid * O + ot]` per thread, which is 16 floats per step. Over T=128, that&#x27;s 2048 floats per block. Global bandwidth is huge, so not a bottleneck. But loading all log_B (1024 floats) once could help. Let&#x27;s consider.
+
+We have B=64 blocks. Total log_B loads without caching: 64 * 128 * 16 = 131072 floats ~ 512 KB. That&#x27;s tiny. Not needed.
+
+Better optimization: precompute emissions for the entire sequence in shared memory: for each batch element, the observations are given. We could have each block load the observation sequence (T ints) into shared memory (128 ints = 512 bytes). Then each step reads from shared memory. This avoids global memory loads per step. But T=128 is small; global loads per block: 128 int64 = 1KB. Also tiny. Not needed.
+
+Another optimization: Since `log_A` is shared, we load it once. Already done.
+
+Potential issue: the kernel does not handle the case B &gt; gridDim.x? We set blocks=B. Fine.
+
+Now, host wrapper:
+
+```cpp
+torch::Tensor forward_hmm(torch::Tensor observations, torch::Tensor log_pi, torch::Tensor log_A, torch::Tensor log_B) {
+    TORCH_CHECK(observations.dim() == 2, &quot;observations must be 2D&quot;);
+    TORCH_CHECK(log_pi.dim() == 1, &quot;log_pi must be 1D&quot;);
+    TORCH_CHECK(log_A.dim() == 2, &quot;log_A must be 2D&quot;);
+    TORCH_CHECK(log_B.dim() == 2, &quot;log_B must be 2D&quot;);
+    
+    int B = observations.size(0);
+    int T = observations.size(1);
+    int S = log_pi.size(0);
+    int O = log_B.size(1);
+    
+    TORCH_CHECK(log_A.size(0) == S &amp;&amp; log_A.size(1) == S, &quot;log_A shape mismatch&quot;);
+    TORCH_CHECK(log_B.size(0) == S &amp;&amp; log_B.size(1) == O, &quot;log_B shape mismatch&quot;);
+    
+    observations = observations.contiguous();
+    log_pi = log_pi.contiguous();
+    log_A = log_A.contiguous();
+    log_B = log_B.contiguous();
+    
+    auto out = torch::empty({B}, log_pi.options());
+    
+    if (B == 0) return out;
+    
+    const int threads = S;
+    const int blocks = B;
+    size_t smem_size = (S * S + 2 * S) * sizeof(float);
+    
+    hmm_forward_kernel&lt;&lt;&lt;blocks, threads, smem_size, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+        observations.data_ptr&lt;int64_t&gt;(),
+        log_pi.data_ptr&lt;float&gt;(),
+        log_A.data_ptr&lt;float&gt;(),
+        log_B.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        B, T, S, O
+    );
+    
+    return out;
+}
+```
+
+One issue: `log_pi.options()` may be on CPU if log_pi is CPU tensor. But we call `.to(device)` in Python before wrapper. So all tensors should be on GPU. If not, kernel will crash. We can either check device in wrapper or in Python.
+
+In Python:
+
+```python
+log_pi = self._normalize_log(self.log_init).to(device=observations.device, dtype=torch.float32)
+log_A = self._normalize_log(self.log_trans, dim=-1).to(device=observations.device, dtype=torch.float32)
+log_B = self._normalize_log(self.log_emit, dim=-1).to(device=observations.device, dtype=torch.float32)
+obs = observations.to(dtype=torch.int64, device=observations.device)
+```
+
+Since observations may be CPU and model parameters CPU. It&#x27;s okay.
+
+Now, is there any issue with integer tensor on CPU being passed to .data_ptr&lt;int64_t&gt;()? In wrapper, we call observations.contiguous(). If it&#x27;s CPU, data_ptr is host pointer, but kernel expects device pointer. CUDA runtime will error. So ensure device in Python.
+
+Will `torch.logsumexp` on CPU produce same result as CUDA? Yes, within tolerance.
+
+Now, compile the kernel and test.
+
+But before we call compile_kernel, we need the full Python source string. Let&#x27;s piece it together.
+
+One more thought: since `torch.utils.cpp_extension.load_inline` compiles at module load time, the compilation may take time but it&#x27;s okay.
+
+We need to produce a single string that is a valid Python module.
+
+Let&#x27;s draft the code.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_CODE = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void hmm_forward_kernel(
+    const int64_t* __restrict__ observations,
+    const float* __restrict__ log_pi,
+    const float* __restrict__ log_A,
+    const float* __restrict__ log_B,
+    float* __restrict__ out,
+    int B,
+    int T,
+    int S,
+    int O)
+{
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    // blockDim.x is assumed to be S
+
+    extern __shared__ float smem[];
+    float* s_A = smem;                 // S * S
+    float* s_alpha = smem + S * S;     // S
+    float* s_new_alpha = s_alpha + S;  // S
+
+    // Cooperative load of transition matrix
+    int total_A = S * S;
+    for (int idx = tid; idx &lt; total_A; idx += blockDim.x) {
+        s_A[idx] = log_A[idx];
+    }
+    __syncthreads();
+
+    // Initial emission
+    int64_t o0 = observations[b * T + 0];
+    s_alpha[tid] = log_pi[tid] + log_B[tid * O + (int)o0];
+    __syncthreads();
+
+    // Forward pass
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = observations[b * T + t];
+
+        float max_val = -1e30f;
+        for (int i = 0; i &lt; S; ++i) {
+            float val = s_alpha[i] + s_A[i * S + tid];
+            if (val &gt; max_val) max_val = val;
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i &lt; S; ++i) {
+            float val = s_alpha[i] + s_A[i * S + tid];
+            sum += expf(val - max_val);
+        }
+
+        float lse = max_val + logf(sum);
+        s_new_alpha[tid] = lse + log_B[tid * O + (int)ot];
+        __syncthreads();
+
+        // swap pointers
+        float* tmp = s_alpha;
+        s_alpha = s_new_alpha;
+        s_new_alpha = tmp;
+    }
+
+    // Final logsumexp over alpha
+    __syncthreads();
+    if (tid == 0) {
+        float max_val = -1e30f;
+        for (int i = 0; i &lt; S; ++i) {
+            float v = s_alpha[i];
+            if (v &gt; max_val) max_val = v;
+        }
+        float sum = 0.0f;
+        for (int i = 0; i &lt; S; ++i) {
+            sum += expf(s_alpha[i] - max_val);
+        }
+        out[b] = max_val + logf(sum);
+    }
+}
+
+torch::Tensor forward_hmm(torch::Tensor observations,
+                          torch::Tensor log_pi,
+                          torch::Tensor log_A,
+                          torch::Tensor log_B) {
+    TORCH_CHECK(observations.dim() == 2, &quot;observations must be 2D&quot;);
+    TORCH_CHECK(log_pi.dim() == 1, &quot;log_pi must be 1D&quot;);
+    TORCH_CHECK(log_A.dim() == 2, &quot;log_A must be 2D&quot;);
+    TORCH_CHECK(log_B.dim() == 2, &quot;log_B must be 2D&quot;);
+
+    int B = observations.size(0);
+    int T = observations.size(1);
+    int S = log_pi.size(0);
+    int O = log_B.size(1);
+
+    TORCH_CHECK(log_A.size(0) == S &amp;&amp; log_A.size(1) == S, &quot;log_A shape mismatch&quot;);
+    TORCH_CHECK(log_B.size(0) == S &amp;&amp; log_B.size(1) == O, &quot;log_B shape mismatch&quot;);
+
+    observations = observations.contiguous();
+    log_pi = log_pi.contiguous();
+    log_A = log_A.contiguous();
+    log_B = log_B.contiguous();
+
+    auto out = torch::empty({B}, log_pi.options());
+
+    if (B == 0) {
+        return out;
+    }
+
+    const int threads = S;
+    const int blocks = B;
+    size_t smem_size = (S * S + 2 * S) * sizeof(float);
+
+    hmm_forward_kernel&lt;&lt;&lt;blocks, threads, smem_size, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+        observations.data_ptr&lt;int64_t&gt;(),
+        log_pi.data_ptr&lt;float&gt;(),
+        log_A.data_ptr&lt;float&gt;(),
+        log_B.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        B, T, S, O);
+
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+_hmm_cuda = load_inline(
+    name=&#x27;hmm_cuda&#x27;,
+    cpp_sources=&#x27;&#x27;,
+    cuda_sources=CUDA_CODE,
+    functions=[&#x27;forward_hmm&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_states, num_obs):
+        super().__init__()
+        self.num_states = num_states
+        self.num_obs = num_obs
+        self.log_init = nn.Parameter(torch.zeros(num_states))
+        self.log_trans = nn.Parameter(torch.zeros(num_states, num_states))
+        self.log_emit = nn.Parameter(torch.zeros(num_states, num_obs))
+
+    def _normalize_log(self, x, dim=-1):
+        return x - torch.logsumexp(x, dim=dim, keepdim=True)
+
+    def forward(self, observations: torch.Tensor) -&gt; torch.Tensor:
+        device = observations.device
+        dt = torch.float32
+        
+        log_pi = self._normalize_log(self.log_init).to(device=device, dtype=dt)
+        log_A = self._normalize_log(self.log_trans, dim=-1).to(device=device, dtype=dt)
+        log_B = self._normalize_log(self.log_emit, dim=-1).to(device=device, dtype=dt)
+        
+        if observations.dtype != torch.int64:
+            observations = observations.to(torch.int64)
+        observations = observations.to(device=device)
+        
+        return _hmm_cuda.forward_hmm(observations, log_pi, log_A, log_B)
+```
+
+Wait, `log_pi.options()` in C++ wrapper uses the options of the tensor passed in. Since we pass a CUDA float tensor, `out` will be CUDA float. Good.
+
+Potential issue: `load_inline` might need `with_cuda=True` when `cpp_sources` is empty and `cuda_sources` is non-empty. Let&#x27;s check docs. Actually `load_inline` signature: `torch.utils.cpp_extension.load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cflags=None, extra_cuda_cflags=None, extra_ldflags=None, extra_include_paths=None, build_directory=None, verbose=False, with_cuda=None, is_python_module=True, keepscript=False)` 
+
+The `with_cuda` parameter is optional. If not provided, it&#x27;s inferred from `cuda_sources` being non-None. So we can omit it.
+
+But there is a subtlety: when `cpp_sources` is empty, the generated `.cpp` file may be empty, and the pybind11 module is generated from the functions found in `cuda_sources`. I think `load_inline` handles this.
+
+Another subtlety: `cpp_sources` cannot contain the `forward_hmm` function if it&#x27;s in `cuda_sources`? Actually `functions=[&#x27;forward_hmm&#x27;]` tells the tool to look for that function in all sources and wrap it. Since it&#x27;s in `cuda_sources`, it should be fine.
+
+Let&#x27;s verify by compiling. Use `compile_kernel`. The tool takes full Python source of ModelNew kernel file. So I will create the above string and compile.
+
+But before compiling, double-check the kernel for correctness regarding log_A indexing. In reference, `log_alpha = log_alpha.unsqueeze(-1) + log_A.unsqueeze(0)` gives shape (B, S, S). This means `log_alpha[b, i] + log_A[i, j]`. Then `logsumexp(dim=1)` over i. So new alpha for state j is max over i of old_alpha[i] + A[i, j]. In our kernel, we compute `s_alpha[i] + s_A[i * S + tid]` where tid = j. That matches A[i, j] if A is row-major with rows i and columns j. Yes, `log_A` from PyTorch is row-major. Good.
+
+One more thing: the normalization in reference is done each forward call. In our kernel, we rely on normalized log_A. That&#x27;s correct.
+
+Now, compile and run correctness.
+
+Wait, there is a potential numerical difference: `torch.logsumexp` uses `torch.logsumexp` which is a vectorized operation that may use a different order of reduction than our manual loop. Since S=16, the max and sum are commutative except for floating point. However, because we do `val - max_val` and then `expf`, the order of summation may differ. But with S=16 and tolerance 1e-4, it should be fine.
+
+But there is a more subtle issue: in our kernel, for each j, we compute `max_val` and then sum `expf(val - max_val)`. If two values are close, the sum may differ slightly from PyTorch&#x27;s reduction. But still within 1e-4 likely.
+
+Another potential issue: the `expf` and `logf` functions from CUDA standard library vs `exp` and `log` in host. Since we compile with `-O3` (not `--use_fast_math`), `expf` and `logf` should be precise. Actually `expf` and `logf` are float versions. On CUDA, they map to `__expf`? No, `expf` is the standard math library function for float, which is accurate. `__expf` is the intrinsic fast one. So without `--use_fast_math`, `expf` is accurate.
+
+Let&#x27;s compile and test.
+
+We&#x27;ll use compile_kernel first.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_CODE = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n__global__ void hmm_forward_kernel(\n    const int64_t* __restrict__ observations,\n    const float* __restrict__ log_pi,\n    const float* __restrict__ log_A,\n    const float* __restrict__ log_B,\n    float* __restrict__ out,\n    int B,\n    int T,\n    int S,\n    int O)\n{\n    int b = blockIdx.x;\n    int tid = threadIdx.x;\n    // blockDim.x is assumed to be S\n\n    extern __shared__ float smem[];\n    float* s_A = smem;                 // S * S\n    float* s_alpha = smem + S * S;     // S\n    float* s_new_alpha = s_alpha + S;  // S\n\n    // Cooperative load of transition matrix\n    int total_A = S * S;\n    for (int idx = tid; idx &lt; total_A; idx += blockDim.x) {\n        s_A[idx] = log_A[idx];\n    }\n    __syncthreads();\n\n    // Initial emission\n    int64_t o0 = observations[b * T + 0];\n    s_alpha[tid] = log_pi[tid] + log_B[tid * O + (int)o0];\n    __syncthreads();\n\n    // Forward pass\n    for (int t = 1; t &lt; T; ++t) {\n        int64_t ot = observations[b * T + t];\n\n        float max_val = -1e30f;\n        for (int i = 0; i &lt; S; ++i) {\n            float val = s_alpha[i] + s_A[i * S + tid];\n            if (val &gt; max_val) max_val = val;\n        }\n\n        float sum = 0.0f;\n        for (int i = 0; i &lt; S; ++i) {\n            float val = s_alpha[i] + s_A[i * S + tid];\n            sum += expf(val - max_val);\n        }\n\n        float lse = max_val + logf(sum);\n        s_new_alpha[tid] = lse + log_B[tid * O + (int)ot];\n        __syncthreads();\n\n        // swap pointers\n        float* tmp = s_alpha;\n        s_alpha = s_new_alpha;\n        s_new_alpha = tmp;\n    }\n\n    // Final logsumexp over alpha\n    __syncthreads();\n    if (tid == 0) {\n        float max_val = -1e30f;\n        for (int i = 0; i &lt; S; ++i) {\n            float v = s_alpha[i];\n            if (v &gt; max_val) max_val = v;\n        }\n        float sum = 0.0f;\n        for (int i = 0; i &lt; S; ++i) {\n            sum += expf(s_alpha[i] - max_val);\n        }\n        out[b] = max_val + logf(sum);\n    }\n}\n\ntorch::Tensor forward_hmm(torch::Tensor observations,\n                          torch::Tensor log_pi,\n                          torch::Tensor log_A,\n                          torch::Tensor log_B) {\n    TORCH_CHECK(observations.dim() == 2, \&quot;observations must be 2D\&quot;);\n    TORCH_CHECK(log_pi.dim() == 1, \&quot;log_pi must be 1D\&quot;);\n    TORCH_CHECK(log_A.dim() == 2, \&quot;log_A must be 2D\&quot;);\n    TORCH_CHECK(log_B.dim() == 2, \&quot;log_B must be 2D\&quot;);\n\n    int B = observations.size(0);\n    int T = observations.size(1);\n    int S = log_pi.size(0);\n    int O = log_B.size(1);\n\n    TORCH_CHECK(log_A.size(0) == S &amp;&amp; log_A.size(1) == S, \&quot;log_A shape mismatch\&quot;);\n    TORCH_CHECK(log_B.size(0) == S &amp;&amp; log_B.size(1) == O, \&quot;log_B shape mismatch\&quot;);\n\n    observations = observations.contiguous();\n    log_pi = log_pi.contiguous();\n    log_A = log_A.contiguous();\n    log_B = log_B.contiguous();\n\n    auto out = torch::empty({B}, log_pi.options());\n\n    if (B == 0) {\n        return out;\n    }\n\n    const int threads = S;\n    const int blocks = B;\n    size_t smem_size = (S * S + 2 * S) * sizeof(float);\n\n    hmm_forward_kernel&lt;&lt;&lt;blocks, threads, smem_size, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(\n        observations.data_ptr&lt;int64_t&gt;(),\n        log_pi.data_ptr&lt;float&gt;(),\n        log_A.data_ptr&lt;float&gt;(),\n        log_B.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        B, T, S, O);\n\n    return out;\n}\n&#x27;&#x27;&#x27;\n\n_hmm_cuda = load_inline(\n    name=&#x27;hmm_cuda&#x27;,\n    cpp_sources=&#x27;&#x27;,\n    cuda_sources=CUDA_CODE,\n    functions=[&#x27;forward_hmm&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_states, num_obs):\n        super().__init__()\n        self.num_states = num_states\n        self.num_obs = num_obs\n        self.log_init = nn.Parameter(torch.zeros(num_states))\n        self.log_trans = nn.Parameter(torch.zeros(num_states, num_states))\n        self.log_emit = nn.Parameter(torch.zeros(num_states, num_obs))\n\n    def _normalize_log(self, x, dim=-1):\n        return x - torch.logsumexp(x, dim=dim, keepdim=True)\n\n    def forward(self, observations: torch.Tensor) -&gt; torch.Tensor:\n        device = observations.device\n        dt = torch.float32\n        \n        log_pi = self._normalize_log(self.log_init).to(device=device, dtype=dt)\n        log_A = self._normalize_log(self.log_trans, dim=-1).to(device=device, dtype=dt)\n        log_B = self._normalize_log(self.log_emit, dim=-1).to(device=device, dtype=dt)\n        \n        if observations.dtype != torch.int64:\n            observations = observations.to(torch.int64)\n        observations = observations.to(device=device)\n        \n        return _hmm_cuda.forward_hmm(observations, log_pi, log_A, log_B)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;hmm_cuda&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=hmm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -c /scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=hmm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -c /scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/main.cpp -o main.o 
+/scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/main.cpp: In function &#x27;void pybind11_init_hmm_cuda(pybind11::module_&amp;)&#x27;:
+/scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/main.cpp:4:50: error: &#x27;forward_hmm&#x27; was not declared in this scope
+    4 | m.def(&quot;forward_hmm&quot;, torch::wrap_pybind_function(forward_hmm), &quot;forward_hmm&quot;);
+      |                                                  ^~~~~~~~~~~
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=hmm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 -std=c++17 -c /scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/cuda.cu -o cuda.cuda.o 
+FAILED: [code=2] cuda.cuda.o 
+/usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=hmm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/tejas/PopcornBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /home/prabhune/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 -std=c++17 -c /scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+/scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/cuda.cu(116): error: namespace &quot;at::cuda&quot; has no member &quot;getCurrentCUDAStream&quot;
+      hmm_forward_kernel&lt;&lt;&lt;blocks, threads, smem_size, at::cuda::getCurrentCUDAStream()&gt;&gt;&gt;(
+                                                                 ^
+
+1 error detected in the compilation of &quot;/scratch/tejas/PopcornBench/runs/full_l12/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_f3ffcc56375c/hmm_cuda/cuda.cu&quot;.
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
