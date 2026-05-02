@@ -1,30 +1,22 @@
 """Per-GPU evaluation server.
 
-A long-lived process pinned to one GPU via CUDA_VISIBLE_DEVICES that drains
-a Manager-backed FIFO request queue and serves submit_kernel work items in
-arrival order.
+Long-lived process pinned to one GPU. Drains a Manager-backed FIFO queue,
+runs each request to completion, ships the result back via a per-call
+response queue.
 
-Architectural rationale
------------------------
-PopcornBench's bottleneck is `submit_kernel`: the full correctness +
-perf-timing eval can take minutes on L3/L4 problems with multi-second
-reference runtimes. With agents pinned to GPUs and oversubscribed
-(agents_per_gpu > 1), many agents end up serializing on a single GPU's
-perf lock. Lock fairness primitives (fcntl.flock, mp.Manager().Lock) do not
-solve this — long evals legitimately starve others past `worker_timeout_s`.
+CUDA-context recovery
+---------------------
+CUDA "illegal memory access" and a handful of related errors are
+asynchronous and destroy the entire torch CUDA context for the process.
+Once one fires, every subsequent allocation or kernel launch in this
+process will fail with the same error, even on perfectly valid candidate
+kernels. There is no torch API to reset the context.
 
-The fix is to decouple eval lifetime from agent lifetime:
-
-  agents → push (kernel, args) to the GPU's request queue → block on result
-                                                                |
-                                            (LLM calls run in parallel here)
-                                                                |
-  one eval-server per GPU → pop, run, push result, repeat (forever)
-
-If an agent's worker_timeout fires while its eval is queued or running, the
-agent process dies; the eval still completes (just no one reads the result),
-so there are no dangling locks, no orphaned compile caches, no cleanup races.
-The queue depth is observable via Manager().Queue().qsize().
+Recovery: when we detect a context-fatal error, we ship the error
+response back to the requesting agent, log loudly, and exit. The
+supervisor in run_sweep.py respawns a fresh server that picks up the
+next request from this GPU's queue. Only the bad candidate fails; the
+rest of the queue gets a clean process.
 """
 
 from __future__ import annotations
@@ -33,10 +25,30 @@ import logging
 import os
 import queue
 import sys
+import time
 import traceback
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# Errors that destroy the CUDA context and require process restart.
+# Match against the lower-cased exception message.
+_CUDA_FATAL_PATTERNS = (
+    "illegal memory access",
+    "unspecified launch failure",
+    "an illegal instruction was encountered",
+    "device-side assert",
+    "misaligned address",
+    "cudaerrorillegaladdress",
+    "cudaerrorillegal",
+    "cudaerrorlaunchfailure",
+)
+
+
+def _is_cuda_context_fatal(text: str) -> bool:
+    s = (text or "").lower()
+    return any(p in s for p in _CUDA_FATAL_PATTERNS)
 
 
 def run_eval_server(
@@ -193,6 +205,22 @@ def run_eval_server(
             response_q.put((request_id, "ok", payload))
             n_served += 1
 
+            # Tools generally CATCH CUDA errors and return ToolResult with
+            # success=False, so a fatal CUDA event reaches us through the
+            # output text rather than as a raised exception. If the output
+            # mentions an illegal memory access (or similar), the context
+            # is poisoned and every subsequent kernel on this server will
+            # see the same error. Exit so the supervisor respawns us.
+            if not result.success and _is_cuda_context_fatal(result.output):
+                logger.error(
+                    "[eval_server gpu=%d] CUDA context-fatal error detected "
+                    "in tool output. Exiting for respawn (served %d requests).",
+                    gpu_id, n_served,
+                )
+                # Brief sleep to let the response_q put flush across IPC.
+                time.sleep(0.5)
+                sys.exit(1)
+
         except Exception as e:
             tb = traceback.format_exc()
             logger.warning("[eval_server gpu=%d] request %s failed: %s",
@@ -204,6 +232,16 @@ def run_eval_server(
                 # The agent that owned the response queue may have died;
                 # drop the response and keep serving.
                 pass
+
+            # Same check on the raised path.
+            if _is_cuda_context_fatal(str(e)) or _is_cuda_context_fatal(tb):
+                logger.error(
+                    "[eval_server gpu=%d] CUDA context-fatal exception. "
+                    "Exiting for respawn (served %d requests).",
+                    gpu_id, n_served,
+                )
+                time.sleep(0.5)
+                sys.exit(1)
 
     logger.info("[eval_server gpu=%d] exiting", gpu_id)
 

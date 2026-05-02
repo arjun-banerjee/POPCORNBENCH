@@ -701,6 +701,9 @@ def main():
     if use_eval_queue:
         from kernelbench.agent.eval_server import run_eval_server
         eval_request_qs = [manager.Queue() for _ in range(num_gpus)]
+        # Each entry is a dict so the supervisor can update `proc` after a
+        # respawn without invalidating the rest of the bookkeeping.
+        eval_server_recs: list = []
         for gpu_id in range(num_gpus):
             ready = manager.Event()
             p = mp.Process(
@@ -710,11 +713,18 @@ def main():
                 name=f"eval_server_gpu{gpu_id}",
             )
             p.start()
-            eval_server_procs.append((p, ready))
+            eval_server_recs.append({
+                "proc": p,
+                "gpu_id": gpu_id,
+                "request_q": eval_request_qs[gpu_id],
+                "ready": ready,
+                "respawns": 0,
+            })
+            eval_server_procs.append((p, ready))  # legacy tuple list for shutdown
         # Wait for every server to import torch + tools and signal ready.
         # ~5-10s on a cold venv; happens once per sweep.
-        for _, ready in eval_server_procs:
-            ready.wait(timeout=120)
+        for rec in eval_server_recs:
+            rec["ready"].wait(timeout=120)
         print(f"  eval queue: {num_gpus} per-GPU FIFO server(s) ready")
     elif par_cfg.get("perf_lock_per_gpu", True) and par_cfg["agents_per_gpu"] > 1:
         # Legacy lock fallback (e.g. multi_gpu sweeps).
@@ -728,6 +738,48 @@ def main():
     stop_event = threading.Event()
     if rep_cfg.get("enabled", True):
         _start_report_thread(run_dir, int(rep_cfg.get("refresh_seconds", 30)), stop_event)
+
+    # Eval-server supervisor: when an eval server exits (because a
+    # CUDA-context-fatal kernel poisoned its torch state and the server
+    # exited cleanly so we'd respawn), bring up a fresh process on the
+    # same GPU using the same request queue. Pending requests on that
+    # queue stay queued and the new server picks them up.
+    if use_eval_queue:
+        from kernelbench.agent.eval_server import run_eval_server as _run_eval_server
+
+        def _supervise_eval_servers():
+            while not stop_event.is_set():
+                for rec in eval_server_recs:
+                    p = rec["proc"]
+                    if not p.is_alive():
+                        # Reap and respawn.
+                        try:
+                            p.join(timeout=1)
+                        except Exception:
+                            pass
+                        rec["respawns"] += 1
+                        new_ready = manager.Event()
+                        new_p = mp.Process(
+                            target=_run_eval_server,
+                            args=(rec["gpu_id"], rec["request_q"], new_ready),
+                            daemon=False,
+                            name=f"eval_server_gpu{rec['gpu_id']}",
+                        )
+                        new_p.start()
+                        new_ready.wait(timeout=120)
+                        rec["proc"] = new_p
+                        rec["ready"] = new_ready
+                        # Track the new process for shutdown too.
+                        eval_server_procs.append((new_p, new_ready))
+                        print(
+                            f"[eval_q] gpu={rec['gpu_id']} eval server "
+                            f"respawned (#{rec['respawns']}; exit code "
+                            f"{p.exitcode})",
+                            flush=True,
+                        )
+                stop_event.wait(10)
+
+        threading.Thread(target=_supervise_eval_servers, daemon=True).start()
 
     # Periodic queue-depth logger so it's obvious whether all GPUs are
     # being kept busy or one queue is hogging all the work.
