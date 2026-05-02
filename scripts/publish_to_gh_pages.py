@@ -264,15 +264,15 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 <h3>Sweeps that feed the figures</h3>
 <table class="plan-table">
 <tr><th>Run</th><th>Coverage</th><th>Models</th></tr>
-<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems (excluding multi-GPU)</td><td>gpt-5.5, FW-GLM-5-1, Llama-4-Maverick, Kimi-K2.6</td></tr>
-<tr><td><code>full_l34</code></td><td>L3, L4, original + popcorn, all problems</td><td>same four</td></tr>
-<tr><td><code>comm_l2_popcorn</code></td><td>L2 popcorn multi-GPU subset (problems 2, 11, 18, 27, 34, 38)</td><td>same four</td></tr>
+<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems (excluding multi-GPU)</td><td>gpt-5.5, Kimi-K2.6</td></tr>
+<tr><td><code>full_l34</code></td><td>L3, L4, original + popcorn, all problems</td><td>same two</td></tr>
+<tr><td><code>comm_l2_popcorn</code></td><td>L2 popcorn multi-GPU subset (problems 2, 11, 18, 27, 34, 38)</td><td>same two</td></tr>
 <tr><td><code>ae_focus_popcorn</code></td><td>L1-L4 popcorn, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
 <tr><td><code>ae_focus_original</code></td><td>L1-L2 original, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
 </table>
 
 <h3>Run order</h3>
-<p>Each sweep is GPU-bound and contests the full 8xH100 box, so the four primary sweeps run sequentially. The aeproxy server and the gh-pages publisher run as background daemons throughout. Each step runs in a detached tmux session so SSH disconnects don't kill it.</p>
+<p>Each sweep is GPU-bound and contests the full 8xH100 box, so the primary sweeps run sequentially. The aeproxy server and the gh-pages publisher run as background daemons throughout. Each step runs in a detached tmux session so SSH disconnects don't kill it.</p>
 <table class="plan-table">
 <tr><th>Step</th><th>tmux session</th><th>Command</th><th>Wall-clock</th><th>Parallel with</th></tr>
 <tr><td>0a (background)</td><td><code>aeproxy</code></td><td><code>tmux new -d -s aeproxy 'cd /scratch/tejas/sp26-ae-llm &amp;&amp; export LD_LIBRARY_PATH=/opt/conda/lib:$LD_LIBRARY_PATH; uv run python -m aeproxy.server'</code></td><td>persistent</td><td>everything (idle until step 4)</td></tr>
