@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 4</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_default</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-02 05:39:24 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab current">default</span><span class="tier-tab disabled">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 4</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_default</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-02 05:44:33 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a><a href="../../../v/original/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a><a href="../../../v/popcorn/models/gpt-5.5-priority.html">gpt-5.5-priority</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab current">default</span><span class="tier-tab disabled">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">4_GFVLA_FusedSceneGraphUpdate.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 10</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 10</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -136,5 +136,2299 @@ def get_inputs():
 
 def get_init_inputs():
     return [dim, pair_dim, num_heads]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 308.5s · 142,864 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 308.5s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to write a custom CUDA kernel for this attention block. Let&#x27;s analyze the model:
+
+- LayerNorm on nodes
+- Linear projections Q, K, V (no bias)
+- Dot-product attention scaled by 1/sqrt(head_dim)
+- Pairwise relation MLP bias: pair_feats (B, N, N, P) -&gt; Linear(P,P) -&gt; SiLU -&gt; Linear(P, H) -&gt; permute to (B, H, N, N)
+- Add to logits
+- Mask with edge_mask (B, N, N) unsqueezed to (B, 1, N, N): fill &lt;0.5 with -inf
+- Softmax over last dimension
+- Multiply attn by V
+- Transpose and reshape to (B, N, D)
+- Linear out_proj (no bias)
+- Residual add
+
+Goal: custom kernel faster than PyTorch reference. Need to fuse operations where possible. The reference does multiple intermediate steps and allocations.
+
+We need to consider memory bandwidth vs compute. Let&#x27;s look at the shapes: batch=4, N=24, D=96, P=16, H=4, head_dim=24.
+
+N is small (24), so this is likely memory bound. Fusing the entire thing into one or few kernels will reduce memory bandwidth.
+
+Strategy:
+
+1. Fused kernel that computes Q, K, V from nodes, then computes logits (Q*K^T) and adds rel_bias and mask, computes softmax, then applies attention to V and writes output to a buffer, then out_proj and residual add.
+
+But with N=24, we could compute everything in shared memory for a batch-head tile.
+
+However, the pair_feats MLP needs to be computed too. We could fuse the pair MLP into the attention kernel: each thread or warp computes the rel_bias for a (i,j) pair. P=16, H=4, so the MLP is small: Linear(16,16) -&gt; SiLU -&gt; Linear(16,4). That&#x27;s tiny. We can embed the weights as constants or load them from global memory. The weights will be in the module parameters. In the kernel, we need to pass them.
+
+Alternatively, precompute the rel_mlp output in a separate kernel (since it&#x27;s independent of Q,K,V), but fusing it might be better.
+
+Let&#x27;s think about the full sequence:
+
+- LayerNorm: compute mean, var over D=96 per (B,N). Then affine transform with gamma, beta. This is memory bound.
+
+- Q, K, V linear: each is (B,N,D) @ (D,D) = matrix multiply. With N=24, B=4, it&#x27;s small. Could fuse LayerNorm + QKV projection into one kernel. Or use one kernel for LN and write to shared, then do QKV. But since D=96 is small, a fused kernel per (b,n) thread block that loads the node vector, does LN, then computes Q,K,V via three small matmuls (96x96 each) and stores them is efficient.
+
+Alternatively, we can just let PyTorch compute the LN and QKV via standard ops and only fuse the attention part. But the overhead of many small ops is large. Fusing as much as possible is ideal.
+
+Given the small N, the attention itself is also small: QK^T is (B,H,N,N) = 4*4*24*24 = 9216 elements. Matmuls for Q,K,V are very small. So the entire model is heavily memory bound. Fusing everything into one kernel per (B,H) or per (B,N) would minimize memory traffic.
+
+However, writing a single kernel that does LN -&gt; QKV -&gt; QK^T -&gt; rel_mlp -&gt; softmax -&gt; attn@V -&gt; out_proj -&gt; add is complex but doable.
+
+Simplify: write a kernel for LayerNorm + QKV projection (fused). Then a kernel for attention (including rel_mlp, softmax, attn*V, out_proj, residual add). But the attention kernel would need Q,K,V in global memory. That&#x27;s fine.
+
+Even better: fuse LayerNorm, QKV projection, attention, out_proj, residual add into one big kernel. Let&#x27;s see if that&#x27;s manageable.
+
+Given N=24, D=96, H=4, head_dim=24.
+
+We can have a kernel where each block handles one (b, h) or one (b). Let&#x27;s think about tiling.
+
+If each block handles one batch element b and one head h:
+- It needs to read the node embeddings for all N nodes: N*D = 24*96 = 2304 floats. It also needs pair_feats for all pairs: N*N*P = 24*24*16 = 9216 floats. edge_mask: N*N = 576 floats.
+- It needs weights for LN: D gamma + D beta.
+- It needs weights for Q_proj, K_proj, V_proj: each D*D = 9216 floats. But we only need the slice for head h: head_dim rows of D, so D*head_dim = 96*24 = 2304 floats per projection. Since there are 3 projections, 6912 floats. Or we could pack QKV weights.
+- It needs rel_mlp weights: Linear1 (P,P): 16*16 = 256, bias maybe? The reference uses bias=True by default? Actually nn.Linear(pair_dim, pair_dim) default bias=True. Wait: nn.Linear(pair_dim, pair_dim) includes bias. Then SiLU. Then nn.Linear(pair_dim, num_heads) includes bias. So rel_mlp has two weight matrices and two bias vectors.
+- It needs out_proj weights: D*D = 9216 floats.
+- It writes output: N*D floats.
+
+Total memory traffic per block: input nodes 2304 + pair_feats 9216 + edge_mask 576 + weights ~ 6912+256+16*4+96+9216... roughly. Output 2304.
+
+This is a lot of memory to load per block, but still within L1/L2. However, the weights are shared across blocks. If each block loads all weights, that&#x27;s redundant. But since the model is tiny, it&#x27;s okay.
+
+Alternatively, we can have each block handle one batch element b (all heads). Then compute Q,K,V for all heads. Q,K,V shape is (H,N,head_dim). Then compute attention per head. This way weights for QKV and out_proj are loaded once per block. That seems better.
+
+Let&#x27;s design a kernel where each block handles one batch element b. Threads in block can cooperate on matmuls.
+
+Number of threads: maybe 256 or 512. Since N=24, D=96, head_dim=24.
+
+Approach 1: Use warp-level matrix multiplications or just simple loops since sizes are tiny. Since N and D are small, a straightforward implementation with each thread handling a few elements is enough. We want to minimize memory round-trips.
+
+Let&#x27;s break the kernel into steps:
+
+1. Load node embeddings for all N nodes into shared memory: nodes_shared[N][D] (24*96 = 2304 floats). If fp32, that&#x27;s 9KB. Fine.
+2. Compute LayerNorm in registers or shared memory: each thread can process a chunk of D. Compute mean and variance across D per node. Need cooperative reduction. Since D=96 and block size maybe 256, we can have each thread process one node? No, block handles one batch b, but there are N=24 nodes. We could assign a warp per node (or a group of threads). With 256 threads, we can have 24 warps? 24*32=768 &gt; 256. Alternatively, we can have each thread process a subset of nodes and dimensions.
+
+Actually, since there are only 24 nodes, we can have each thread handle one node if we launch 24 threads per block. But 24 is not a multiple of warp size. We could have each warp (32 threads) handle one node, with some threads idle. 24 warps = 768 threads. That&#x27;s okay but maybe more than needed. Or we can have 96 threads handle 4 nodes each (24/6=4? no). Let&#x27;s think.
+
+A more systematic way: launch a block of 256 threads. Each thread handles some dimensions for all nodes? Or some nodes.
+
+Because N and D are small, we can compute LN with each warp handling one node: 24 warps = 768 threads. But we can also compute LN with a block of 128 threads handling 4 nodes each (32 threads per node). 128 threads is nice.
+
+Then Q,K,V projection: after LN, each node vector x (size D) is multiplied by weight matrices W_q, W_k, W_v (D x D). Since D=96, this is a small matmul. We can compute Q = x @ W_q^T? Wait, linear is y = x @ W^T. So for each node, it&#x27;s (1,D) @ (D,D) -&gt; (1,D). With N=24, it&#x27;s (24,96) @ (96,96) -&gt; (24,96). We can do this as a batched matmul. Since it&#x27;s small, we can compute it with each thread handling a few output elements. For example, each thread computes one output dimension for one node.
+
+Better: use shared memory for W_q etc. Load W_q into shared memory? W_q size 96x96 = 9216 floats = 36KB. That&#x27;s too large for shared memory per block (max 48KB or 96KB depending on arch). Loading all three would exceed. But we can load one at a time. Or we can keep W_q in global memory and each thread loads a subset of rows. Since it&#x27;s small and coalesced, reading from global memory (likely L2 cached) is fine.
+
+Actually, since the weights are small and reused heavily, they will be in L1/L2.
+
+Given the complexity of writing a highly optimized matmul for such tiny sizes, maybe a simpler approach: just compute Q,K,V and Out_proj using loops and hope the compiler optimizes. Since the whole thing is memory bound, the key is fusion, not peak FLOP.
+
+So design: one kernel per batch element. Each thread block has some threads. Let&#x27;s say blockDim.x = 128.
+
+We can compute LN first. Then compute Q,K,V for all nodes, storing in shared memory or registers. Q,K,V size: 3 * N * D = 3*24*96 = 6912 floats = 27KB. That fits in shared memory. Then compute attention.
+
+But attention per head: Q (H,N,head_dim), K (H,N,head_dim), V (H,N,head_dim). We can store Q,K,V in shared memory.
+
+Then for each head h and query i, compute dot products with all keys j. N*N*head_dim = 4*24*24*24 = 55296 multiplications. Very small. Each thread can compute one or more logits.
+
+Let&#x27;s think of a simpler kernel: just fuse the attention part (from Q,K,V to output) and leave LN and QKV projections to PyTorch? But then we have many small ops. However, maybe we can fuse LN + QKV into one kernel, then attention + out_proj + residual into another. That&#x27;s manageable and will likely give significant speedup.
+
+But to maximize speedup, let&#x27;s try to fuse as much as possible.
+
+Given the architecture, maybe we can launch one kernel per batch element with 256 threads. Steps:
+
+Shared memory:
+- nodes: N * D = 2304 floats.
+- QKV: 3 * N * D = 6912 floats.
+- attn: N * N = 576 floats per head? Or we can compute softmax on the fly and accumulate into output.
+- pair_feats: N * N * P = 9216 floats. That&#x27;s large. 9216*4 = 36KB. If we load pair_feats into shared memory, plus nodes, plus QKV, that&#x27;s ~54KB. Might be okay if we have 64KB shared memory. But pair_feats is only needed for the rel_mlp. Since P=16, we could process pair features in registers per thread.
+
+Alternative: don&#x27;t put pair_feats in shared memory. Each thread or warp loads the pair_feat vector for a specific (i,j) from global memory when computing the bias.
+
+Given N=24, total pairs = 576. Each pair has P=16 features. If each thread processes one pair, we need enough threads. With 256 threads, each thread processes ~2.25 pairs. That works. But we also need to compute QK^T for those pairs, which requires reading Q[i] and K[j]. Q and K can be in shared memory.
+
+So let&#x27;s think of the attention kernel (fused from Q,K,V to output). But Q,K,V are computed by previous kernel or this kernel.
+
+Let&#x27;s try to write a single kernel that does everything from nodes to final output, processing one batch element per block.
+
+Block configuration: blockDim.x = 256. We handle one batch element per block.
+
+Shared memory layout:
+- smem_nodes: N * D floats: stores original nodes (for residual) and normalized nodes? Or we can store normalized nodes.
+Actually we need original nodes for the final residual add. We can load them and keep them in shared memory or registers.
+- smem_qkv: maybe not needed if we compute QKV and store them in shared memory.
+- smem_out: N * D floats for output of attention before out_proj? Or we can accumulate directly.
+
+Better approach: compute LN and QKV into smem_qkv. Then compute attention and out_proj directly into registers, writing final result (residual added) to global memory.
+
+Let&#x27;s outline the kernel steps for a block handling one batch element:
+
+**Step 0: Load nodes and weights**
+- Each thread loads a portion of nodes (B,N,D) into shared memory: smem_nodes[N][D].
+- Also load LN gamma, beta into shared memory or registers.
+
+**Step 1: LayerNorm**
+- Compute mean and variance per node. Since D=96, we can have each warp handle one node. 24 warps -&gt; 768 threads. But we can also do it with 96 threads per node? That&#x27;s too many.
+Simpler: have the block compute LN sequentially node by node? With 256 threads, we can process multiple nodes simultaneously.
+Option: tile over nodes. Let each thread handle a slice of D for all nodes? For mean: each thread sums its D&#x27; elements, then block-level reduction per node. But block-level reduction for each node separately is tricky.
+Alternative: process one node at a time with all threads. 256 threads &gt; D=96, so we can have 96 active threads for a node. Since 96 doesn&#x27;t divide warp size nicely, but we can still do it. Let&#x27;s have the first 128 threads (4 warps) handle node 0, next 128 handle node 1, etc. But 24 nodes * 96 threads = 2304 thread instances. With 256 threads, we process 2 nodes per iteration (256 threads handle 2 nodes: 128 threads each). 128 threads for D=96 means 96 active, 32 idle. That&#x27;s okay.
+So we loop over nodes in groups of 2. For each group, compute mean and var using warp reductions, then normalize and write back to smem_nodes. Then apply gamma and beta.
+
+Wait, if we have 256 threads, we can handle floor(256/96)=2 nodes concurrently (using 192 threads), leaving 64 threads idle. Or handle 3 nodes concurrently using 288 threads &gt; 256. So 2 nodes at a time. 24 nodes -&gt; 12 iterations.
+
+Alternatively, handle 4 nodes concurrently with 64 threads each. 64 threads &gt; D=96? No, 64 &lt; 96. So each thread handles 2 dimensions. That&#x27;s actually nice: 4 nodes per iteration, 24 nodes -&gt; 6 iterations. Each thread processes 2 dims for one node. Let&#x27;s do that.
+
+So we have 256 threads = 64 threads per node * 4 nodes.
+Each thread tid is assigned to node_idx = (tid / 64) in the group, and dim_idx = tid % 64, handling 2 dims: dim0 = dim_idx, dim1 = dim_idx + 64. D=96, so dim1 might be out of range for dim_idx &gt;=32. So we can have each thread handle 1 or 2 dims. Actually, 96/64 = 1.5. Not clean.
+Alternative: 32 threads per node (one warp). 256 threads = 8 warps -&gt; 8 nodes concurrently. D=96, each thread handles 3 dims. That&#x27;s perfect! 32 threads * 3 dims = 96. Yes!
+So assign warp w (0..7) to node n = base_n + w. Each lane l (0..31) handles dims l, l+32, l+64. So each warp handles one node.
+24 nodes -&gt; 3 iterations (8 nodes per iteration). 256 threads = 8 warps.
+
+This is great. Within each warp, we can compute mean and variance efficiently using warp shuffles.
+
+**Step 2: QKV projection**
+After LN, each node vector x (size D) is in smem_nodes. Now we need Q = x @ W_q^T, K = x @ W_k^T, V = x @ W_v^T. W matrices are (D,D). We can store Q,K,V in shared memory: smem_qkv[3][H][N][head_dim] or smem_qkv[3][N][D].
+
+Again, we can use warps. For each node and each projection, we need matrix-vector multiplication of size D x D. But D=96. Each warp can compute one projection for one node: 32 threads computing 96 output dims? That&#x27;s 3 dims per thread. Or we can compute all projections for a node in parallel.
+
+Since Q,K,V are independent, we could have each warp compute Q for a node, another warp compute K, etc. But we have 8 warps. For 8 nodes, we need 3 projections each, so 24 warps. We have only 8 warps per iteration. But we can do 3 iterations for Q, 3 for K, 3 for V? Or we can use the 8 warps to compute partial sums and accumulate.
+
+Simpler: after LN, each thread can compute a subset of Q,K,V elements. For example, each thread handles 3 Q dims, 3 K dims, 3 V dims for one node. But that&#x27;s a lot of registers.
+
+Alternative: compute Q,K,V one at a time. Using all 256 threads to compute Q for all 24 nodes. How?
+- We have W_q in global memory. Each thread handles a block of output dims for a block of nodes.
+- For node n, output dim d is sum_{k=0}^{D-1} x[n][k] * W_q[d][k].
+- We can have each thread compute one output element (n,d). Total elements = N*D = 2304. With 256 threads, each computes 9 elements. That&#x27;s small loops. We can store results in smem_q or registers.
+
+Actually, since N*D=2304, we can launch 2304 threads per batch element? But we are limited to 1024 threads per block. 2304 &gt; 1024. So we need multiple blocks per batch? We can also have each block handle a subset of nodes.
+
+But maybe launching multiple blocks per batch is fine.
+
+Let&#x27;s think differently: Instead of one block per batch, use multiple blocks per batch. For example, each block handles a tile of nodes and heads.
+
+Given the small problem size, perhaps the reference is already quite fast. But we can still beat it by fusing.
+
+The reference does many separate kernels:
+1. LayerNorm
+2. q_proj, k_proj, v_proj (3 gemms)
+3. matmul QK^T
+4. rel_mlp (2 linears + activation)
+5. add bias
+6. masked_fill
+7. softmax
+8. matmul attn @ V
+9. transpose + reshape
+10. out_proj
+11. add residual
+
+Each of these launches a kernel and writes to global memory. Fusing them into 1 or 2 kernels will drastically reduce memory bandwidth.
+
+So even if our fused kernel is not perfectly optimized, it should be faster.
+
+Let&#x27;s design two kernels:
+- Kernel 1: Fused LayerNorm + QKV projection. Input: nodes (B,N,D). Output: qkv (B,3,N,D) or separate q,k,v.
+- Kernel 2: Fused attention + out_proj + residual. Input: q,k,v (B,H,N,head_dim), pair_feats, edge_mask, original nodes. Output: updated nodes.
+
+Actually, kernel 2 can also incorporate the rel_mlp on pair_feats. Since pair_feats is independent of q,k,v, we could either precompute rel_mlp output in a small kernel or fuse it into kernel 2.
+
+Given P=16 and H=4, each pair&#x27;s MLP is tiny. Fusing into kernel 2 is easy: each thread computing a logit also computes the rel_bias for that pair.
+
+Let&#x27;s start with Kernel 1: LayerNorm + QKV.
+
+We can have each block handle one batch element. Threads: 256 or 512.
+
+Data:
+- nodes: (N,D)
+- gamma, beta: (D)
+- W_q, W_k, W_v: each (D,D)
+- Output qkv: (3,N,D)
+
+Simplify: store qkv in global memory as three separate tensors or one contiguous. Let&#x27;s produce three separate tensors for clarity.
+
+Implementation plan for Kernel 1:
+- Block size: 256 threads.
+- Each block handles one batch element b.
+- Shared memory: smem_nodes[N][D] to store normalized nodes. We also need original nodes for residual in Kernel 2, so we might not need them here. Kernel 1 writes q,k,v to global memory.
+- To compute LN: we&#x27;ll iterate over nodes in groups. As above, use 8 warps (256 threads) to process 8 nodes at a time. Each warp (32 threads) handles one node, with lane l handling dims l, l+32, l+64 (3 dims per lane).
+- For each node, compute mean: sum of 96 elements. Each lane sums its 3 elements, then warp shuffle sum. Store mean in a register.
+- Compute variance: sum of (x - mean)^2 for 3 dims, warp shuffle sum.
+- Apply normalization: x = (x - mean) * rsqrt(var + eps) * gamma + beta. Each lane updates its 3 dims in smem_nodes.
+
+Wait, do we need the original nodes for residual? Kernel 2 does residual add. We can pass original nodes to Kernel 2. So Kernel 1 only needs normalized nodes.
+But we only have smem_nodes for normalized nodes. After LN, we compute Q,K,V. We can reuse the same smem for intermediate results.
+
+QKV projection:
+We need to compute Q = normalized_nodes @ W_q^T. The output is (N,D).
+We can have each thread compute one output element: for a given (n,d), loop over k=0..D-1 and accumulate smem_nodes[n][k] * W_q[d][k].
+But that requires reading W_q from global memory D times per output element. With N*D=2304 output elements and 256 threads, each thread computes 9 outputs. Each output loops over 96. So each thread does 864 FMAs. Total FLOPs ~ 3 * 2304 * 96 = 663k. Very small.
+Memory reads: each thread reads W_q[d][k] for its d. If we coalesce, threads with same d but different n read same row of W_q. That can be broadcast or cached. Good.
+
+Since D=96 is small, we can store W_q in shared memory? 96x96 floats = 36KB. With 48KB limit, we can fit one weight matrix. But we have three. We can load W_q, compute Q, load W_k, compute K, load W_v, compute V. That&#x27;s fine.
+
+Shared memory for W: 96x96 = 9216 floats. Smem_nodes: 24x96 = 2304 floats. Total ~46KB (if we keep both). Wait, 9216+2304=11520 floats * 4 bytes = 46KB. Actually 11520*4 = 46080 bytes. That&#x27;s under 48KB. Good. We can load one weight matrix at a time.
+
+But we need to store Q,K,V outputs. We can write directly to global memory.
+
+So Kernel 1 steps:
+1. Load nodes into smem_nodes.
+2. Compute LN, store normalized nodes back into smem_nodes.
+3. Load W_q into smem_w (D x D). Compute Q: each thread handles a subset of (n,d) pairs. Write to global memory q[b,n,d].
+4. Load W_k into smem_w. Compute K. Write to k.
+5. Load W_v into smem_w. Compute V. Write to v.
+
+Wait, W_q is (D,D). In PyTorch, linear layer weight is (out_features, in_features). So q_proj.weight shape is (D,D). The operation is y = x @ W^T. So we need W_q^T. If we store W_q in shared memory as (D,D), we can read W_q[d][k] (i.e., row d). So we need to load weight transposed or read accordingly. But in global memory, weights are stored row-major: W_q[out,in]. So W_q[d][k] is contiguous for fixed d and varying k? Actually, if we have threads in a warp with same d but different n, they all access W_q[d][*]. If k is the loop index, they access the same row but different columns. That&#x27;s strided by in_features=96. Not coalesced for the warp if they access different k simultaneously? Wait, in the inner loop, all threads access the same k at the same time (since k is loop index). So they all access W_q[d][k] for their own d. For a fixed k and varying d, accesses are to different rows, which are separated by in_features=96 floats. That is not fully coalesced but cached. Since D=96 is tiny, loads will hit L2/L1.
+Alternatively, we can transpose the weight when loading into shared memory: load W_q^T so that smem_w[k][d] = W_q[d][k]. Then in the loop over k, threads with same d but different n read smem_w[k][d] which is the same address. That&#x27;s broadcast. Good.
+
+Let&#x27;s define: smem_w[k][d] = W_q[d][k] (transposed). Then compute dot product: for each (n,d), sum_k smem_nodes[n][k] * smem_w[k][d].
+In the inner loop over k, each thread reads smem_nodes[n][k] and smem_w[k][d]. Threads with same k and different d read adjacent d from smem_w[k][*]. That&#x27;s coalesced (if d is threadIdx.x). Nice.
+
+So for QKV projection, we can have each thread assigned to a (n,d) pair. Let&#x27;s say we flatten (n,d) into 24*96=2304 indices. Block has 256 threads. Each thread computes ceil(2304/256)=9 elements. We can compute start = threadIdx.x * 9, end = min(start+9, 2304). For each idx, n = idx / D, d = idx % D. Then accumulate over k.
+But each thread has a different n and d. In the inner loop over k, each thread reads smem_nodes[n][k] (different n) and smem_w[k][d] (different d). This is good for coalescing: for a fixed k, threads read different n from smem_nodes (adjacent if n varies contiguously) and different d from smem_w (adjacent if d varies contiguously). Actually, if threadIdx.x maps to idx, then n and d vary in a mixed way. We can map threadIdx.x to d first, then n: idx = n*D + d? Or d*N + n? Let&#x27;s think.
+
+If we map linear idx = n*D + d, then for consecutive threads, n increases slowly and d increases fast. In the inner loop k, they read smem_nodes[n][k] where n is almost same for a block of 96 threads. And smem_w[k][d] where d differs across threads. That is okay: smem_w[k][d] is coalesced for d. smem_nodes[n][k] might have bank conflicts if many threads read same n? Actually, if 96 consecutive threads have the same n (since D=96), they all read smem_nodes[n][k] which is the same address. That causes broadcast (no bank conflict on read) or serialization? In shared memory, if all threads read the same address, it&#x27;s a broadcast and fast. Great.
+If we have 256 threads, first 96 have n=0, next 96 have n=1, etc. So groups of threads read same n, different d. Broadcast for nodes, coalesced for weights. Perfect.
+
+So mapping: idx = threadIdx.x + blockIdx.x * blockDim.x? No, block handles one batch, so within block:
+idx_start = threadIdx.x * elems_per_thread.
+But for better occupancy, we want consecutive threads to have consecutive d. Since blockDim.x=256 and D=96, 96 threads map to n=0 (all d), next 96 map to n=1 (d), next 64 map to n=2 (d=0..63). That&#x27;s fine.
+
+Actually, we can compute total_elems = N * D = 2304. For each thread t, for e from t to total_elems step blockDim.x: this gives strided distribution, which is also fine. In that case, consecutive threads have consecutive e, so same as above. Let&#x27;s use that pattern.
+
+**Kernel 2: Attention + rel_mlp + out_proj + residual**
+
+Inputs:
+- q: (B, H, N, head_dim)
+- k: (B, H, N, head_dim)
+- v: (B, H, N, head_dim)
+- pair_feats: (B, N, N, P)
+- edge_mask: (B, N, N)
+- nodes_orig: (B, N, D) (for residual)
+- W_out: (D, D)
+Output: updated nodes (B, N, D)
+
+We can fuse everything.
+
+Let&#x27;s think of tiling by head and query.
+
+Since N=24, we can process one (b, h) per block or multiple. Let&#x27;s say each block handles one batch element b and all heads h. That means computing attention for all H=4 heads.
+
+Block size: maybe 256 threads.
+
+We need to compute logits (H, N, N). For each head, we compute Q*K^T (N,N). Then add rel_bias (H,N,N) and mask (N,N). Then softmax over j. Then multiply by V (N,head_dim). Then we have output per head (N,head_dim). Concatenate heads to (N,D). Then out_proj (N,D). Then add residual.
+
+We can avoid materializing the full attn matrix by computing softmax on the fly and accumulating into output.
+
+But for softmax, we need the max logit and sum of exp for each query i. So we need to compute all logits for a fixed query i before softmax. N=24 is tiny, so we can compute logits for all j in registers or shared memory.
+
+Let&#x27;s define for a block handling batch b:
+- Load q, k, v for all heads into shared memory? q size = H*N*head_dim = 4*24*24 = 2304 floats. Same for k and v. Total 6912 floats = 27KB. This fits.
+- Alternatively, we can keep q,k,v in global memory and load as needed. Since N is tiny, shared memory is good.
+
+But we also need pair_feats: N*N*P = 24*24*16 = 9216 floats = 36KB. That&#x27;s large but fits if we have &gt;64KB shared. If we have 48KB limit, 27+36 = 63KB &gt; 48KB. So we cannot put everything in shared memory.
+
+But pair_feats is only needed for rel_mlp. Since P=16, we can compute rel_mlp on the fly without storing all pair_feats in shared memory. Each thread loads pair_feats[b,i,j,:] for its (i,j) directly from global memory. Since N is small, the loads are cached.
+
+Similarly, edge_mask is small: 576 floats. Can keep in registers or shared.
+
+So shared memory for Kernel 2:
+- smem_q: H*N*head_dim = 2304 floats
+- smem_k: 2304 floats
+- smem_v: 2304 floats
+Total = 6912 floats = 27KB.
+We also might want smem_edge_mask: N*N = 576 floats = 2.3KB.
+Or we can keep edge_mask in global memory and load as needed.
+
+We also need to store the attention output before out_proj? Or we can accumulate out_proj directly.
+Out_proj is (N,D) = (24,96). We can compute it after we have ctx (N,D). ctx = attention output (N,D). Then out = ctx @ W_out^T + nodes_orig.
+
+We can compute ctx into shared memory or registers, then do out_proj.
+
+Let&#x27;s detail the steps for a block handling batch b:
+
+1. Load q,k,v from global memory into smem_q, smem_k, smem_v.
+   q is stored as (B,H,N,head_dim). We can load all elements. With 256 threads, each loads ceil(6912/256)=27 elements. Coalesced? If we flatten and strided, yes.
+
+2. For each head h (0..H-1):
+   For each query i (0..N-1):
+     - Compute max logit over j:
+       - For each j, compute dot = sum_{d=0}^{head_dim-1} q[h][i][d] * k[h][j][d].
+       - Compute rel_bias = rel_mlp(pair_feats[b][i][j][:]). Since P=16 and MLP is small, we can compute it inline.
+       - Add rel_bias to dot.
+       - If edge_mask[b][i][j] &lt; 0.5, set to -inf.
+       - Compute max across j.
+     - Compute softmax denominator: sum_j exp(dot - max).
+     - Compute output for query i: sum_j exp(dot - max) / denom * v[h][j][d] for each d.
+   Store ctx for head h.
+
+   N=24, H=4. Total queries = H*N = 96. We have 256 threads. We could assign each thread to one query. That would be 96 threads active, 160 idle. Or assign 2 threads per query to split j reduction? Not needed. Or assign each warp (32 threads) to a query: 96 queries need 3 warps each? No, 32 threads for one query is overkill for N=24. But we can have a warp compute one query: lane 0..23 compute dot products with j=lane, lanes 24..31 are idle. Then warp-level reduction for max and sum.
+   Actually, a warp can compute the dot products for all j in parallel. Each lane handles one j. Since N=24 &lt;= 32, this fits perfectly in a warp! Excellent.
+   So each warp handles one query i for one head h. 32 threads, 24 active.
+   With 256 threads = 8 warps, we can process 8 queries concurrently. Total queries = H*N = 96. So we need 96/8 = 12 iterations.
+
+   Let&#x27;s map warp w (0..7) to query index qid = iter*8 + w. qid maps to h = qid / N, i = qid % N.
+   For each warp:
+   - Load q vector for (h,i) from smem_q into registers (24 floats per thread? No, each thread loads one element? Actually q vector is head_dim=24 floats. We need all elements in registers for the dot product. We can have lane 0..23 each load one element? But then the dot product is computed by having each lane compute q[d] * k_j[d] for a specific d? No, each lane j computes dot product over d. So we need the entire q vector in all threads of the warp, or we need to distribute.
+   Better: Each thread in the warp computes dot product for its assigned j. To compute dot product, it needs q_i and k_j. k_j is in smem_k for this j. q_i is same for all threads. We can load q_i into a register array or shared memory and broadcast to all threads.
+   Since head_dim=24, each thread can load all 24 elements of q_i into registers? 24 floats = 96 bytes. That&#x27;s fine.
+   Or we can have each thread load one element of q_i and do warp shuffles to broadcast during the dot product. But 24 is small; loading all 24 into registers per thread is okay.
+
+   Actually, since each warp handles one query, we can have lane 0 load q_i[0], lane 1 load q_i[1], ... lane 23 load q_i[23], then compute dot product via warp shuffle? That&#x27;s more complex. Simpler: have thread 0 of the warp load the 24 floats of q_i into a shared memory array or registers, then broadcast? Or just have each thread load the 24 floats by looping. Since 24 is small, a loop is fine.
+
+   Similarly, each thread j loads k_j (24 floats) from smem_k.
+
+   Then dot = sum_{d=0}^{23} q_i[d] * k_j[d]. Each thread does 24 FMAs.
+
+   Then compute rel_bias: each thread loads pair_feats[b][i][j][0..P-1] (P=16). Compute MLP:
+     hidden = SiLU( W1 @ pair_feat + b1 )
+     bias = W2 @ hidden + b2
+   W1 shape (P,P) = (16,16), b1 (16). W2 shape (H,P) = (4,16), b2 (H).
+   Actually, the second linear maps to num_heads. So W2 is (num_heads, pair_dim). So for head h, we need row h of W2.
+   We can pre-load W1, b1, W2, b2 into shared memory or registers. They are small: W1 256 floats, b1 16, W2 64, b2 4. Total &lt; 1KB. Load into shared memory or just read from global memory (cached).
+
+   So each thread computes its own rel_bias for its (i,j) and head h? Wait, each warp handles one (h,i), and each thread in warp handles one j. The rel_bias depends on (i,j) and head h? Actually rel_mlp(pair_feats).permute(0,3,1,2) gives (B,H,N,N). So for each pair (i,j) and head h, there is a scalar bias. So each thread computes the bias for its j.
+   Steps:
+   - Load pair_feat = pair_feats[b, i, j, :] (16 floats).
+   - Compute tmp = matvec(W1, pair_feat) + b1. Since W1 is 16x16, each thread does 16 FMAs.
+   - Apply SiLU.
+   - Compute bias = dot(W2[h,:], tmp) + b2[h]. 16 FMAs.
+   Total extra FLOPs per thread: ~32.
+
+   Then logit = dot * scale + bias.
+   If edge_mask[b,i,j] &lt; 0.5, set to -inf.
+
+   Then warp-level reduction for max over j (only first 24 lanes participate).
+   Then compute exp(logit - max). If -inf, exp is 0.
+   Then warp-level reduction for sum of exp.
+
+   Then compute attn_weight = exp(logit - max) / sum.
+   Then compute output vector for this query: out_d = sum_j attn_weight * v_j[d] for d=0..head_dim-1.
+   Again, each thread j has v_j (24 floats). We need to compute a weighted sum across threads in the warp.
+   For each d, we can have each thread j provide v_j[d] * attn_weight_j, then warp shfl reduction sum.
+   Since head_dim=24, we need 24 reductions. Each reduction is over 24 lanes. That&#x27;s 24 * 24 = 576 shuffles per warp. That&#x27;s okay.
+   Alternatively, we can accumulate in shared memory: have a smem_acc[head_dim] per warp. Each thread j adds attn_weight_j * v_j[d] to smem_acc[d]. But atomic adds? No, we can have a warp-level segmented reduction using shfl. Using shuffles is cleaner and avoids shared memory.
+
+   After we have the output vector for (h,i) (24 floats), we write it to global memory or shared memory as ctx[b, h, i, d].
+
+3. After all warps finish, we have ctx in global memory or smem. ctx shape (B,H,N,head_dim) = same as q. We can write it to global memory, then do out_proj and residual.
+
+Or we can fuse out_proj into the same kernel:
+- After computing ctx for a query i, we have a vector of length head_dim. We can accumulate the final output for node i directly.
+- out_proj: y = ctx @ W_out^T. Since ctx is (N,D) and W_out is (D,D). Node i&#x27;s output is sum_{d=0}^{D-1} ctx[i][d] * W_out[out_d][d]. This is a matrix-vector product across D=96.
+- But ctx is split by heads. For each head h, we have head_dim elements. So the full ctx vector for node i is D elements (H*head_dim). We can compute the matvec after we have the full ctx.
+- However, in our warp-per-query schedule, we compute one head at a time. For node i, we need to combine all heads before out_proj. That suggests writing ctx to shared memory, then doing out_proj.
+
+Since D=96 and N=24, we can store ctx in shared memory: N*D = 2304 floats = 9KB. Then add a second phase for out_proj + residual.
+
+Kernel 2 plan:
+Shared memory:
+- smem_q: H*N*head_dim = 2304 floats
+- smem_k: 2304 floats
+- smem_v: 2304 floats
+- smem_ctx: N*D = 2304 floats (for attention output)
+Total = 9KB + 9KB + 9KB + 9KB = 36KB. Fits.
+Edge mask: we can keep in global or smem. 576 floats. If we add, total 38KB. Still okay.
+Weight for rel_mlp: ~300 floats. Negligible.
+
+Algorithm:
+Phase 1: Load q, k, v into smem.
+Phase 2: Compute attention.
+  - We need to write ctx into smem_ctx. smem_ctx layout: [N][D]. For each head h and query i, we compute output vector of length head_dim and write to smem_ctx[i][h*head_dim + d].
+  - Warps process queries as described. Since there are 96 queries (H*N) and 8 warps per block, we iterate 12 times.
+  - For iteration iter, warp_id = w, qid = iter*8 + w.
+    if qid &lt; H*N:
+      h = qid / N
+      i = qid % N
+      Compute logit for each j (threadIdx.x%32 = j if j&lt;24 else ignore).
+      Compute softmax.
+      Compute output vector o[head_dim].
+      Write o[d] to smem_ctx[i][h*head_dim + d] for d=0..head_dim-1.
+Phase 3: __syncthreads().
+Phase 4: Out_proj + residual.
+  - We have smem_ctx (N,D). Need to compute out = smem_ctx @ W_out^T + nodes_orig.
+  - This is a (N,D) @ (D,D) -&gt; (N,D) matmul. Same as QKV projection. We can use same pattern: total_elems = N*D = 2304. Each thread computes a subset of output elements.
+  - Load W_out into shared memory transposed. Or reuse the same smem buffer for W (we can overwrite smem_q since we&#x27;re done with q,k,v).
+  - Write result to global memory: nodes_new[b,n,d] = out + nodes_orig[b,n,d].
+
+This seems very solid.
+
+Potential issues:
+- Kernels are small; we need to ensure no unnecessary global memory writes/reads.
+- We need to pass weights to the kernel. In the Python code, we will extract weight tensors from the nn.Linear modules. We need to handle the fact that the weights are transposed for the matmul.
+
+Wait, in PyTorch, nn.Linear weight shape is (out_features, in_features). So:
+- q_proj.weight: (D, D). The operation is nodes @ q_proj.weight.t().
+- In the kernel, we can just pass the weight pointer and treat it as (D, D) but note that the memory layout is row-major with in_features columns. So weight[d][k] is at pointer + d*D + k.
+For our shared memory load, we want smem_w[k][d] = weight[d][k] (transposed). So when loading from global to shared, thread t loads weight[d][t] and writes to smem_w[t][d]? We need to be careful.
+
+Let&#x27;s think about the weight loading for QKV kernel:
+We have smem_w of size D*D. We want smem_w[k][d] = weight[d][k].
+Global weight pointer w. w[d*D + k] = weight[d][k].
+To load transposed into shared memory, we can have each thread read one element and write to transposed position.
+But D*D=9216. Block has 256 threads. Each thread loads 36 elements. Since the access pattern is strided, coalescing is not perfect but okay for small sizes.
+Alternatively, we can have each thread load a row of weight? But we want smem_w in a layout where index [k][d] is contiguous in d. That is, smem_w is stored as [D][D] where the second dimension is d. Wait, if we declare `float smem_w[D][D];` then `smem_w[k][d]` is at offset k*D + d. So we want to fill smem_w such that `smem_w[k][d] = weight[d][k]`.
+This is exactly a transpose. We can have each thread read weight[d*D + k] and write to smem_w[k*D + d]. To make writes coalesced, we can have threads in a warp write consecutive d for a fixed k. So we can assign thread t to compute k = t / D? That doesn&#x27;t map well.
+Better: iterate over k. For each k, have threads 0..D-1 copy weight[d*D + k] to smem_w[k*D + d]. That is, for a fixed k, thread d reads weight[d*D + k] (stride D between threads) and writes to smem_w[k*D + d] (contiguous). The reads are strided by D=96 floats = 384 bytes. That&#x27;s not coalesced but again small. Writes are coalesced.
+We can also have threads read contiguous chunks: thread t reads weight[t] (contiguous) and writes to smem_w[t % D][t / D]? That gives coalesced reads but strided writes. Since the memory is tiny, either way is fine.
+
+I think we should go ahead and write the kernel with careful but not overly complex indexing.
+
+**Key details for Kernel 1 (LN + QKV):**
+
+```cuda
+__global__ void fused_ln_qkv_kernel(
+    const float* nodes,       // (B, N, D)
+    const float* gamma,
+    const float* beta,
+    const float* Wq, const float* Wk, const float* Wv,
+    float* q, float* k, float* v,  // (B, N, D)
+    int B, int N, int D, float eps) {
+```
+
+But we can fuse B dimension: gridDim.x = B.
+
+Shared memory:
+- float smem_nodes[N * D];  // normalized nodes
+- float smem_w[D * D];      // weight for one projection
+
+Let&#x27;s keep it dynamic: `extern __shared__ float smem[];`
+
+But sizes are small and compile-time constants are easier. Since N=24? Actually N can vary? The problem says batch_size=4, num_objects=24, dim=96, pair_dim=16, num_heads=4. But the kernel must handle the constructor arguments, so N and D are runtime values. However, in the kernel we can treat them as dynamic. But for small fixed sizes, using templates would be best. But since N and D are not known at compile time in the kernel? Actually dim, pair_dim, num_heads are constructor args. In the forward call, we get nodes shape (B,N,D). The kernel can handle variable N and D but with loops.
+
+However, the evaluation might use the provided sizes but we must support the general case? The reference model is general. The problem says &quot;Accept the same constructor arguments as Model.&quot; So forward should handle any N and D matching dim. But the shapes are given by inputs. We can write a generic kernel with loops.
+
+Given the small sizes, we should pass N, D, H, head_dim, P as arguments.
+
+Simplify: Since the problem gives fixed sizes in get_inputs, maybe we can assume those? But to be safe, let&#x27;s write generic.
+
+However, using dynamic shared memory with variable N and D is okay.
+
+Let&#x27;s decide on a concrete design and write the code.
+
+**Kernel 1 details:**
+
+Each block handles one batch index b. threads = 256.
+
+Shared memory:
+- smem_nodes: N*D floats
+- smem_w: D*D floats (for weight)
+Total dynamic shared = (N*D + D*D) * sizeof(float). For N=24,D=96: (2304+9216)*4 = 46080 bytes. This is close to 48KB limit. Most GPUs have 48KB default shared. Some have 96KB. To be safe, we can use static arrays if sizes are known? But they are runtime.
+
+Actually, 46080 &lt; 49152 (48KB). So it fits in default shared memory. Good.
+
+But we need to pass N and D as ints. Since they are small, we can allocate dynamic shared memory.
+
+Loading nodes:
+`s_nodes = smem;`
+Each thread loads a portion of nodes: for tid from threadIdx.x to N*D step blockDim.x: 
+  idx = b*N*D + tid;
+  s_nodes[tid] = nodes[idx];
+But nodes is (B,N,D). We need to handle out-of-bounds if N*D is not multiple of blockDim.x.
+
+Wait, blockDim.x=256, N*D=2304. 2304/256 = 9. So each thread loads exactly 9 elements. No out-of-bounds if tid &lt; 2304? Actually 256*9 = 2304. Perfect. So each thread t (0..255) loads elements t, t+256, ..., t+2048. That&#x27;s 9 loads per thread.
+
+Loading gamma, beta: D=96 elements. We can load into registers or shared memory. Since all threads need them, shared is fine. But we have limited shared memory. We can load gamma and beta into the first 2*D floats of smem_w temporarily? Or just load into registers per thread? Since each thread only needs the gamma and beta for the dims it processes, we can load into shared memory by reusing the first part of smem_w.
+
+ simpler: load gamma and beta into shared memory: `float* s_gamma = smem_w; float* s_beta = smem_w + D;` Then after LN, we can reuse smem_w for weights.
+
+LN computation:
+We decided to use 8 warps, 8 nodes at a time. Each warp handles one node. But with N=24, we need 3 iterations of 8 nodes. In a generic kernel with variable N, we need loops.
+
+Let&#x27;s implement a loop over node groups. group_size = blockDim.x / 32 = 8 warps. But if N &lt; 8, some warps idle. That&#x27;s fine.
+
+For each group start g = warp_id * 32 to N:
+  node_idx = g + warp_id; // if we process 8 nodes per iteration
+Actually, let&#x27;s fix: each iteration processes up to num_warps nodes. num_warps = blockDim.x / 32.
+For iter = 0; iter &lt; N; iter += num_warps:
+  node = iter + warp_id;
+  if (node &lt; N) {
+    // this warp processes node
+    // offset = node * D
+    float sum = 0;
+    // each lane l handles dims l, l+32, l+64 (if &lt; D)
+    for (int d = lane; d &lt; D; d += 32) {
+      float val = s_nodes[node*D + d];
+      sum += val;
+    }
+    // warp reduce sum
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset /= 2) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    float mean = sum / D;
+    // compute variance
+    float sq_sum = 0;
+    for (int d = lane; d &lt; D; d += 32) {
+      float diff = s_nodes[node*D + d] - mean;
+      sq_sum += diff * diff;
+    }
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset /= 2) sq_sum += __shfl_down_sync(0xFFFFFFFF, sq_sum, offset);
+    float var = sq_sum / D;
+    float inv_std = rsqrtf(var + eps);
+    // normalize and apply gamma/beta
+    // need gamma[d] and beta[d]. We can load them from shared or global.
+    for (int d = lane; d &lt; D; d += 32) {
+      float val = (s_nodes[node*D + d] - mean) * inv_std;
+      // apply gamma, beta
+      val = val * gamma[d] + beta[d];
+      s_nodes[node*D + d] = val;
+    }
+  }
+
+But `gamma` and `beta` are pointers in global memory. Reading them per thread in the loop is okay (cached). Since D=96 is small, we can load them into shared memory first.
+
+`s_gamma` and `s_beta` can be placed in the first 2*D of smem_w. We load them with a few threads.
+
+Let&#x27;s write that.
+
+Actually, there is a subtlety: `__shfl_down_sync` requires all threads in the warp to participate to avoid deadlock. We have a conditional `if (node &lt; N)`. If N is not a multiple of num_warps, some warps may be inactive in the last iteration. But `__shfl_down_sync` must be called by all threads in the warp? Actually, if some threads are diverged (e.g., due to `if`), they can still call `__shfl_down_sync` but the mask should include active threads. However, it&#x27;s easier to avoid the conditional around shfl by having all warps process a node, but if node &gt;= N, they just do dummy work on node N-1 or zero? That wastes a bit but safe.
+
+Alternatively, we can keep the conditional and ensure shfl is inside the conditional. Since all threads in a warp have the same warp_id, they all take the same branch (node &lt; N or not). Actually, lane doesn&#x27;t affect node. So all 32 lanes in a warp have the same `node` value. Therefore they all take the same branch. So `__shfl_down_sync` inside the conditional is safe because either all 32 threads call it or none. Good.
+
+But `if (node &lt; N)` is warp-divergent only if some warps have node &lt; N and some don&#x27;t, which happens when N is not a multiple of num_warps. However, the `if` is uniform within the warp. So shfl is fine.
+
+LN done. s_nodes now holds normalized nodes.
+
+Now QKV projection.
+We need to compute Q, K, V. For each projection:
+  Load weight into smem_w transposed.
+  Compute matmul: output[n][d] = sum_k s_nodes[n][k] * smem_w[k][d].
+  Write to global memory.
+
+Compute total elements = N*D. With blockDim.x=256, each thread handles `ceil(total / 256)` elements. Since 2304/256 = 9 exactly, each thread handles 9. For generic N,D, we can compute `for (int idx = threadIdx.x; idx &lt; N*D; idx += blockDim.x)` but with step blockDim.x, if total is not multiple, it&#x27;s fine. But 2304 is multiple of 256, so each thread does exactly 9.
+
+For a given idx: n = idx / D; d = idx % D.
+accum = 0;
+for (int k = 0; k &lt; D; ++k) {
+    accum += s_nodes[n*D + k] * s_w[k*D + d];
+}
+out[b*N*D + idx] = accum;
+
+This is straightforward. Since D=96, each thread does 9*96 = 864 FMAs. That&#x27;s okay.
+
+Loading weight transposed into s_w:
+w has shape (D,D). We want s_w[k*D + d] = w[d*D + k].
+We can have each thread copy several elements:
+for (int idx = threadIdx.x; idx &lt; D*D; idx += blockDim.x) {
+    int d = idx / D;
+    int k = idx % D;
+    s_w[k*D + d] = w[d*D + k];
+}
+But careful: this reads w in row-major (d fixed, k varying) which is contiguous. Writes s_w with stride D (since k*D + d). That&#x27;s not coalesced for writes? Actually, consecutive threads have consecutive idx. So d = idx/D changes slowly, k = idx%D changes fast. For idx from 0 to 255, d=0 for first 96 idx, k=0..95. So threads 0..95 write s_w[k*D + d] = s_w[k*D + 0] for k=0..95. That&#x27;s contiguous in s_w! Great. Reads are w[d*D + k] = w[0*D + k] for k=0..95. That&#x27;s contiguous too. Perfect. So this load pattern is fully coalesced for both read and write.
+
+Wait, check: idx = threadIdx.x + t*blockDim.x.
+For t=0, threads 0..95: d=0, k=0..95 -&gt; read w[0..95], write s_w[k*D + 0] = s_w[k*D]. That is contiguous? s_w[k*D] for k=0..95: stride D between elements. That&#x27;s not contiguous. Oh no! The writes are strided by D floats (384 bytes). That&#x27;s not coalesced.
+But the reads are contiguous. Since D=96 is small, the strided writes are still okay because they will hit different banks but maybe serialize? Actually, for shared memory, if threads write to addresses that differ by D*4 bytes, and D is 96, the stride is 96 floats = 384 bytes. Shared memory banks are 4 bytes wide, so offset 384 bytes = 96 banks. If there are 32 banks, 96 mod 32 = 0. So threads 0..31 write to bank 0? Wait: s_w[k*D + d] for d=0: address = k*D. Thread k writes to bank (k*D) % num_banks. With D=96, k*96 % 32 = (k*0) %32 = 0. So ALL threads in a warp write to the same bank! That&#x27;s a huge bank conflict. So this is bad.
+
+We need a better transpose loading.
+
+Alternative layout for s_w: store it as row-major in d (i.e., s_w[d][k] = w[d][k] but we want to access by k then d). We could just keep s_w in original layout (row-major d) and change the matmul loop to read s_w[d*D + k]? Wait, the matmul is sum_k s_nodes[n][k] * w[d][k]. If we store s_w as original w (row-major d), then s_w[d*D + k] = w[d][k]. In the matmul, for a fixed (n,d) and varying k, we read s_w[d*D + k] which is contiguous! That&#x27;s perfect. And s_nodes[n*D + k] is also contiguous. So the dot product for a given (n,d) is a dot product of two contiguous arrays. Great.
+
+But in the matmul, each thread computes for a fixed (n,d). It loops over k reading s_nodes[n*D + k] and s_w[d*D + k]. If multiple threads in a warp have different d, they read different rows of s_w, but the same k at each step. So for a fixed k, thread 0 reads s_w[d0*D + k], thread 1 reads s_w[d1*D + k]. The addresses are spaced by D. In shared memory, that&#x27;s a strided access: bank conflict if D % num_banks == 0. D=96, 96 % 32 = 0. So yes, bank conflict: all threads read same bank for a given k? Wait: s_w[d*D + k] for different d: address = d*D + k. Bank = (d*D + k) % 32. Since D=96 ≡ 0 mod 32, bank = k % 32. So for a fixed k, all threads in a warp read the same bank! That&#x27;s a broadcast? Actually, if they read the same address? No, they read different addresses: d0*D+k, d1*D+k. But since D is multiple of 32, these addresses are in the same bank but different rows? Wait, shared memory is 1D. Bank = (addr/4) % 32. addr = (d*D + k)*4. bank = (d*D + k) % 32. Since D%32=0, bank = k%32. So for fixed k, all threads read the same bank. But they read different addresses: d0*D+k vs d1*D+k. The distance is multiple of D=96, which is multiple of 32. So they are in the same bank but different &quot;rows&quot;? Shared memory bank conflict means multiple threads accessing different addresses in the same bank. So yes, this is a 32-way bank conflict for reading s_w. Not good.
+
+How to avoid? We can pad the weight shared memory: s_w[d][D_padded]. If we set D_padded = D+1 = 97, then bank = (d*97 + k) % 32. For consecutive d, bank changes. Good. But we need to allocate accordingly.
+
+Alternatively, we can store the weight transposed but with padding to avoid conflicts. s_w[k][D_padded] where D_padded = D+1. Then for fixed k and varying d, address = k*(D+1) + d. Bank = (k*(D+1) + d) % 32. For consecutive d, consecutive banks. No conflict. And the writes during loading are also coalesced if we do it right.
+
+Let&#x27;s do that: declare `float s_w[(D+1)*D];` Actually, if we store transposed, shape is D rows (k) by D columns (d). We can pad column dimension to D+1. So `s_w[k*(D+1) + d] = w[d*D + k]`.
+When loading from global to shared:
+for (int idx = threadIdx.x; idx &lt; D*D; idx += blockDim.x) {
+    int d = idx / D;
+    int k = idx % D;
+    s_w[k*(D+1) + d] = w[d*D + k];
+}
+Now writes: for fixed d and varying k, threads write to s_w[k*(D+1)+d] which is strided by D+1=97. 97%32 = 1, so each thread writes to a different bank. Good. Reads: for fixed k and varying d, threads read s_w[k*(D+1)+d] which is contiguous (d varies), so fully coalesced. Perfect.
+
+Similarly, for s_nodes, we read s_nodes[n*D + k] where n is fixed and k varies. That&#x27;s contiguous. If multiple threads have different n but same k (e.g., threads processing same n), that&#x27;s broadcast. If threads processing different n, they read different rows, strided by D=96. Same bank conflict issue. But in our mapping, threads in the same warp have the same n? Let&#x27;s check.
+
+In the QKV matmul, we process elements (n,d). With blockDim.x=256, threads are assigned via strided loop: thread t gets idx = t, t+256, ... For D=96, idx=0..95 correspond to n=0,d=0..95. So first 96 threads (3 warps) have n=0, d varying. Next 96 threads have n=1. Next 64 have n=2,d=0..63.
+So within a warp (32 threads), for the first warp (t=0..31), n=0, d=0..31. So they all read s_nodes[0*D + k] (same n), which is broadcast. Good. They read s_w[k*(D+1) + d] where d varies: coalesced. Excellent.
+For the second warp (t=32..63), n=0, d=32..63. Same s_nodes row, coalesced s_w. Good.
+Third warp: n=0, d=64..95. Good.
+Fourth warp: n=1, d=0..31. Same pattern.
+
+So within each warp, all threads have the same n. Thus s_nodes reads are broadcast (fast). s_w reads are coalesced (no bank conflict because of padding). This is ideal.
+
+Great. We&#x27;ll use padded shared memory for weights.
+
+**Kernel 2 details:**
+
+We need to define the attention kernel.
+
+Inputs:
+- q, k, v: (B, H, N, head_dim)
+- pair_feats: (B, N, N, P)
+- edge_mask: (B, N, N)
+- nodes_orig: (B, N, D) (for residual)
+- rel_mlp weights and biases: W1 (P, P), b1 (P), W2 (H, P), b2 (H)
+- W_out: (D, D)
+Output: out (B, N, D)
+
+Block size: 256 threads. Grid: B blocks.
+
+Shared memory:
+- smem_q: H*N*head_dim floats
+- smem_k: same
+- smem_v: same
+- smem_ctx: N*D floats (attention output, before out_proj)
+Total = 4 * 2304 * 4 bytes = 36KB (for max sizes). Fits.
+We can also use dynamic shared memory, but sizes are variable. We&#x27;ll pass pointers and use dynamic.
+
+Wait, H*N*head_dim = B? No, per block: H*N*head_dim = num_heads * N * (dim/num_heads) = N*dim = 2304. So each of q,k,v is 2304 floats. smem_ctx is 2304. Total 9216 floats = 36KB.
+
+But we might also need W_out in shared memory. We can reuse the smem_q/k/v buffer after attention phase to store W_out transposed and padded. Since q,k,v are not needed after computing ctx, we can overwrite smem_q with W_out.
+But W_out size is D*D = 9216 floats. That&#x27;s as large as smem_q+smem_k combined. We can reuse smem_q+smem_k+smem_v (6912 floats) for W_out (9216 floats). Not enough. Wait, W_out is 9216 floats. smem_ctx is 2304. Total needed for out_proj: smem_ctx (2304) + W_out (9216) = 11520 floats = 45.8KB. Plus edge_mask maybe. That&#x27;s close to limit.
+But we don&#x27;t need W_out in shared memory! For out_proj, we can load W_out from global memory directly (cached). Since it&#x27;s small and reused across all threads, it will be in L1/L2. So we can skip loading W_out into shared memory. That saves shared memory.
+
+Similarly, rel_mlp weights are tiny, we can load from global memory.
+
+So shared memory for Kernel 2:
+- smem_q: H*N*head_dim
+- smem_k: same
+- smem_v: same
+- smem_ctx: N*D
+Total: 36KB.
+
+But we might not even need smem_q/k/v if we read from global memory directly. q,k,v are produced by Kernel 1 and stored in global memory. Reading them from global memory for each thread may be okay since they are reused. But each warp reads q_i and k_j multiple times. Actually, q_i is read per warp (once per query). k_j is read by each thread j (24 times per warp). v_j is read by each thread j (24 times per warp). With B=4, total warps = 4 blocks * 8 warps = 32 warps. Each warp reads q_i (24 floats), k_j for 24 j&#x27;s (24*24=576 floats), v_j for 24 j&#x27;s (576 floats). Total per block: q (2304), k (2304), v (2304). If we read from global memory, it&#x27;s 27KB reads per block. With L2 cache, it&#x27;s fine. But using shared memory ensures we read once. Since 27KB fits, let&#x27;s use shared memory to be safe.
+
+So steps:
+1. Load q, k, v into smem. Each thread loads its share.
+2. __syncthreads();
+3. Compute attention into smem_ctx.
+4. __syncthreads();
+5. Compute out_proj + residual into global memory.
+
+For step 3:
+We have total_queries = H * N = 96.
+num_warps = blockDim.x / 32 = 8.
+queries_per_warp = 1.
+Iterations = ceil(96 / 8) = 12.
+
+For iter = 0..11:
+  qid = iter * num_warps + warp_id;
+  if (qid &lt; H*N) {
+     h = qid / N;
+     i = qid % N;
+
+     // Load q_i into registers
+     float qi[head_dim]; // dynamic? head_dim is runtime but known (dim/num_heads). Since head_dim &lt;= 96/1? If dim and num_heads are runtime, we cannot allocate fixed-size array in registers easily if not known at compile time. But we know max is probably small (e.g., dim=768, heads=12 =&gt; head_dim=64). We can allocate a max or use a small loop. Since the reference uses dim up to maybe 96, head_dim up to 96. We can allocate 96 floats in registers per thread. That&#x27;s 384 bytes. For 32 threads per warp, total per warp = 12KB. That&#x27;s okay. For 256 threads per block, total registers = 8 * 12KB = 96KB. Register file is 64KB per SM on many GPUs. That might be too high.
+     Better: each lane j loads k_j and v_j into registers. That&#x27;s 24 floats each = 96 bytes per thread. 256 threads -&gt; 24KB. Plus qi 24 floats per thread -&gt; another 24KB. Total 48KB. That&#x27;s okay.
+     Actually, each lane only needs k_j and v_j for its j (one j per thread). So k_j and v_j are per thread. qi is per thread (all lanes load same q_i, but they store in registers). So 24+24+24 = 72 floats per thread. 72*4 = 288 bytes. 256 threads -&gt; 73,728 bytes = 72KB. Register file per SM is 256KB (e.g., A100). So per block it&#x27;s okay if we stay under 64KB. But register limit is per thread: max 255 registers. 72 floats is 72 registers. That&#x27;s okay.
+     Wait, 72 registers for arrays, plus loop indices, temps, etc. Probably under 128 registers. Fine.
+
+     Let&#x27;s allocate fixed-size arrays with max size. We can use a compile-time constant like MAX_HEAD_DIM = 128 or something. But we might not know the exact head_dim. In the constructor, dim and num_heads are passed. We can compute head_dim = dim // num_heads. In the kernel, we can pass head_dim as an integer. To allocate registers, we can use a small loop and keep values in a local array. CUDA compiler will put small arrays in registers.
+
+     Actually, we can avoid storing qi in an array: we can read it from shared memory on demand inside the dot product loop. That is, for d=0..head_dim-1, read smem_q[h][i][d] each time. Since the dot product loop is small (head_dim=24), reading shared memory inside the loop is fine. Similarly for k_j. So we don&#x27;t need arrays for q and k. We only need to store v_j in registers? Not even that: we can read v_j[d] from shared memory during the weighted sum. But the weighted sum requires reading v_j[d] for each d after computing softmax weights. That means for each d, we need a warp reduce over j of weight_j * v_j[d]. We can have each thread load v_j[d] from shared memory at the start of each d iteration. That&#x27;s N=24 loads per d = 24*24=576 loads per warp. Or we can have each thread preload v_j into registers (24 floats) once, then reuse. That&#x27;s better: 24 loads once, then register reads.
+
+     So we allocate `float vj[head_dim];` But head_dim is not compile-time constant. We can allocate a maximum size, e.g., 128, and only use head_dim of it. Or we can use dynamic indexing with a fixed-size array. Since the problem uses dim=96, num_heads=4, head_dim=24, we can safely use a max of 128.
+
+     Actually, we can avoid arrays entirely by recomputing the softmax weights and then for each d doing:
+        float sum = 0;
+        for j=0..N-1:
+           sum += attn_weights[j] * smem_v[h][j][d];
+     This requires storing attn_weights in registers (N=24 floats). That&#x27;s small. And we read smem_v per j per d. Number of shared memory reads: N * head_dim = 24*24=576 per warp. Shared memory is fast. This might be simpler and use fewer registers.
+
+     Let&#x27;s do this:
+     - Compute dot_j for each j (threadIdx.x%32):
+        float dot = 0;
+        for d=0; d&lt;head_dim; ++d)
+           dot += smem_q[((h*N + i)*head_dim + d)] * smem_k[((h*N + j)*head_dim + d)];
+     - Compute rel_bias:
+        load pair_feats[b][i][j][p] into registers or local memory (16 floats). Use small array `float pf[16];` (since pair_dim is max maybe 64? We don&#x27;t know. But given pair_dim=16, we can allocate max 64 or use dynamic). Or we can load directly from global in the MLP loops.
+     - Add to dot.
+     - Compute max over j using warp shfl.
+     - Compute exp(dot - max) * mask. Store in `float attn_j`.
+     - Compute sum exp using warp shfl.
+     - Normalize: attn_j /= sum.
+     - Now compute output for each d:
+        for d=0; d&lt;head_dim; ++d) {
+           float out_d = 0;
+           for j=0; j&lt;N; ++j)
+              out_d += attn_j (for this j?) Wait, each thread only has attn_j for its own j. We need a warp reduce over j.
+           Actually, since threads in a warp have different j, we can compute for each d:
+              float val = attn_j * smem_v[((h*N + j)*head_dim + d)];
+              // warp reduce sum over j
+              for (int offset = 16; offset &gt; 0; offset /= 2) val += __shfl_down_sync(mask, val, offset);
+              if (lane == 0) smem_ctx[i*D + h*head_dim + d] = val;
+        }
+     This requires for each d: each thread reads smem_v for its j and d, multiplies by attn_j, then warp sum.
+     Since head_dim=24, we do 24 iterations. In each iteration, each thread does one shared read, one multiply, then warp shuffle reduce (5 shuffles). Total per warp: 24 * (1 read + 1 mul + 5 shfl) ~ 168 ops. Very fast.
+
+     But we need to handle the case where lane &gt;= N. For j &gt;= N, set dot = -inf, attn_j = 0, and in the final sum, val=0. The warp shuffle should include all lanes (0..31) but lanes &gt;= N contribute 0. That&#x27;s fine.
+
+     So we don&#x27;t need arrays for q, k, or v! Only need to read q and k in the dot product loop. This uses fewer registers.
+
+     Let&#x27;s detail:
+
+     // Each warp handles one query (h,i)
+     int lane = threadIdx.x % 32;
+     int warp_id = threadIdx.x / 32;
+     int num_warps = blockDim.x / 32;
+     int total_queries = num_heads * N;
+
+     for (int qid = warp_id; qid &lt; total_queries; qid += num_warps) {
+         int h = qid / N;
+         int i = qid % N;
+         int q_offset = ((b * num_heads + h) * N + i) * head_dim; // global memory offset for q
+         // Actually we have q in shared memory already. smem_q layout: [num_heads][N][head_dim]
+         int smem_q_base = (h * N + i) * head_dim;
+         int smem_k_base = h * N * head_dim;
+         int smem_v_base = h * N * head_dim;
+
+         float max_logit = -1e30f;
+         float dot = 0.0f;
+         if (lane &lt; N) {
+             int j = lane;
+             // compute dot product q_i . k_j
+             float sum = 0.0f;
+             for (int d = 0; d &lt; head_dim; ++d) {
+                 sum += smem_q[smem_q_base + d] * smem_k[smem_k_base + j * head_dim + d];
+             }
+             // compute rel_bias via MLP
+             // load pair_feats
+             float bias = 0.0f;
+             // MLP: W1 (P,P), b1 (P), SiLU, W2 (H,P), b2 (H)
+             // We&#x27;ll compute hidden = W1 * pf + b1
+             // Since P is small (e.g., 16), we can compute directly.
+             // Let&#x27;s load pf into registers: we can read from pair_feats global memory.
+             int pf_base = ((b * N + i) * N + j) * pair_dim;
+             // hidden[d] = sum_p W1[d][p] * pf[p] + b1[d]
+             // Then bias = sum_d W2[h][d] * hidden[d] + b2[h]
+             // We can compute without storing hidden array:
+             // bias = W2[h] @ SiLU(W1 @ pf + b1) + b2[h]
+             // Since P is small, we can compute `float hidden[64];` if we have compile-time max.
+             // Or we can unroll the loops if pair_dim is passed as argument.
+             // Given pair_dim is likely small, we can allocate a fixed-size array, e.g., MAX_P=64.
+             // But to be generic and avoid large stack, let&#x27;s compute on the fly.
+             // Actually, we need the hidden vector to dot with W2. We can compute hidden[p] for each p and accumulate dot with W2[h][p] simultaneously? No, because SiLU is elementwise and W2 dot is after SiLU. So we need to compute hidden[p] first.
+             // We can local array `float hidden[64];` with a compile-time max. Let&#x27;s set a reasonable max like 64.
+             // Or we can compute in a small loop and store in registers. The compiler will keep it in registers if small.
+
+             // Let&#x27;s assume pair_dim &lt;= 64. We&#x27;ll allocate `float hidden[64];` and only use pair_dim.
+             for (int d = 0; d &lt; pair_dim; ++d) {
+                 float val = b1[d];
+                 for (int p = 0; p &lt; pair_dim; ++p) {
+                     val += W1[d * pair_dim + p] * pair_feats[pf_base + p];
+                 }
+                 val = val * sigmoidf(val); // SiLU(x) = x * sigmoid(x)
+                 hidden[d] = val;
+             }
+             bias = b2[h];
+             for (int d = 0; d &lt; pair_dim; ++d) {
+                 bias += W2[h * pair_dim + d] * hidden[d];
+             }
+
+             dot = sum * scale + bias;
+
+             // mask
+             float mask_val = edge_mask[((b * N) + i) * N + j];
+             if (mask_val &lt; 0.5f) dot = -1e30f; // -inf approx
+             max_logit = dot;
+         }
+
+         // warp reduce max
+         for (int offset = 16; offset &gt; 0; offset /= 2) {
+             float other = __shfl_down_sync(0xFFFFFFFF, max_logit, offset);
+             if (other &gt; max_logit) max_logit = other;
+         }
+
+         // compute exp and sum
+         float exp_val = 0.0f;
+         if (lane &lt; N) {
+             exp_val = expf(dot - max_logit);
+         }
+         float sum_exp = exp_val;
+         for (int offset = 16; offset &gt; 0; offset /= 2) {
+             sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, offset);
+         }
+
+         float inv_sum = 1.0f / sum_exp;
+         float attn_weight = (lane &lt; N) ? exp_val * inv_sum : 0.0f;
+
+         // compute output for each d
+         for (int d = 0; d &lt; head_dim; ++d) {
+             float val = 0.0f;
+             if (lane &lt; N) {
+                 val = attn_weight * smem_v[smem_v_base + lane * head_dim + d];
+             }
+             // warp sum
+             for (int offset = 16; offset &gt; 0; offset /= 2) {
+                 val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+             }
+             if (lane == 0) {
+                 smem_ctx[i * D + h * head_dim + d] = val;
+             }
+         }
+     }
+
+     This is very clean.
+
+     But we need `hidden` array. Since pair_dim is runtime, we can allocate a small fixed-size array, e.g., `float hidden[64];` and assert pair_dim &lt;= 64. Given pair_dim=16, that&#x27;s fine. But we shouldn&#x27;t hardcode if not needed. We can also allocate dynamically based on a template or just use a loop with no array: compute each component of hidden, apply SiLU, then dot with W2. But we need all hidden components to compute the dot with W2. However, we can compute the dot incrementally: for each p from 0 to pair_dim-1:
+         compute hidden_p = SiLU( sum_q W1[p][q] * pf[q] + b1[p] )
+         bias += W2[h][p] * hidden_p
+     So we don&#x27;t need to store hidden at all! We accumulate bias as we go.
+     Let&#x27;s verify:
+         bias = b2[h]
+         for p in 0..P-1:
+             // compute p-th hidden element
+             float tmp = b1[p];
+             for q in 0..P-1:
+                 tmp += W1[p*P + q] * pf[q];
+             tmp = tmp * sigmoidf(tmp);
+             bias += W2[h*P + p] * tmp;
+     This uses only `pf[q]` (we need all q for each p). We can read pf[q] from global memory inside the inner loop. Since P=16, inner loop is 16. Outer loop 16. Total 256 ops per pair. That&#x27;s fine. Or we can preload pf into a small register array `float pf[64];` once per thread. That might be slightly faster.
+
+     Let&#x27;s preload pf:
+         float pf[64];
+         int pf_base = ((b * N + i) * N + lane) * pair_dim;
+         for (int p = 0; p &lt; pair_dim; ++p) pf[p] = pair_feats[pf_base + p];
+     Then compute bias.
+
+     This is great. No need for large arrays.
+
+     One issue: `pair_feats` is (B, N, N, P). Access pattern: for a fixed b,i,j, we read P contiguous floats. Since each thread in the warp has a different j (lane), the accesses to `pair_feats` are for j = lane. The base index includes j. So threads read `pf_base + p` where base differs by `P` between threads. Since P=16, consecutive threads read addresses offset by 16 floats = 64 bytes. That is a strided access. Not fully coalesced. But since P is small, and it&#x27;s only 16 floats per thread, total 512 bytes per warp, it&#x27;s fine.
+
+     `edge_mask` access: `edge_mask[((b * N) + i) * N + j]` where j=lane. Consecutive threads read consecutive floats. That&#x27;s coalesced.
+
+     **Loading q,k,v into shared memory:**
+     Before the attention loop, we need to load q,k,v from global memory into smem. Since q,k,v are produced by Kernel 1 in contiguous arrays (B,N,D) each. Actually, we can store q,k,v as (B, N, D) in global memory, or (B, H, N, head_dim). For the attention kernel, smem layout should be convenient. We can store q as (B, N, D) and interpret in the kernel as [H][N][head_dim]. Since H*head_dim = D, the memory layout is the same.
+
+     global q address: q + b*N*D + idx.
+     smem_q address: smem_q + h*N*head_dim + i*head_dim + d.
+     So if we load flat, we can just copy the entire N*D block.
+
+     Load q:
+     for (int idx = threadIdx.x; idx &lt; N*D; idx += blockDim.x) {
+         smem_q[idx] = q[b*N*D + idx];
+     }
+     Same for k and v.
+
+     Since N*D = 2304 and blockDim=256, each thread loads 9 elements. Coalesced.
+
+     **Out_proj + Residual:**
+     After attention, smem_ctx contains the context vectors (N,D). We need to compute:
+         out[b][n][d] = sum_k smem_ctx[n][k] * W_out[d][k] + nodes_orig[b][n][d]
+     Wait, out_proj is `ctx @ W_out^T`, where W_out shape (D,D). So for output dim d:
+         out[n][d] = sum_k ctx[n][k] * W_out[d][k] + nodes_orig[b][n][d]
+     This is identical to the QKV projection. We can use the same pattern.
+
+     We don&#x27;t need to load W_out into shared memory; we can read directly from global memory. But reading from global memory inside the dot product loop means each thread reads D elements from W_out for its d. For 256 threads, they access different d. W_out[d][k] for fixed k: threads read different rows but same column. That is strided by D in memory. Since D=96, it&#x27;s not coalesced, but cached.
+
+     However, we can also load W_out transposed into shared memory to get coalesced reads. But we have 36KB used. Can we fit W_out? 96*96*4 = 36KB. That would bring us to 72KB, exceeding 48KB. So we cannot load W_out into shared memory if we keep q,k,v there.
+
+     But we can overlap: after computing attention, q,k,v in shared memory are no longer needed. We can reuse that shared memory for W_out. smem_q + smem_k + smem_v = 3 * 2304 * 4 = 27KB. W_out needs 36KB. Not enough. smem_v alone is 9KB. W_out is 36KB. Still not enough.
+
+     What if we don&#x27;t keep q,k,v in shared memory? We can read q,k,v from global memory directly during attention. Let&#x27;s evaluate:
+     - q is read once per query (96 queries). Total reads = 96 * 24 = 2304 floats. That&#x27;s tiny.
+     - k is read once per (query, j) pair: 96 * 24 = 2304 floats. Wait, each query reads all k_j. So 2304 * 24 = 55296 floats? No, for each query i and head h, we compute dot with all j. There are H*N=96 queries. Each reads all N keys of size head_dim: 96 * 24 * 24 = 55296 floats. That&#x27;s 216KB reads. But with L2 cache, the k tensor for the block is 9KB. So it will be cached.
+     - v is read once per (query, j, d) in the weighted sum: 96 * 24 * 24 = 55296 floats. Same.
+     - Total reads from global for q,k,v = ~110KB per block. That&#x27;s acceptable.
+
+     If we skip shared memory for q,k,v, we only need smem_ctx (9KB). That leaves plenty of room for W_out (36KB) if we want. But we may not need W_out in shared memory either.
+
+     Let&#x27;s compute out_proj directly from global W_out:
+     For each thread handling (n,d):
+         out = 0;
+         for k=0; k&lt;D; ++k)
+             out += smem_ctx[n*D + k] * W_out[d*D + k];
+         out += nodes_orig[b*N*D + n*D + d];
+         output[b*N*D + n*D + d] = out;
+
+     Reads of W_out: for each (n,d), loop over k. Threads in a warp have same or different n and d. With our mapping (consecutive threads have consecutive d for same n), for a fixed k, threads read W_out[d*D + k] where d varies across the warp. That&#x27;s strided by D. D=96, so bank-like conflict in L1. But since it&#x27;s small and cached, it&#x27;s okay.
+
+     Alternatively, we can load W_out transposed into shared memory using the space we freed. We have 48KB - 9KB = 39KB available. W_out is 36KB. It fits! So we can load W_out into shared memory (padded) after attention. We need to sync.
+
+     Plan for Kernel 2 without q/k/v shared memory:
+     Shared: smem_ctx (N*D floats). That&#x27;s it. 9KB.
+     After attention computed and stored in smem_ctx:
+     - Load W_out transposed (padded) into the rest of shared memory. But dynamic shared memory size parameter must be fixed at launch. We can allocate dynamic shared of size (N*D + (D+1)*D) * sizeof(float). That&#x27;s (2304 + 9792) * 4 = ~48KB. Wait, (D+1)*D = 97*96 = 9312. Total = 2304 + 9312 = 11616 floats * 4 = 46464 bytes. That&#x27;s under 48KB. Good.
+
+     Actually, we need to verify: D+1 padding for W_out. W_out size D*D. Padded size D*(D+1). For D=96: 96*97=9312 floats. smem_ctx = 2304. Total 11616. 11616*4=46464. Fits exactly.
+
+     So we can do:
+     float* smem_ctx = smem;
+     float* smem_w = smem + N*D;
+     Load W_out transposed into smem_w.
+     Then compute out_proj + residual using smem_ctx and smem_w.
+
+     This gives best of both worlds: no shared memory for q/k/v (relying on L2 cache), but shared memory for W_out to get broadcast reads for ctx and coalesced reads for weights.
+
+     Wait, but what about reading q/k/v from global memory for the dot product? During dot product, each thread reads q_i[d] and k_j[d] repeatedly in the inner loop. For 96 queries * 24 keys * 24 dims = 55296 reads each of q and k. That&#x27;s 110k reads. Each read is 4 bytes. Total 440KB per block. L2 cache can handle this.
+     However, q and k are stored in global memory as contiguous arrays. The accesses are:
+     - q_i[d]: for a given query (h,i), all threads in the warp read the same q_i[d] at the same time. This is a broadcast from global memory? Not exactly, but it will hit L1/L2. Since each q_i is 24 floats, it might fit in L1.
+     - k_j[d]: for a given key j and dim d, only one thread (the one with that j) reads it. So it&#x27;s a single float read. Coalesced across j? For a fixed d and varying j, k_j[d] are spaced by head_dim floats. If head_dim=24, spacing is 96 bytes. So consecutive threads (j=0..31) read addresses offset by 96 bytes. 96/4 = 24. 24 % 32 = 24. So accesses map to different banks but not contiguous. There might be some coalescing: a warp reads 32 floats spaced by 96 bytes. The total span is 31*96 = 2976 bytes. That&#x27;s 2976/128 = 23.25 cache lines (128B lines). So it touches about 24 cache lines. L1 can handle it.
+
+     So reading q,k,v from global memory directly is acceptable and saves shared memory.
+
+     Let&#x27;s adopt this:
+     Kernel 2 shared memory:
+     - smem_ctx: N*D floats (attention output)
+     - smem_w: D*(D+1) floats (W_out transposed and padded)
+     Dynamic size = (N*D + D*(D+1)) * sizeof(float).
+     For D=96,N=24: (2304 + 9312)*4 = 46464 bytes. Fits.
+
+     Actually, to avoid magic numbers, we can compute padded size at runtime: `size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);` and launch with that.
+
+     **Kernel 2 algorithm:**
+
+     ```cuda
+     __global__ void fused_attn_out_kernel(
+         const float* q, const float* k, const float* v,
+         const float* pair_feats,
+         const float* edge_mask,
+         const float* nodes_orig,
+         const float* W1, const float* b1,
+         const float* W2, const float* b2,
+         const float* W_out,
+         float* out,
+         int B, int N, int D, int H, int P, float scale) {
+     ```
+
+     Inside:
+     int b = blockIdx.x;
+     extern __shared__ float smem[];
+     float* smem_ctx = smem;
+     float* smem_w = smem + N * D;
+
+     // compute attention
+     int lane = threadIdx.x % 32;
+     int warp_id = threadIdx.x / 32;
+     int num_warps = blockDim.x / 32;
+     int head_dim = D / H;
+     int total_queries = H * N;
+
+     for (int qid = warp_id; qid &lt; total_queries; qid += num_warps) {
+         int h = qid / N;
+         int i = qid % N;
+
+         int q_base = ((b * H + h) * N + i) * head_dim;
+         int k_base = ((b * H + h) * N) * head_dim;
+         int v_base = ((b * H + h) * N) * head_dim;
+
+         // preload pair_feat for this (i, lane)?
+         float pf[64]; // compile-time max, use P actual
+         int pf_base = ((b * N + i) * N + lane) * P;
+         if (lane &lt; N) {
+             for (int p = 0; p &lt; P; ++p) {
+                 pf[p] = pair_feats[pf_base + p];
+             }
+         }
+
+         float dot = 0.0f;
+         if (lane &lt; N) {
+             int j = lane;
+             // compute q_i dot k_j
+             float sum = 0.0f;
+             for (int d = 0; d &lt; head_dim; ++d) {
+                 sum += q[q_base + d] * k[k_base + j * head_dim + d];
+             }
+
+             // compute rel_bias
+             float bias = b2[h];
+             for (int p = 0; p &lt; P; ++p) {
+                 float tmp = b1[p];
+                 for (int q_idx = 0; q_idx &lt; P; ++q_idx) {
+                     tmp += W1[p * P + q_idx] * pf[q_idx];
+                 }
+                 tmp = tmp / (1.0f + expf(-tmp)); // SiLU = x * sigmoid(x)
+                 bias += W2[h * P + p] * tmp;
+             }
+
+             dot = sum * scale + bias;
+
+             float mask_val = edge_mask[((b * N) + i) * N + j];
+             if (mask_val &lt; 0.5f) dot = -1e30f;
+         }
+
+         // warp reduce max
+         float max_logit = dot;
+         #pragma unroll
+         for (int offset = 16; offset &gt; 0; offset /= 2) {
+             float other = __shfl_down_sync(0xFFFFFFFF, max_logit, offset);
+             if (other &gt; max_logit) max_logit = other;
+         }
+
+         float exp_val = 0.0f;
+         if (lane &lt; N) {
+             exp_val = expf(dot - max_logit);
+         }
+         float sum_exp = exp_val;
+         #pragma unroll
+         for (int offset = 16; offset &gt; 0; offset /= 2) {
+             sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, offset);
+         }
+         float inv_sum = 1.0f / sum_exp;
+         float attn_weight = (lane &lt; N) ? exp_val * inv_sum : 0.0f;
+
+         // compute ctx for each d
+         for (int d = 0; d &lt; head_dim; ++d) {
+             float val = 0.0f;
+             if (lane &lt; N) {
+                 val = attn_weight * v[v_base + lane * head_dim + d];
+             }
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) {
+                 val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+             }
+             if (lane == 0) {
+                 smem_ctx[i * D + h * head_dim + d] = val;
+             }
+         }
+     }
+
+     __syncthreads();
+
+     // Load W_out into shared memory transposed (padded)
+     // smem_w[k][d] = W_out[d][k]
+     for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+         int d = idx / D;
+         int k = idx % D;
+         smem_w[k * (D + 1) + d] = W_out[d * D + k];
+     }
+     __syncthreads();
+
+     // out_proj + residual
+     int total_out = N * D;
+     for (int idx = threadIdx.x; idx &lt; total_out; idx += blockDim.x) {
+         int n = idx / D;
+         int d = idx % D;
+         float sum = 0.0f;
+         for (int k = 0; k &lt; D; ++k) {
+             sum += smem_ctx[n * D + k] * smem_w[k * (D + 1) + d];
+         }
+         float orig = nodes_orig[b * N * D + n * D + d];
+         out[b * N * D + n * D + d] = orig + sum;
+     }
+     ```
+
+     Wait, `W_out` in the model is `out_proj.weight` with shape (D,D). The operation is `ctx @ W_out.T`, so `out[n][d] = sum_k ctx[n][k] * W_out[d][k]`. Yes, this matches.
+
+     **Potential issues:**
+     - `pf[64]` is a stack array. With lane &lt; N check, if lane &gt;= N we don&#x27;t load, but the array is still there. That&#x27;s fine.
+     - `qid` loop: warp_id from 0..7. For total_queries=96, iterations: qid = warp_id + 0*8, warp_id + 1*8, ... up to &lt;96. For warp_id=0: qid=0,8,16,...,88 (12 iterations). Good. Each warp does 12 queries. Good occupancy? With 256 threads per block and 8 warps, each warp does 12 queries. Total warps across B=4 blocks = 32 warps. SM can run multiple blocks.
+     - `__shfl_down_sync` mask: we can use 0xFFFFFFFF, but lanes &gt;= N might have dot = -1e30f and exp_val = 0. They won&#x27;t affect the max if there is at least one real value. But `__shfl_down_sync` requires active threads. Since all threads in the warp participate in the loop (no conditional around the shuffle), we are fine. The `if (lane &lt; N)` only guards the computation but the shuffle is called by all threads in the warp. Wait, we have:
+         float max_logit = dot;
+         for (...) { other = __shfl_down_sync(...); max_logit = fmaxf(max_logit, other); }
+       This is called by all threads in the warp. Good.
+       But `dot` is 0 for lane &gt;= N (because we didn&#x27;t set it). Actually, we set `float dot = 0.0f;` and then `if (lane &lt; N) { ... dot = ... }`. So for lane &gt;= N, dot = 0. But max_logit should be influenced only by real lanes. Since real lanes have N=24, and there are 24 of them, and dot values can be negative or positive. If all real dots are negative (e.g., -10), the max among real lanes is -10. Lane 24 has dot=0, which would become the max! That&#x27;s a bug.
+       We need to initialize dot to a very negative number for all lanes, and set mask_val to 0 for inactive lanes.
+       So:
+         float dot = -1e30f;
+         if (lane &lt; N) {
+            ...
+            dot = sum * scale + bias;
+            if (mask_val &lt; 0.5f) dot = -1e30f;
+         }
+       Then max_logit = dot. For lane &gt;= N, dot = -1e30f, so they won&#x27;t affect max.
+       Similarly for exp_val: `float exp_val = 0.0f; if (lane &lt; N) exp_val = expf(dot - max_logit);` For inactive lanes, exp_val=0.
+       Good.
+
+     - `nodes_orig`: The original nodes tensor. We need to pass it to Kernel 2. In the reference, the residual is added to the output of out_proj. So we need the original nodes, not the normalized ones. In our Kernel 1, we write q,k,v to global memory. We can keep the original nodes in global memory and pass the pointer to Kernel 2. That&#x27;s easy.
+
+     - `q`, `k`, `v` buffers: We need temporary storage. We can allocate them in `forward()` using `torch.empty_like(nodes)` and pass to kernels.
+
+     - `smem_ctx` writing: Only lane 0 writes to smem_ctx per query. Since there are 96 queries, lane 0 of each warp writes 24 times (for each d). That&#x27;s 96*24 = 2304 writes total. Since multiple warps may write to the same bank? Each warp writes to different (i, h*head_dim+d) which are distinct. Good.
+
+     - `__syncthreads()` before loading W_out: we need all warps to finish writing smem_ctx. Then load W_out. Then `__syncthreads()`. Then compute out.
+
+     - Edge mask: The reference uses `edge_mask.unsqueeze(1) &lt; 0.5` and fills with -inf. Our kernel uses `edge_mask[b,i,j] &lt; 0.5`. That&#x27;s correct.
+
+     - `scale`: 1.0 / sqrt(head_dim). We can pass as float.
+
+     **Kernel 1 finalization:**
+     Let&#x27;s write the LN+QKV kernel.
+
+     ```cuda
+     __global__ void fused_ln_qkv_kernel(
+         const float* nodes,
+         const float* gamma,
+         const float* beta,
+         const float* Wq,
+         const float* Wk,
+         const float* Wv,
+         float* q,
+         float* k,
+         float* v,
+         int B, int N, int D, float eps) {
+     ```
+
+     Dynamic shared memory: s_nodes (N*D), s_w (D*(D+1)). Total = same as before? Actually D*(D+1) + N*D. For D=96: 9792+2304=12096 floats = 48.4KB? Wait, 12096*4 = 48384 bytes. Slightly over 48KB! For D=96,N=24: N*D=2304. D*(D+1)=9312. Sum=11616. 11616*4=46464. Under 48KB. Good.
+
+     But wait: we need Wq, Wk, Wv. We can load them one at a time into s_w. Same s_w buffer.
+
+     Steps:
+     1. Load nodes into s_nodes.
+     2. __syncthreads()
+     3. LN.
+     4. __syncthreads()
+     5. For each proj in {Wq, Wk, Wv}:
+          a. Load weight into s_w transposed padded.
+          b. __syncthreads()
+          c. Compute output and write to global q/k/v.
+          d. __syncthreads()
+
+     LN details: we decided to use warps for nodes. But if N is small, we can just handle it. Let&#x27;s write generic:
+
+     int num_warps = blockDim.x / 32;
+     for (int n_start = 0; n_start &lt; N; n_start += num_warps) {
+         int node = n_start + warp_id;
+         if (node &lt; N) {
+             // compute mean
+             float sum = 0.0f;
+             for (int d = lane; d &lt; D; d += 32) {
+                 sum += s_nodes[node * D + d];
+             }
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+             float mean = sum / D;
+
+             float sq_sum = 0.0f;
+             for (int d = lane; d &lt; D; d += 32) {
+                 float diff = s_nodes[node * D + d] - mean;
+                 sq_sum += diff * diff;
+             }
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) sq_sum += __shfl_down_sync(0xFFFFFFFF, sq_sum, offset);
+             float var = sq_sum / D;
+             float inv_std = rsqrtf(var + eps);
+
+             for (int d = lane; d &lt; D; d += 32) {
+                 float val = (s_nodes[node * D + d] - mean) * inv_std;
+                 val = val * gamma[d] + beta[d];
+                 s_nodes[node * D + d] = val;
+             }
+         }
+     }
+
+     Wait, `gamma` and `beta` are in global memory. Accessing them by lane index. Since D=96, lane 0..31 read gamma[0..31], gamma[32..63], gamma[64..95] across the three iterations of the loop. That&#x27;s coalesced? The loop `for (int d = lane; d &lt; D; d += 32)` means in the first iteration d=lane, second d=lane+32, third d=lane+64. So each thread reads gamma[lane], gamma[lane+32], gamma[lane+64]. Consecutive threads read consecutive elements: gamma[0], gamma[1], ... gamma[31]. That&#x27;s coalesced. Good.
+
+     However, `gamma` and `beta` are broadcast to all nodes. So they will be in L1 cache.
+
+     **Projection computation:**
+     For each weight matrix:
+     ```cuda
+     for (int idx = threadIdx.x; idx &lt; N * D; idx += blockDim.x) {
+         int n = idx / D;
+         int d = idx % D;
+         float sum = 0.0f;
+         for (int k = 0; k &lt; D; ++k) {
+             sum += s_nodes[n * D + k] * s_w[k * (D + 1) + d];
+         }
+         out_ptr[b * N * D + idx] = sum;
+     }
+     ```
+     Where out_ptr is q, k, or v.
+
+     **PyTorch side:**
+     In ModelNew.__init__, we need to create the same layers as Model? Actually, we need the weights for LN, QKV, rel_mlp, out_proj. We can keep the nn.Module layers from Model and extract their weights in forward. Or we can reimplement the layers.
+
+     The simplest: In ModelNew.__init__, instantiate the submodules (norm, q_proj, etc.) just like Model. Then in forward, extract weight pointers and call the custom kernels.
+
+     Wait, the reference does `self.norm = nn.LayerNorm(dim)`. Our ModelNew can also have these layers. Then in forward, we call our custom kernels using the weight tensors.
+
+     However, the LayerNorm in PyTorch stores weight and bias as `weight` and `bias`. The linear layers store `weight`. The sequential rel_mlp has two linear layers: `rel_mlp[0]` and `rel_mlp[2]`. We can extract them.
+
+     Since we want to compile the kernel at module load time, we need to define the CUDA code as a string and call `torch.utils.cpp_extension.load_inline`. We must list the kernel function names in `functions=[...]`. The functions are the host-side wrappers that call the kernels. But since we are using raw pointers, we need to write C++ wrapper functions that take `at::Tensor` and launch the kernels.
+
+     So in `cpp_sources`, we write:
+     ```cpp
+     #include &lt;torch/extension.h&gt;
+     #include &lt;cuda_runtime.h&gt;
+     #include &lt;math.h&gt;
+
+     __global__ void fused_ln_qkv_kernel(...) { ... }
+
+     __global__ void fused_attn_out_kernel(...) { ... }
+
+     void fused_ln_qkv(
+         at::Tensor nodes,
+         at::Tensor gamma,
+         at::Tensor beta,
+         at::Tensor Wq,
+         at::Tensor Wk,
+         at::Tensor Wv,
+         at::Tensor q,
+         at::Tensor k,
+         at::Tensor v) {
+         int B = nodes.size(0);
+         int N = nodes.size(1);
+         int D = nodes.size(2);
+         const float* nodes_ptr = nodes.data_ptr&lt;float&gt;();
+         // ... etc
+         size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);
+         fused_ln_qkv_kernel&lt;&lt;&lt;B, 256, smem_size&gt;&gt;&gt;(...);
+     }
+
+     void fused_attn_out(...) { ... }
+     ```
+
+     Then in Python, `functions=[&#x27;fused_ln_qkv&#x27;, &#x27;fused_attn_out&#x27;]`.
+
+     Need to handle tensor strides? We assume contiguous. The inputs likely are contiguous float tensors. But we should call `.contiguous()` if needed.
+
+     Also, we must create output tensors `q`, `k`, `v` in forward.
+
+     Let&#x27;s outline ModelNew.forward:
+     ```python
+     def forward(self, nodes, pair_feats, edge_mask):
+         B, N, D = nodes.shape
+         H = self.num_heads
+         P = self.pair_dim
+         head_dim = D // H
+
+         # Ensure contiguous float
+         nodes_f = nodes.contiguous().float()
+         pair_feats_f = pair_feats.contiguous().float()
+         edge_mask_f = edge_mask.contiguous().float()
+
+         # extract weights
+         gamma = self.norm.weight.contiguous().float()
+         beta = self.norm.bias.contiguous().float()
+         Wq = self.q_proj.weight.contiguous().float()   # (D,D)
+         Wk = self.k_proj.weight.contiguous().float()
+         Wv = self.v_proj.weight.contiguous().float()
+         W_out = self.out_proj.weight.contiguous().float()
+
+         # rel_mlp weights
+         W1 = self.rel_mlp[0].weight.contiguous().float()  # (P,P)
+         b1 = self.rel_mlp[0].bias.contiguous().float()    # (P,)
+         W2 = self.rel_mlp[2].weight.contiguous().float()  # (H,P)
+         b2 = self.rel_mlp[2].bias.contiguous().float()    # (H,)
+
+         q = torch.empty_like(nodes_f)
+         k = torch.empty_like(nodes_f)
+         v = torch.empty_like(nodes_f)
+         out = torch.empty_like(nodes_f)
+
+         # Call CUDA wrappers
+         # Need a module-level reference to the compiled extension.
+         # We can store it as self._cpp or a global variable.
+         ext.fused_ln_qkv(nodes_f, gamma, beta, Wq, Wk, Wv, q, k, v)
+         ext.fused_attn_out(q, k, v, pair_feats_f, edge_mask_f, nodes_f,
+                             W1, b1, W2, b2, W_out, out,
+                             B, N, D, H, P, 1.0 / math.sqrt(head_dim))
+         return out
+     ```
+
+     But the compiled extension functions need to accept the tensors. Let&#x27;s write the C++ wrappers properly.
+
+     Also need to handle the case where inputs are on GPU. The kernel bench likely runs on CUDA. So we can assume CUDA tensors. `torch.utils.cpp_extension.load_inline` will compile for the current GPU arch.
+
+     **Writing the CUDA code:**
+
+     Let&#x27;s write the kernels carefully. Since sizes are small, we don&#x27;t need to use `__restrict__` but it&#x27;s good.
+
+     Also, for the MLP bias computation in the attention kernel, we need to be careful about reading W1, W2, b1, b2. They are small and constant for the block. We can read from global memory directly.
+
+     One more optimization: Since pair_feats is small, and each thread needs `pf[0..P-1]`, we could load `pf` into registers. But for P=16, reading from global memory 16 times per thread is fine.
+
+     Let&#x27;s double check the `pf` pointer:
+     `int pf_base = ((b * N + i) * N + lane) * P;`
+     Wait, `pair_feats` shape is (B, N, N, P). In C/C++ (row-major), indexing is:
+     `pair_feats[((b * N + i) * N + j) * P + p]`.
+     Yes.
+
+     Edge mask:
+     `edge_mask[((b * N) + i) * N + j]`.
+
+     q, k, v shapes: we will store them as (B, N, D) in global memory. The attention kernel accesses them by:
+     `q_base = ((b * H + h) * N + i) * head_dim` but if q is stored as (B, N, D), then the offset is `b*N*D + i*D + h*head_dim + d`. Wait, in PyTorch, `.view(B, N, H, head_dim).transpose(1,2)` gives (B,H,N,head_dim). In memory, this is a contiguous tensor if we use `.contiguous()` after transpose. But we don&#x27;t need to transpose if we interpret the (B,N,D) layout as (B,N,H,head_dim) with D=H*head_dim. The attention operation expects q as (B,H,N,head_dim). How is it stored?
+     In the reference:
+     `q = self.q_proj(h).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)`
+     So q becomes (B, H, N, head_dim) and contiguous (since transpose creates non-contiguous, but matmul may handle strides). Later, `logits = torch.matmul(q, k.transpose(-2, -1))` works with strides.
+     In our fused kernel, we don&#x27;t need to physically transpose if we can index correctly.
+     If we store q as (B, N, D), then the element for head h, dim d at node i is at offset `i*D + h*head_dim + d`. This is exactly the same layout as (B, N, H, head_dim) with last dimension contiguous.
+     Matmul in PyTorch with transpositions uses strides. But our custom kernel needs to know the layout.
+     If we keep q as (B, N, D) and interpret it as:
+     `q_val = q_ptr[b*N*D + i*D + h*head_dim + d]`.
+     Is this equivalent to the transposed layout? Let&#x27;s check the reference:
+     Original after `.view(B, N, H, head_dim)`: memory is `(b, n, h, d)` contiguous.
+     After `.transpose(1,2)`: shape (B, H, N, head_dim), strides: stride[0]=N*H*head_dim, stride[1]=head_dim, stride[2]=H*head_dim, stride[3]=1.
+     So the element (b, h, n, d) is at offset `b*N*H*head_dim + h*head_dim + n*H*head_dim + d`.
+     Wait, that&#x27;s `b*N*D + n*D + h*head_dim + d`. Yes! Because stride for dimension 2 (n) is H*head_dim = D.
+     So indeed, the transposed tensor is semantically (B,H,N,head_dim) but physically stored as (B,N,H,head_dim) with contiguous memory. This is because we transposed dimensions 1 and 2, but since the original view already had them as (N,H,head_dim), transposing to (H,N,head_dim) results in strides that are not monotonic? Let&#x27;s compute carefully.
+     Original `.view(B, N, H, head_dim)` has shape (B,N,H,head_dim) and strides (N*H*head_dim, H*head_dim, head_dim, 1).
+     After `.transpose(1,2)`, shape becomes (B, H, N, head_dim), strides become (N*H*head_dim, head_dim, H*head_dim, 1).
+     So the offset for index (b, h, n, d) is:
+     `b * (N*H*head_dim) + h * head_dim + n * (H*head_dim) + d * 1`
+     = `b*N*D + h*head_dim + n*D + d`
+     = `b*N*D + n*D + h*head_dim + d`.
+     So yes, the memory layout is the same as `(B,N,D)` with the head dimensions interleaved within the D dimension. Specifically, for node n, the D dimensions are grouped by head: [head0_d0..d_head_dim-1, head1_d0..., ...].
+     Therefore, storing q as (B,N,D) and interpreting it as described is correct.
+
+     Great. So our Q, K, V buffers can just be (B,N,D).
+
+     In the attention kernel, q_base for (b,h,i) should be:
+     `q_base = b * N * D + i * D + h * head_dim;`
+     And k_j for head h is:
+     `k_base_j_d = b * N * D + j * D + h * head_dim + d;`
+     Which simplifies to `k_ptr + b*N*D + j*D + h*head_dim + d`.
+
+     So we can just pass q,k,v as (B,N,D) tensors.
+
+     **Kernel 2 q/k/v indexing:**
+     ```cpp
+     int q_base = b * N * D + i * D + h * head_dim;
+     ```
+     Then in loop over d:
+     `q[q_base + d]`
+     For k_j:
+     `k[b * N * D + j * D + h * head_dim + d]`
+     For v_j:
+     `v[b * N * D + j * D + h * head_dim + d]`
+
+     Wait, but `j` is `lane` for this thread. Each thread in the warp has a different j. So we compute:
+     ```cpp
+     int k_offset = b * N * D + lane * D + h * head_dim;
+     v_offset similar.
+     ```
+     Then in dot product loop:
+     `sum += q[q_base + d] * k[k_offset + d];`
+     This is good: all threads read the same q address (broadcast), and read k addresses spaced by D (strided). As discussed, it&#x27;s okay.
+
+     Actually, for v_offset, in the final accumulation:
+     `v[v_offset + d]` where v_offset = b*N*D + lane*D + h*head_dim.
+     Each thread reads its own v for its j.
+
+     Good.
+
+     **Kernel 1 output:**
+     q, k, v are (B,N,D). We write directly.
+
+     **Numerical equivalence:**
+     The LayerNorm in PyTorch uses `eps=1e-5` by default. We should use the same.
+     PyTorch softmax uses a numerically stable implementation. Our warp-level max and exp should match.
+     PyTorch SiLU is `x * sigmoid(x)`. We implement as `tmp / (1.0f + expf(-tmp))` or `tmp * sigmoidf(tmp)`. `sigmoidf` might not be defined; we can use `1.0f / (1.0f + expf(-x))`.
+     Need to match fp32 exactly? Within tolerance. Differences due to order of operations in reduction might exist. For small sizes, it should be close.
+     For LayerNorm, we compute variance as `mean((x - mean)^2)`. PyTorch uses the same. But there might be a slight difference in the reduction order. With 96 elements and warp shuffle, it should be very close.
+     For the matmuls, our accumulation order may differ from cuBLAS. For small D=96, the difference should be within 1e-4.
+
+     One potential issue: In the attention kernel, `max_logit` reduction: we do `float max_logit = dot;` and then shfl down. For lane &gt;= N, dot = -1e30f. For lanes &lt; N, dot is the actual value. The max across all 32 lanes will be the max across the 24 real lanes. Good.
+
+     But `__shfl_down_sync` with `0xFFFFFFFF` includes all lanes. We need to make sure we don&#x27;t use a narrower mask because inactive lanes (due to `if`) might not call the function. However, the call is outside the `if`. We call it unconditionally for all threads in the warp. Good.
+
+     **Compiling and binding:**
+
+     In Python, we will define the CUDA/C++ source string and call `load_inline` at module level. The functions list includes `fused_ln_qkv` and `fused_attn_out`. Then we call them inside `ModelNew.forward`.
+
+     Let&#x27;s write the code.
+
+     **Kernel 1 code:**
+
+     ```cuda
+     __global__ void fused_ln_qkv_kernel(
+         const float* __restrict__ nodes,
+         const float* __restrict__ gamma,
+         const float* __restrict__ beta,
+         const float* __restrict__ Wq,
+         const float* __restrict__ Wk,
+         const float* __restrict__ Wv,
+         float* __restrict__ q,
+         float* __restrict__ k,
+         float* __restrict__ v,
+         int B, int N, int D, float eps) {
+
+         int b = blockIdx.x;
+         extern __shared__ float smem[];
+         float* s_nodes = smem;
+         float* s_w = smem + N * D;
+
+         // Load nodes
+         int total = N * D;
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             s_nodes[idx] = nodes[b * total + idx];
+         }
+         __syncthreads();
+
+         // LayerNorm
+         int lane = threadIdx.x % 32;
+         int warp_id = threadIdx.x / 32;
+         int num_warps = blockDim.x / 32;
+
+         for (int n_start = 0; n_start &lt; N; n_start += num_warps) {
+             int node = n_start + warp_id;
+             if (node &lt; N) {
+                 float sum = 0.0f;
+                 for (int d = lane; d &lt; D; d += 32) {
+                     sum += s_nodes[node * D + d];
+                 }
+                 #pragma unroll
+                 for (int offset = 16; offset &gt; 0; offset /= 2) {
+                     sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+                 }
+                 float mean = sum / D;
+
+                 float sq_sum = 0.0f;
+                 for (int d = lane; d &lt; D; d += 32) {
+                     float diff = s_nodes[node * D + d] - mean;
+                     sq_sum += diff * diff;
+                 }
+                 #pragma unroll
+                 for (int offset = 16; offset &gt; 0; offset /= 2) {
+                     sq_sum += __shfl_down_sync(0xFFFFFFFF, sq_sum, offset);
+                 }
+                 float var = sq_sum / D;
+                 float inv_std = rsqrtf(var + eps);
+
+                 for (int d = lane; d &lt; D; d += 32) {
+                     float val = (s_nodes[node * D + d] - mean) * inv_std;
+                     val = val * gamma[d] + beta[d];
+                     s_nodes[node * D + d] = val;
+                 }
+             }
+         }
+         __syncthreads();
+
+         // Projections
+         auto proj = [&amp;](const float* W, float* out_ptr) {
+             // Load weight transposed into s_w with padding
+             for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+                 int d = idx / D;
+                 int k = idx % D;
+                 s_w[k * (D + 1) + d] = W[d * D + k];
+             }
+             __syncthreads();
+
+             for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+                 int n = idx / D;
+                 int d = idx % D;
+                 float sum = 0.0f;
+                 for (int kk = 0; kk &lt; D; ++kk) {
+                     sum += s_nodes[n * D + kk] * s_w[kk * (D + 1) + d];
+                 }
+                 out_ptr[b * total + idx] = sum;
+             }
+             __syncthreads();
+         };
+
+         proj(Wq, q);
+         proj(Wk, k);
+         proj(Wv, v);
+     }
+     ```
+
+     Wait, a lambda inside a CUDA kernel is allowed in C++11 but not in `__global__` functions on all CUDA versions? In modern CUDA (&gt;=11), lambda in device code is supported if compiled with `--expt-extended-lambda`. `torch.utils.cpp_extension.load_inline` passes appropriate flags? Usually it does. But to be safe, we can unroll the projection manually or write a device function. Or we can just write the code three times. It&#x27;s a bit verbose but safe. Actually, a regular inline device function is safer.
+
+     Let&#x27;s write a device inline function or just repeat the code block. Repeating three times is fine.
+
+     Actually, we can write a `__device__` inline function that takes `W` and `out_ptr`, but it needs access to `s_nodes`, `s_w`, `D`, `total`, `b`. We can pass them.
+
+     ```cuda
+     __device__ __forceinline__ void compute_proj(
+         const float* s_nodes, float* s_w, int D, int total, int b,
+         const float* W, float* out_ptr) {
+         for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+             int d = idx / D;
+             int k = idx % D;
+             s_w[k * (D + 1) + d] = W[d * D + k];
+         }
+         __syncthreads();
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             int n = idx / D;
+             int d = idx % D;
+             float sum = 0.0f;
+             for (int kk = 0; kk &lt; D; ++kk) {
+                 sum += s_nodes[n * D + kk] * s_w[kk * (D + 1) + d];
+             }
+             out_ptr[b * total + idx] = sum;
+         }
+         __syncthreads();
+     }
+     ```
+
+     Then call it three times in the kernel. But `__syncthreads()` inside a device function called by threads is okay as long as all threads in the block reach it, which they do because the loops are over all threads. However, `__syncthreads()` inside a non-`__global__` function can be tricky: all threads in the block must reach the same `__syncthreads()`. Since we call it inside the device function and all threads call the device function, it&#x27;s fine. But it&#x27;s generally discouraged? Actually, it&#x27;s allowed if all threads in the block encounter it. Since we have `for (int idx = threadIdx.x; ...)` which all threads execute, it should be fine. But we need to ensure no early return. There is no early return. Good.
+
+     However, putting `__syncthreads()` in an inline device function is fine if all threads in the block call it. Some style guides discourage it to avoid deadlocks, but it&#x27;s legal.
+
+     Let&#x27;s keep it simple and repeat the code.
+
+     **Kernel 2 code:**
+
+     ```cuda
+     __global__ void fused_attn_out_kernel(
+         const float* __restrict__ q,
+         const float* __restrict__ k,
+         const float* __restrict__ v,
+         const float* __restrict__ pair_feats,
+         const float* __restrict__ edge_mask,
+         const float* __restrict__ nodes_orig,
+         const float* __restrict__ W1,
+         const float* __restrict__ b1,
+         const float* __restrict__ W2,
+         const float* __restrict__ b2,
+         const float* __restrict__ W_out,
+         float* __restrict__ out,
+         int B, int N, int D, int H, int P, float scale) {
+
+         int b = blockIdx.x;
+         int lane = threadIdx.x % 32;
+         int warp_id = threadIdx.x / 32;
+         int num_warps = blockDim.x / 32;
+         int head_dim = D / H;
+         int total_queries = H * N;
+
+         extern __shared__ float smem[];
+         float* s_ctx = smem;
+         float* s_w = smem + N * D;
+
+         // Initialize s_ctx to zero? We write all elements, so no need.
+         // But we need to make sure all threads participate in writing.
+         // Since total_queries*head_dim = H*N*head_dim = N*D = total elements.
+         // Each query writes head_dim elements via lane 0. So all elements are written.
+
+         for (int qid = warp_id; qid &lt; total_queries; qid += num_warps) {
+             int h = qid / N;
+             int i = qid % N;
+
+             int q_base = b * N * D + i * D + h * head_dim;
+             int k_base = b * N * D + h * head_dim; // plus j*D
+             int v_base = b * N * D + h * head_dim; // plus j*D
+
+             // load pair feats for j = lane
+             float pf[64];
+             int pf_base = ((b * N + i) * N + lane) * P;
+             if (lane &lt; N) {
+                 for (int p = 0; p &lt; P; ++p) {
+                     pf[p] = pair_feats[pf_base + p];
+                 }
+             }
+
+             float dot = -1e30f;
+             if (lane &lt; N) {
+                 int j = lane;
+                 float sum = 0.0f;
+                 for (int d = 0; d &lt; head_dim; ++d) {
+                     sum += q[q_base + d] * k[k_base + j * D + d];
+                 }
+
+                 float bias = b2[h];
+                 for (int p = 0; p &lt; P; ++p) {
+                     float tmp = b1[p];
+                     for (int q_idx = 0; q_idx &lt; P; ++q_idx) {
+                         tmp += W1[p * P + q_idx] * pf[q_idx];
+                     }
+                     // SiLU
+                     tmp = tmp / (1.0f + expf(-tmp));
+                     bias += W2[h * P + p] * tmp;
+                 }
+
+                 dot = sum * scale + bias;
+                 float mask_val = edge_mask[((b * N) + i) * N + j];
+                 if (mask_val &lt; 0.5f) dot = -1e30f;
+             }
+
+             float max_logit = dot;
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) {
+                 float other = __shfl_down_sync(0xFFFFFFFF, max_logit, offset);
+                 if (other &gt; max_logit) max_logit = other;
+             }
+
+             float exp_val = 0.0f;
+             if (lane &lt; N) {
+                 exp_val = expf(dot - max_logit);
+             }
+             float sum_exp = exp_val;
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) {
+                 sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, offset);
+             }
+             float inv_sum = 1.0f / sum_exp;
+             float attn_weight = (lane &lt; N) ? exp_val * inv_sum : 0.0f;
+
+             for (int d = 0; d &lt; head_dim; ++d) {
+                 float val = 0.0f;
+                 if (lane &lt; N) {
+                     val = attn_weight * v[v_base + lane * D + d];
+                 }
+                 #pragma unroll
+                 for (int offset = 16; offset &gt; 0; offset /= 2) {
+                     val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+                 }
+                 if (lane == 0) {
+                     s_ctx[i * D + h * head_dim + d] = val;
+                 }
+             }
+         }
+
+         __syncthreads();
+
+         // Load W_out transposed padded into s_w
+         for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+             int d = idx / D;
+             int k = idx % D;
+             s_w[k * (D + 1) + d] = W_out[d * D + k];
+         }
+         __syncthreads();
+
+         int total = N * D;
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             int n = idx / D;
+             int d = idx % D;
+             float sum = 0.0f;
+             for (int kk = 0; kk &lt; D; ++kk) {
+                 sum += s_ctx[n * D + kk] * s_w[kk * (D + 1) + d];
+             }
+             float orig = nodes_orig[b * total + idx];
+             out[b * total + idx] = orig + sum;
+         }
+     }
+     ```
+
+     Wait, in the out_proj, `s_w[k*(D+1) + d]` is transposed weight. `W_out[d*D + k]` is global weight. Yes.
+
+     In `k_base + j * D + d` and `v_base + j * D + d`: since q,k,v are stored as (B,N,D) and head h&#x27;s data is at offset `h*head_dim` within each node&#x27;s D dims. So for node j, the base is `b*N*D + j*D + h*head_dim`. We wrote `k_base = b*N*D + h*head_dim` and then `j*D`. So `k_base + j*D + d` is correct.
+
+     Wait, `q_base = b * N * D + i * D + h * head_dim`. Yes.
+     `k_base = b * N * D + h * head_dim`. Then for j: `k_base + j * D + d`. This is `b*N*D + j*D + h*head_dim + d`. Correct.
+
+     **C++ wrappers:**
+
+     Need to wrap with PyTorch tensor API.
+
+     ```cpp
+     void fused_ln_qkv(
+         at::Tensor nodes,
+         at::Tensor gamma,
+         at::Tensor beta,
+         at::Tensor Wq,
+         at::Tensor Wk,
+         at::Tensor Wv,
+         at::Tensor q,
+         at::Tensor k,
+         at::Tensor v) {
+
+         int B = nodes.size(0);
+         int N = nodes.size(1);
+         int D = nodes.size(2);
+         size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);
+         fused_ln_qkv_kernel&lt;&lt;&lt;B, 256, smem_size&gt;&gt;&gt;(
+             nodes.data_ptr&lt;float&gt;(),
+             gamma.data_ptr&lt;float&gt;(),
+             beta.data_ptr&lt;float&gt;(),
+             Wq.data_ptr&lt;float&gt;(),
+             Wk.data_ptr&lt;float&gt;(),
+             Wv.data_ptr&lt;float&gt;(),
+             q.data_ptr&lt;float&gt;(),
+             k.data_ptr&lt;float&gt;(),
+             v.data_ptr&lt;float&gt;(),
+             B, N, D, 1e-5f);
+     }
+
+     void fused_attn_out(
+         at::Tensor q,
+         at::Tensor k,
+         at::Tensor v,
+         at::Tensor pair_feats,
+         at::Tensor edge_mask,
+         at::Tensor nodes_orig,
+         at::Tensor W1,
+         at::Tensor b1,
+         at::Tensor W2,
+         at::Tensor b2,
+         at::Tensor W_out,
+         at::Tensor out,
+         float scale) {
+
+         int B = q.size(0);
+         int N = q.size(1);
+         int D = q.size(2);
+         int H = W2.size(0); // num_heads
+         int P = W1.size(0); // pair_dim
+         size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);
+         fused_attn_out_kernel&lt;&lt;&lt;B, 256, smem_size&gt;&gt;&gt;(
+             q.data_ptr&lt;float&gt;(),
+             k.data_ptr&lt;float&gt;(),
+             v.data_ptr&lt;float&gt;(),
+             pair_feats.data_ptr&lt;float&gt;(),
+             edge_mask.data_ptr&lt;float&gt;(),
+             nodes_orig.data_ptr&lt;float&gt;(),
+             W1.data_ptr&lt;float&gt;(),
+             b1.data_ptr&lt;float&gt;(),
+             W2.data_ptr&lt;float&gt;(),
+             b2.data_ptr&lt;float&gt;(),
+             W_out.data_ptr&lt;float&gt;(),
+             out.data_ptr&lt;float&gt;(),
+             B, N, D, H, P, scale);
+     }
+     ```
+
+     Wait, `W1.size(0)` is `pair_dim` (out_features of first linear). `W2.size(0)` is `num_heads`. In `__init__`, `W1 = self.rel_mlp[0].weight` has shape (pair_dim, pair_dim). `W2 = self.rel_mlp[2].weight` has shape (num_heads, pair_dim). So yes.
+
+     We need to ensure all tensors are contiguous and on the same device.
+
+     In Python `forward`, we should cast to float (the reference likely uses fp32). We can also support other types by casting.
+
+     Since the reference model&#x27;s weights might be fp32 or other, and inputs might be fp32, it&#x27;s safe to cast to float.
+
+     Actually, the reference implementation uses default dtype (likely float32). We&#x27;ll just use `.float()` on everything.
+
+     Let&#x27;s write the full Python module.
+
+     **Potential issue:** `load_inline` auto-generates pybind11 module. We must not include our own `PYBIND11_MODULE`. We just pass `functions=[&#x27;fused_ln_qkv&#x27;, &#x27;fused_attn_out&#x27;]`.
+
+     Check for static analysis: no try/except fallback, no timing patches.
+
+     Let&#x27;s draft the code.
+
+     ```python
+     import math
+     import torch
+     import torch.nn as nn
+
+     # CUDA source
+     cuda_source = &#x27;&#x27;&#x27;
+     #include &lt;torch/extension.h&gt;
+     #include &lt;cuda_runtime.h&gt;
+     #include &lt;math.h&gt;
+
+     __global__ void fused_ln_qkv_kernel(
+         const float* __restrict__ nodes,
+         const float* __restrict__ gamma,
+         const float* __restrict__ beta,
+         const float* __restrict__ Wq,
+         const float* __restrict__ Wk,
+         const float* __restrict__ Wv,
+         float* __restrict__ q,
+         float* __restrict__ k,
+         float* __restrict__ v,
+         int B, int N, int D, float eps) {
+
+         int b = blockIdx.x;
+         extern __shared__ float smem[];
+         float* s_nodes = smem;
+         float* s_w = smem + N * D;
+
+         int total = N * D;
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             s_nodes[idx] = nodes[b * total + idx];
+         }
+         __syncthreads();
+
+         int lane = threadIdx.x % 32;
+         int warp_id = threadIdx.x / 32;
+         int num_warps = blockDim.x / 32;
+
+         for (int n_start = 0; n_start &lt; N; n_start += num_warps) {
+             int node = n_start + warp_id;
+             if (node &lt; N) {
+                 float sum = 0.0f;
+                 for (int d = lane; d &lt; D; d += 32) {
+                     sum += s_nodes[node * D + d];
+                 }
+                 #pragma unroll
+                 for (int offset = 16; offset &gt; 0; offset /= 2) {
+                     sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+                 }
+                 float mean = sum / D;
+
+                 float sq_sum = 0.0f;
+                 for (int d = lane; d &lt; D; d += 32) {
+                     float diff = s_nodes[node * D + d] - mean;
+                     sq_sum += diff * diff;
+                 }
+                 #pragma unroll
+                 for (int offset = 16; offset &gt; 0; offset /= 2) {
+                     sq_sum += __shfl_down_sync(0xFFFFFFFF, sq_sum, offset);
+                 }
+                 float var = sq_sum / D;
+                 float inv_std = rsqrtf(var + eps);
+
+                 for (int d = lane; d &lt; D; d += 32) {
+                     float val = (s_nodes[node * D + d] - mean) * inv_std;
+                     val = val * gamma[d] + beta[d];
+                     s_nodes[node * D + d] = val;
+                 }
+             }
+         }
+         __syncthreads();
+
+         // Q proj
+         for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+             int d = idx / D;
+             int k = idx % D;
+             s_w[k * (D + 1) + d] = Wq[d * D + k];
+         }
+         __syncthreads();
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             int n = idx / D;
+             int d = idx % D;
+             float sum = 0.0f;
+             for (int kk = 0; kk &lt; D; ++kk) {
+                 sum += s_nodes[n * D + kk] * s_w[kk * (D + 1) + d];
+             }
+             q[b * total + idx] = sum;
+         }
+         __syncthreads();
+
+         // K proj
+         for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+             int d = idx / D;
+             int k = idx % D;
+             s_w[k * (D + 1) + d] = Wk[d * D + k];
+         }
+         __syncthreads();
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             int n = idx / D;
+             int d = idx % D;
+             float sum = 0.0f;
+             for (int kk = 0; kk &lt; D; ++kk) {
+                 sum += s_nodes[n * D + kk] * s_w[kk * (D + 1) + d];
+             }
+             k[b * total + idx] = sum;
+         }
+         __syncthreads();
+
+         // V proj
+         for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+             int d = idx / D;
+             int k = idx % D;
+             s_w[k * (D + 1) + d] = Wv[d * D + k];
+         }
+         __syncthreads();
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             int n = idx / D;
+             int d = idx % D;
+             float sum = 0.0f;
+             for (int kk = 0; kk &lt; D; ++kk) {
+                 sum += s_nodes[n * D + kk] * s_w[kk * (D + 1) + d];
+             }
+             v[b * total + idx] = sum;
+         }
+     }
+
+     __global__ void fused_attn_out_kernel(
+         const float* __restrict__ q,
+         const float* __restrict__ k,
+         const float* __restrict__ v,
+         const float* __restrict__ pair_feats,
+         const float* __restrict__ edge_mask,
+         const float* __restrict__ nodes_orig,
+         const float* __restrict__ W1,
+         const float* __restrict__ b1,
+         const float* __restrict__ W2,
+         const float* __restrict__ b2,
+         const float* __restrict__ W_out,
+         float* __restrict__ out,
+         int B, int N, int D, int H, int P, float scale) {
+
+         int b = blockIdx.x;
+         int lane = threadIdx.x % 32;
+         int warp_id = threadIdx.x / 32;
+         int num_warps = blockDim.x / 32;
+         int head_dim = D / H;
+         int total_queries = H * N;
+
+         extern __shared__ float smem[];
+         float* s_ctx = smem;
+         float* s_w = smem + N * D;
+
+         for (int qid = warp_id; qid &lt; total_queries; qid += num_warps) {
+             int h = qid / N;
+             int i = qid % N;
+
+             int q_base = b * N * D + i * D + h * head_dim;
+             int k_base = b * N * D + h * head_dim;
+             int v_base = b * N * D + h * head_dim;
+
+             float pf[64];
+             int pf_base = ((b * N + i) * N + lane) * P;
+             if (lane &lt; N) {
+                 for (int p = 0; p &lt; P; ++p) {
+                     pf[p] = pair_feats[pf_base + p];
+                 }
+             }
+
+             float dot = -1e30f;
+             if (lane &lt; N) {
+                 int j = lane;
+                 float sum = 0.0f;
+                 for (int d = 0; d &lt; head_dim; ++d) {
+                     sum += q[q_base + d] * k[k_base + j * D + d];
+                 }
+
+                 float bias = b2[h];
+                 for (int p = 0; p &lt; P; ++p) {
+                     float tmp = b1[p];
+                     for (int q_idx = 0; q_idx &lt; P; ++q_idx) {
+                         tmp += W1[p * P + q_idx] * pf[q_idx];
+                     }
+                     tmp = tmp / (1.0f + expf(-tmp));
+                     bias += W2[h * P + p] * tmp;
+                 }
+
+                 dot = sum * scale + bias;
+                 float mask_val = edge_mask[((b * N) + i) * N + j];
+                 if (mask_val &lt; 0.5f) dot = -1e30f;
+             }
+
+             float max_logit = dot;
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) {
+                 float other = __shfl_down_sync(0xFFFFFFFF, max_logit, offset);
+                 if (other &gt; max_logit) max_logit = other;
+             }
+
+             float exp_val = 0.0f;
+             if (lane &lt; N) {
+                 exp_val = expf(dot - max_logit);
+             }
+             float sum_exp = exp_val;
+             #pragma unroll
+             for (int offset = 16; offset &gt; 0; offset /= 2) {
+                 sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, offset);
+             }
+             float inv_sum = 1.0f / (sum_exp + 1e-30f);
+             float attn_weight = (lane &lt; N) ? exp_val * inv_sum : 0.0f;
+
+             for (int d = 0; d &lt; head_dim; ++d) {
+                 float val = 0.0f;
+                 if (lane &lt; N) {
+                     val = attn_weight * v[v_base + lane * D + d];
+                 }
+                 #pragma unroll
+                 for (int offset = 16; offset &gt; 0; offset /= 2) {
+                     val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+                 }
+                 if (lane == 0) {
+                     s_ctx[i * D + h * head_dim + d] = val;
+                 }
+             }
+         }
+
+         __syncthreads();
+
+         for (int idx = threadIdx.x; idx &lt; D * D; idx += blockDim.x) {
+             int d = idx / D;
+             int k = idx % D;
+             s_w[k * (D + 1) + d] = W_out[d * D + k];
+         }
+         __syncthreads();
+
+         int total = N * D;
+         for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+             int n = idx / D;
+             int d = idx % D;
+             float sum = 0.0f;
+             for (int kk = 0; kk &lt; D; ++kk) {
+                 sum += s_ctx[n * D + kk] * s_w[kk * (D + 1) + d];
+             }
+             float orig = nodes_orig[b * total + idx];
+             out[b * total + idx] = orig + sum;
+         }
+     }
+
+     void fused_ln_qkv(
+         at::Tensor nodes,
+         at::Tensor gamma,
+         at::Tensor beta,
+         at::Tensor Wq,
+         at::Tensor Wk,
+         at::Tensor Wv,
+         at::Tensor q,
+         at::Tensor k,
+         at::Tensor v) {
+
+         int B = nodes.size(0);
+         int N = nodes.size(1);
+         int D = nodes.size(2);
+         size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);
+         fused_ln_qkv_kernel&lt;&lt;&lt;B, 256, smem_size&gt;&gt;&gt;(
+             nodes.data_ptr&lt;float&gt;(),
+             gamma.data_ptr&lt;float&gt;(),
+             beta.data_ptr&lt;float&gt;(),
+             Wq.data_ptr&lt;float&gt;(),
+             Wk.data_ptr&lt;float&gt;(),
+             Wv.data_ptr&lt;float&gt;(),
+             q.data_ptr&lt;float&gt;(),
+             k.data_ptr&lt;float&gt;(),
+             v.data_ptr&lt;float&gt;(),
+             B, N, D, 1e-5f);
+     }
+
+     void fused_attn_out(
+         at::Tensor q,
+         at::Tensor k,
+         at::Tensor v,
+         at::Tensor pair_feats,
+         at::Tensor edge_mask,
+         at::Tensor nodes_orig,
+         at::Tensor W1,
+         at::Tensor b1,
+         at::Tensor W2,
+         at::Tensor b2,
+         at::Tensor W_out,
+         at::Tensor out,
+         float scale) {
+
+         int B = q.size(0);
+         int N = q.size(1);
+         int D = q.size(2);
+         int H = W2.size(0);
+         int P = W1.size(0);
+         size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);
+         fused_attn_out_kernel&lt;&lt;&lt;B, 256, smem_size&gt;&gt;&gt;(
+             q.data_ptr&lt;float&gt;(),
+             k.data_ptr&lt;float&gt;(),
+             v.data_ptr&lt;float&gt;(),
+             pair_feats.data_ptr&lt;float&gt;(),
+             edge_mask.data_ptr&lt;float&gt;(),
+             nodes_orig.data_ptr&lt;float&gt;(),
+             W1.data_ptr&lt;float&gt;(),
+             b1.data_ptr&lt;float&gt;(),
+             W2.data_ptr&lt;float&gt;(),
+             b2.data_ptr&lt;float&gt;(),
+             W_out.data_ptr&lt;float&gt;(),
+             out.data_ptr&lt;float&gt;(),
+             B, N, D, H, P, scale);
+     }
+     &#x27;&#x27;&#x27;
+
+     # Compile
+     import torch.utils.cpp_extension
+     _cuda_ext = torch.utils.cpp_extension.load_inline(
+         name=&#x27;gf_vla_fused&#x27;,
+         cpp_sources=&#x27;&#x27;,
+         cuda_sources=cuda_source,
+         functions=[&#x27;fused_ln_qkv&#x27;, &#x27;fused_attn_out&#x27;],
+         extra_cuda_cflags=[&#x27;-O3&#x27;],
+         verbose=False,
+     )
+
+     class ModelNew(nn.Module):
+         def __init__(self, dim, pair_dim, num_heads):
+             super().__init__()
+             self.dim = dim
+             self.pair_dim = pair_dim
+             self.num_heads = num_heads
+             self.head_dim = dim // num_heads
+             self.scale = 1.0 / math.sqrt(self.head_dim)
+
+             self.norm = nn.LayerNorm(dim)
+             self.q_proj = nn.Linear(dim, dim, bias=False)
+             self.k_proj = nn.Linear(dim, dim, bias=False)
+             self.v_proj = nn.Linear(dim, dim, bias=False)
+             self.rel_mlp = nn.Sequential(
+                 nn.Linear(pair_dim, pair_dim),
+                 nn.SiLU(),
+                 nn.Linear(pair_dim, num_heads),
+             )
+             self.out_proj = nn.Linear(dim, dim, bias=False)
+
+         def forward(self, nodes, pair_feats, edge_mask):
+             B, N, D = nodes.shape
+             H = self.num_heads
+             P = self.pair_dim
+
+             # cast to float and contiguous
+             nodes_f = nodes.contiguous().float()
+             pair_feats_f = pair_feats.contiguous().float()
+             edge_mask_f = edge_mask.contiguous().float()
+
+             gamma = self.norm.weight.contiguous().float()
+             beta = self.norm.bias.contiguous().float()
+             Wq = self.q_proj.weight.contiguous().float()
+             Wk = self.k_proj.weight.contiguous().float()
+             Wv = self.v_proj.weight.contiguous().float()
+             W_out = self.out_proj.weight.contiguous().float()
+
+             W1 = self.rel_mlp[0].weight.contiguous().float()
+             b1 = self.rel_mlp[0].bias.contiguous().float()
+             W2 = self.rel_mlp[2].weight.contiguous().float()
+             b2 = self.rel_mlp[2].bias.contiguous().float()
+
+             q = torch.empty_like(nodes_f)
+             k = torch.empty_like(nodes_f)
+             v = torch.empty_like(nodes_f)
+             out = torch.empty_like(nodes_f)
+
+             _cuda_ext.fused_ln_qkv(nodes_f, gamma, beta, Wq, Wk, Wv, q, k, v)
+             _cuda_ext.fused_attn_out(q, k, v, pair_feats_f, edge_mask_f, nodes_f,
+                                      W1, b1, W2, b2, W_out, out, self.scale)
+             return out
+     ```
+
+     Wait, we need to make sure the weights are on the same device as inputs. In `forward`, inputs are likely CUDA. We should move weights to CUDA if they aren&#x27;t already. Since the layers are registered nn.Module parameters, they will be on the same device as the module (which should be moved to CUDA). But to be safe, we can ensure `.to(nodes.device)`.
+
+     Actually, `self.norm.weight` is a parameter. If ModelNew is on CPU, weights are CPU. The evaluation likely moves the model to CUDA. So it&#x27;s fine. But we can add `.to(nodes.device)` to be robust.
+
+     Let&#x27;s add `.to(nodes.device)` to all weight extractions. However, `.to(...)` creates a copy. Better to just ensure model is on the right device.
+
+     In the `forward`, we can do:
+     `gamma = self.norm.weight.float()` and then ensure it&#x27;s contiguous. If it&#x27;s already on CUDA and float, `.contiguous()` is cheap.
+     But if the model is in fp16, `.float()` will create a copy. The reference might be fp32. The problem says &quot;produce numerically equivalent outputs at fp32 precision&quot;. So we can cast to float.
+     Let&#x27;s just do everything in float.
+
+     One more thing: The `nodes` input might be on CPU in `get_inputs`. The check may run on CPU? The problem says &quot;backend=cuda&quot; probably. But we can handle by checking device.
+
+     In the default ModelNew (PyTorch) it works on any device. Our kernel requires CUDA. The evaluation environment likely supplies CUDA inputs and moves the model to CUDA. Let&#x27;s assume that.
+
+     Let&#x27;s add `if not nodes.is_cuda: return self._fallback(...)`? But we don&#x27;t have fallback. We can just let it fail or move to CUDA. Since evaluation is on GPU, it&#x27;s fine.
+
+     Actually, `run_correctness` might test on CPU or GPU. The prompt says &quot;backend=cuda&quot; likely. But to be safe, we could check `if not nodes.is_cuda: return self._ref(nodes, pair_feats, edge_mask)` but we don&#x27;t have _ref. Alternatively, we can just write a pure PyTorch fallback if not CUDA, but the static checker might flag fallbacks? The static checker flags &quot;try/except fallbacks to the reference, timing-function patches, lazy-tensor tricks, threading injection&quot;. A simple `if not nodes.is_cuda` fallback is okay? It might be considered a fallback. Better to avoid. But if the test runs on CPU, our kernel won&#x27;t work. However, the problem says &quot;Replace the forward computation ... with a custom CUDA kernel.&quot; and &quot;run faster than the PyTorch reference.&quot; The evaluation likely runs on GPU.
+
+     Let&#x27;s check the tools: `compile_kernel` compiles the kernel. `run_correctness` runs correctness only. `submit_kernel` records final. All are GPU. So we can assume CUDA.
+
+     Wait, we need to add `#include &lt;torch/extension.h&gt;` and use `at::Tensor`. In `load_inline`, the auto-generated binding expects C++ functions that take `at::Tensor` and returns `void` or tensor. Our functions return void. That&#x27;s okay.
+
+     Actually, `load_inline` may need the C++ source to compile with `torch/extension.h`. We included it.
+
+     One issue: `load_inline` requires `cpp_sources` and `cuda_sources`. We passed `cpp_sources=&#x27;&#x27;`. Is that okay? Yes.
+
+     Another issue: `extra_cuda_cflags=[&#x27;-O3&#x27;]` might be unnecessary but fine. We may want to add `--use_fast_math`? No, that could reduce precision. We are already using `expf` and `rsqrtf`. PyTorch uses similar. We should avoid `--use_fast_math` to ensure correctness.
+
+     Let&#x27;s think about `size_t smem_size = (N * D + D * (D + 1)) * sizeof(float);`. In Kernel 1 and Kernel 2, we pass this per launch. For N=24, D=96: 46464 bytes. Max shared memory per block is usually 48KB (49152). So it&#x27;s within limits. For other potential sizes (if they test with different dims), it could exceed. But the problem gives fixed sizes. The constructor args are passed at init but the shapes at runtime match. If they vary, we might exceed. But the kernel could fail. We can maybe add a check and fallback? But the problem expects custom kernel for the model. The fixed sizes are just for the benchmark. I think it&#x27;s okay.
+
+     Wait, the problem says &quot;Accept the same constructor arguments as Model.&quot; So dim, pair_dim, num_heads are stored. But get_inputs defines batch_size=4, num_objects=24, dim=96, pair_dim=16, num_heads=4. The evaluation might use these or might vary? Usually KernelBench uses fixed sizes from get_inputs. But to be robust, we should handle any valid sizes within memory limits.
+
+     However, our kernel uses `pf[64]`. If `pair_dim` &gt; 64, we get stack overflow or wrong results. We can make it dynamic by allocating a small array with a compile-time constant that is large enough. Max pair_dim could be maybe 256? If we want to be safe, use a larger constant like 256 or 512. But registers are limited. Since the benchmark uses 16, we can keep 64. But to be safe, let&#x27;s use `128` or allocate based on `pair_dim` in shared memory? That&#x27;s complicated because shared memory is already used for other things. Another option: read pair_feats directly in the inner loop without preloading into `pf`. That avoids local array size limit.
+
+     We can rewrite the MLP bias computation without `pf` array:
+
+     ```cpp
+     float bias = b2[h];
+     for (int p = 0; p &lt; P; ++p) {
+         float tmp = b1[p];
+         for (int q_idx = 0; q_idx &lt; P; ++q_idx) {
+             tmp += W1[p * P + q_idx] * pair_feats[pf_base + q_idx];
+         }
+         tmp = tmp / (1.0f + expf(-tmp));
+         bias += W2[h * P + p] * tmp;
+     }
+     ```
+
+     This reads `pair_feats` P*P times per thread (256 reads). Since P is small, it&#x27;s fine. This eliminates the `pf` array and the size limit. Let&#x27;s do that.
+
+     Wait, `pf_base` is computed as `((b * N + i) * N + lane) * P`. So `pair_feats[pf_base + q_idx]` reads the correct element. Yes.
+
+     Let&#x27;s modify Kernel 2 accordingly.
+
+     Also, we have `float pf[64];` in the code. Let&#x27;s remove it.
+
+     **Another issue:** The `for (int q_idx = 0; q_idx &lt; P; ++q_idx)` inside the `if (lane &lt; N)` block. For `P=16`, inner loop is 16. That&#x27;s fine. For larger P, still okay.
+
+     **Potential performance issue:** The rel_mlp is computed inside the QK dot product, which is inside the `qid` loop. Each warp does 12 iterations. In each iteration, 24 active threads each compute the MLP. Total MLP evaluations per block = 96 * 24 = 2304. Each MLP is 16*16 + 16*4 = 256+64=320 FMAs + activations. Total FLOPs ~ 737k. That&#x27;s fine.
+
+     **Check numerical stability of softmax:**
+     We compute `expf(dot - max_logit)`. If dot is -1e30f, `dot - max_logit` could be large negative. expf(-1e30) underflows to 0. That&#x27;s fine. We also add `1e-30f` to sum_exp to avoid division by zero if all are -inf. In our code, `float inv_sum = 1.0f / (sum_exp + 1e-30f);`. Actually, I wrote `float inv_sum = 1.0f / sum_exp;` earlier. Let&#x27;s add epsilon: `float inv_sum = 1.0f / (sum_exp + 1e-30f);`. But in PyTorch, if all are -inf, softmax returns nan (0/0). However, edge_mask ensures at least one is kept? Not necessarily. But if all are masked, it&#x27;s an edge case. In the reference, `masked_fill` with -inf and softmax on all -inf gives nan. Our code: if all lanes &lt; N are masked, all dots are -1e30f. max_logit = -1e30f. exp_val = expf(-1e30f - (-1e30f)) = expf(0) = 1? Wait, no: dot = -1e30f, max_logit = -1e30f. dot - max_logit = 0. exp_val = 1. sum_exp = N (e.g., 24). inv_sum = 1/24. attn_weight = 1/24. That is NOT nan. It treats all -inf as equal and gives uniform attention. PyTorch softmax on all -inf gives nan because max is -inf, exp(-inf - (-inf)) = exp(nan) = nan. Wait, let&#x27;s check: in PyTorch, softmax with all -inf: max = -inf. x - max = -inf - (-inf) = nan. exp(nan) = nan. sum = nan. result = nan.
+     To match this, we should make max_logit = -inf lead to nan. But this is an edge case. If reference never hits all-masked rows, it&#x27;s fine. But to be safe, we can handle it: if max_logit &lt; -1e20f, then set exp_val = 0.0f for all. Let&#x27;s see:
+     If max_logit = -1e30f (our proxy for -inf), then `if (max_logit &lt; -1e20f) exp_val = 0.0f;` Then sum_exp = 0, and `inv_sum = 1/(0+1e-30) = 1e30`, attn_weight = 0. That gives 0 output, not nan. Hmm.
+     Actually, PyTorch returns nan for all -inf softmax. But the reference `edge_mask` could have rows of all zeros? If so, `masked_fill` makes all -inf, and the subsequent `matmul(attn, v)` would produce nan. Do we need to match nan exactly? Tolerance for fp32 is 1e-4. Nan != 0, so if the test includes all-masked rows, we would fail.
+     How likely is that? The get_inputs uses `torch.ones` for edge_mask, so no all-zero rows. The test might use random masks. If a row is all zeros, reference gives nan. Our kernel would give 0 output for that row. Different. We need to fix this.
+     To replicate PyTorch&#x27;s nan behavior: if max_logit &lt; -1e20f, we can set `exp_val = 0.0f` and `sum_exp = 0.0f`, and then `inv_sum = 1.0f / sum_exp` -&gt; inf, and `attn_weight = nan` (0 * inf = nan). Actually in float: `0.0f * (1.0f / 0.0f)` is NaN. Let&#x27;s test: 0 * inf = NaN in IEEE 754.
+     So if we do:
+         float inv_sum = 1.0f / sum_exp; // no epsilon
+         float attn_weight = (lane &lt; N) ? exp_val * inv_sum : 0.0f;
+     If all dots are -inf, max_logit = -inf. For lane &lt; N: dot = -inf, exp_val = expf(-inf - (-inf)) = expf(NaN) = NaN. sum_exp = NaN. inv_sum = NaN. attn_weight = NaN. Then `val = NaN * v[...] = NaN`. shfl sum = NaN. s_ctx = NaN. That matches PyTorch!
+     Wait, our `dot` is not actually -inf, it&#x27;s -1e30f. So dot - max_logit = 0, not NaN. So we get uniform, not NaN.
+     To match, we need `dot` to be `-INFINITY` (actual negative infinity). We can set `dot = -CUDART_INF_F;` if masked. But then `max_logit` = -inf. `__shfl_down_sync` with -inf? That&#x27;s fine. Then `dot - max_logit` = NaN (because -inf - (-inf) = NaN). `expf(NaN)` = NaN. That replicates.
+     Let&#x27;s use `#include &lt;math_constants.h&gt;`? Or just `__int_as_float(0xff800000)` for -inf. Or `#include &lt;math.h&gt;` and use `CUDART_NEG_INF`? Actually in CUDA device code, we can use `-CUDART_INF_F` if we include `&lt;math_constants.h&gt;`. Or simply `-INFINITY` from C++ `&lt;cmath&gt;`.
+     Let&#x27;s set `dot = -INFINITY;`. Then `dot - max_logit` = `-INFINITY - (-INFINITY)` = NaN. `expf(NaN)` = NaN. `sum_exp` = NaN. `inv_sum` = NaN. `attn_weight` = NaN. Then output is NaN. That matches PyTorch.
+     However, if some are masked and some are not, max_logit is finite. For masked lanes, dot = -inf. `dot - max_logit` = -inf - finite = -inf. `expf(-inf)` = 0. Good.
+
+     So change:
+     `if (mask_val &lt; 0.5f) dot = -INFINITY;`
+     And `float dot = -INFINITY;` initially. Wait, but we need `dot` defined outside `if`. Let&#x27;s do:
+     ```cpp
+     float dot = -INFINITY;
+     if (lane &lt; N) {
+         ...
+         dot = sum * scale + bias;
+         if (mask_val &lt; 0.5f) dot = -INFINITY;
+     }
+     ```
+     Then everything follows.
+     However, `__shfl_down_sync` with -INFINITY: is that okay? Yes, it&#x27;s just a float value.
+
+     But will `max_logit` for a real query be -INFINITY only if all are masked? If all real lanes have dot = -INFINITY, max_logit = -INFINITY. Then expf(dot - max_logit) = expf(NaN) = NaN. Sum = NaN. Good.
+
+     Wait, if a query has some real lanes and some masked lanes (lane &gt;= N), then lane &gt;= N has dot = -INFINITY. Max is reduced over all lanes. If the real max is finite, `__shfl_down_sync` includes -INFINITY, but `other &gt; max_logit` check means max stays finite. Good.
+
+     So using `-INFINITY` is correct and matches PyTorch behavior for all-masked rows.
+
+     However, `expf(NaN)` is NaN, and `1.0f / NaN` is NaN. The output will be NaN. Good.
+
+     Let&#x27;s add `#include &lt;cmath&gt;` and use `-INFINITY`. Or we can define `-1e30f` and special-case all-masked? But `-INFINITY` is cleaner.
+
+     Actually, using `-INFINITY` in device code is fine with `#include &lt;math.h&gt;` or `&lt;cmath&gt;`. `expf(-INFINITY)` is 0. `expf(NaN)` is NaN.
+
+     Let&#x27;s change the code to use `-INFINITY`.
+
+     Also, we need to include `&lt;math.h&gt;` for `expf`, `rsqrtf`, etc. We already have it.
+
+     Next issue: `s_ctx` is not initialized to zero. We write all elements. For total_queries = H*N, each query writes head_dim elements. So total writes = H*N*head_dim = N*D. We cover all elements. No need to zero.
+
+     However, there is a subtlety: `__syncthreads()` after attention writes to s_ctx. Then some threads load W_out into s_w. Then another `__syncthreads()`. Then all threads compute out_proj. This is fine.
+
+     But `s_w` array size is `D*(D+1)`. In Kernel 2, shared memory is `(N*D + D*(D+1)) * sizeof(float)`. In Kernel 1, it is the same. Since we allocate dynamic shared memory of that size, `s_w` must not be accessed beyond that. D*(D+1) covers it.
+
+     Let&#x27;s double-check Kernel 1 uses `s_w[k*(D+1) + d]`. k ranges 0..D-1, d ranges 0..D-1. Max index = (D-1)*(D+1) + (D-1) = D^2 + D - 2? Wait:
+     `(D-1)*(D+1) + (D-1) = D^2 - 1 + D - 1 = D^2 + D - 2`. But we allocated `D*(D+1)` elements (indices 0..D*(D+1)-1 = D^2+D-1). So max index D^2+D-2 &lt; D^2+D-1. Good.
+
+     **Edge case:** `N*D + D*(D+1)` must be computed as size_t to avoid overflow. For D up to maybe 512, 512*513=262k, times 4 = 1MB &gt; 48KB. So for larger D, shared memory would be exceeded. But given the benchmark, D=96. If the evaluation tests different sizes, the kernel may fail. But it&#x27;s common in kernel bench to test fixed sizes. We can add a fallback: if shared memory required &gt; 48KB, fall back to PyTorch? But we don&#x27;t want a fallback. However, maybe we can handle larger sizes by using separate kernels or splitting. But it&#x27;s unlikely needed.
+
+     Actually, we can compute shared memory in Kernel 1 differently: we only need one weight at a time. So we can allocate `s_nodes` and `s_w`. That is necessary.
+     For Kernel 2, we can avoid `s_w` for W_out and just read from global memory. That reduces shared memory to `N*D` (9KB) and eliminates the size constraint from W_out. Let&#x27;s do that! It simplifies Kernel 2 memory.
+
+     In Kernel 2 out_proj: read W_out from global directly. Since it&#x27;s cached, it&#x27;s fine.
+     Remove the loading of W_out into shared memory.
+     Then smem_size for Kernel 2 = N*D * sizeof(float).
+     For D=96, that&#x27;s 9KB. Very safe.
+
+     Let&#x27;s do that. It also reduces code.
+
+     Kernel 2 out_proj:
+     ```cpp
+     __syncthreads();
+     int total = N * D;
+     for (int idx = threadIdx.x; idx &lt; total; idx += blockDim.x) {
+         int n = idx / D;
+         int d = idx % D;
+         float sum = 0.0f;
+         // W_out shape (D, D). W_out[d][k] is global.
+         for (int kk = 0; kk &lt; D; ++kk) {
+             sum += s_ctx[n * D + kk] * W_out[d * D + kk];
+         }
+         float orig = nodes_orig[b * total + idx];
+         out[b * total + idx] = orig + sum;
+     }
+     ```
+     This reads W_out[d*D + kk] for fixed d, varying kk. Threads in a warp with same n and varying d read different rows of W_out (strided by D). As discussed, D=96 causes some serialization but it&#x27;s okay. With only 9KB shared memory, we can launch more blocks.
+
+     Actually, wait. In the dot product `sum += s_ctx[n * D + kk] * W_out[d * D + kk];`, for a fixed kk, threads with different d read `W_out[d*D + kk]`, which are spaced by D. Since D=96, bank conflict in L1. But again, small size.
+
+     So Kernel 2 smem_size = N*D*sizeof(float).
+
+     Let&#x27;s adjust the wrapper.
+
+     **Kernel 1 smem_size:** still `(N*D + D*(D+1)) * sizeof(float)`. For D=96, 46464 bytes. Under 48KB. If D were 128: N*D unknown. But for the benchmark, it&#x27;s fine.
+
+     Actually, could we reduce Kernel 1 shared memory too? The weight s_w is D*(D+1). We could read W from global each time and avoid transposing into shared. But then each thread would read D elements from global for each output element. With 2304 output elements * 96 reads = 221k reads. Cached. It might be okay. But 46KB is under 48KB, so it&#x27;s fine.
+
+     However, some GPUs have 48KB shared but one block using 46KB limits occupancy to 1 block per SM. Still okay for B=4.
+
+     Let&#x27;s check GPU specs first to see shared memory size.
+
+     I should call `get_gpu_specs()` to verify.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
 </body></html>
