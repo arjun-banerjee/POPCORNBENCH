@@ -264,7 +264,7 @@ def _build_homepage(worktree: Path, n_reports: int) -> None:
 <h3>Sweeps that feed the figures</h3>
 <table class="plan-table">
 <tr><th>Run</th><th>Coverage</th><th>Models</th></tr>
-<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems (excluding multi-GPU)</td><td>gpt-5.5, Kimi-K2.6</td></tr>
+<tr><td><code>full_l12</code></td><td>L1, L2, original + popcorn, all problems (excluding multi-GPU)</td><td>gpt-5.5-priority, Kimi-K2.6</td></tr>
 <tr><td><code>full_l34</code></td><td>L3, L4, original + popcorn, all problems</td><td>same two</td></tr>
 <tr><td><code>comm_l2_popcorn</code></td><td>L2 popcorn multi-GPU subset (problems 2, 11, 18, 27, 34, 38)</td><td>same two</td></tr>
 <tr><td><code>ae_focus_popcorn</code></td><td>L1-L4 popcorn, problems 1, 2, 10</td><td>AlphaEvolve (Gemini 3.0 mixture)</td></tr>
