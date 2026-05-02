@@ -73,25 +73,32 @@ def run_eval_server(
             ready_event.set()
         return
 
-    # Belt-and-suspenders: explicitly pin via torch.cuda.set_device too. If
-    # CUDA_VISIBLE_DEVICES took effect, this is a no-op (only one device is
-    # visible, and it's already cuda:0). If it did NOT take effect (e.g.
-    # parent's torch already initialized CUDA at script import time),
-    # set_device(gpu_id) still routes work to the right physical GPU.
+    # Belt-and-suspenders pinning. CUDA_VISIBLE_DEVICES filtering only takes
+    # effect if torch hasn't initialized CUDA yet — but with mp.spawn the
+    # parent's run_sweep.py is re-imported in the child (torch import + a
+    # few helpers), and depending on what those helpers touch, CUDA may
+    # already be initialized by the time we get here. If it is, our env
+    # var is ignored.
+    #
+    # We detect both cases via torch.cuda.device_count():
+    #   visible == 1  -> env-var pin worked, use cuda:0 (= physical gpu_id)
+    #   visible >  1  -> env-var pin failed, use cuda:gpu_id explicitly
+    #
+    # The crucial part is `server_device` — every ToolContext we build
+    # downstream uses this device for tensor allocation, so even when the
+    # env var fails, every kernel runs on the right physical GPU.
     visible = torch.cuda.device_count()
     if visible == 1:
-        # Pinning worked: this process sees only one GPU, which is gpu_id.
         torch.cuda.set_device(0)
+        server_device = torch.device("cuda:0")
         physical_gpu = gpu_id
     else:
-        # Pinning didn't take effect; fall back to set_device on the requested
-        # gpu_id. This also serves as a clear signal in the log.
         torch.cuda.set_device(gpu_id)
+        server_device = torch.device(f"cuda:{gpu_id}")
         physical_gpu = gpu_id
         logger.warning(
             "[eval_server gpu=%d] CUDA_VISIBLE_DEVICES=%s did not restrict "
-            "device count (saw %d devices); falling back to "
-            "torch.cuda.set_device(%d).",
+            "device count (saw %d devices); using explicit cuda:%d.",
             gpu_id,
             os.environ.get("CUDA_VISIBLE_DEVICES"),
             visible,
@@ -99,12 +106,12 @@ def run_eval_server(
         )
 
     try:
-        dev_name = torch.cuda.get_device_name(0)
+        dev_name = torch.cuda.get_device_name(server_device)
     except Exception:
         dev_name = "?"
     logger.info(
-        "[eval_server gpu=%d] pinned to physical GPU %d (%s), visible=%d",
-        gpu_id, physical_gpu, dev_name, visible,
+        "[eval_server gpu=%d] pinned to physical GPU %d (%s), visible=%d, server_device=%s",
+        gpu_id, physical_gpu, dev_name, visible, server_device,
     )
 
     # Imports that must follow torch (and therefore CUDA_VISIBLE_DEVICES).
@@ -151,7 +158,7 @@ def run_eval_server(
             continue
 
         try:
-            ctx = _build_server_context(args)
+            ctx = _build_server_context(args, server_device)
             if kind == "submit":
                 result = submit_tool.execute(ctx, kernel_code=args["kernel_code"])
             elif kind == "compile":
@@ -201,20 +208,22 @@ def run_eval_server(
     logger.info("[eval_server gpu=%d] exiting", gpu_id)
 
 
-def _build_server_context(args: dict[str, Any]) -> "Any":
+def _build_server_context(args: dict[str, Any], device) -> "Any":
     """Reconstruct a ToolContext from a serialized request payload.
 
-    Imported lazily so this module can be imported without torch present
-    (the publisher does this when scanning code for the prompts page).
+    `device` is the eval server's pinned physical GPU (a torch.device).
+    Every tool's tensor allocation runs on this device, so work goes to
+    the right physical GPU even when the CUDA_VISIBLE_DEVICES env-var
+    pin is silently ignored (which happens whenever the spawn child
+    inherits an already-CUDA-initialized torch state).
     """
-    import torch
     from kernelbench.agent.tools import ToolContext
 
     return ToolContext(
         ref_arch_src=args["ref_arch_src"],
         backend=args.get("backend", "cuda"),
         precision=args.get("precision", "fp32"),
-        device=torch.device("cuda:0"),  # CUDA_VISIBLE_DEVICES pin makes this correct
+        device=device,
         build_dir=args.get("build_dir"),
         num_correct_trials=int(args.get("num_correct_trials", 5)),
         num_perf_trials=int(args.get("num_perf_trials", 100)),
