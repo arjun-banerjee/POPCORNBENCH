@@ -76,12 +76,22 @@ def run_eval_server(
     # Imports that must follow torch (and therefore CUDA_VISIBLE_DEVICES).
     from kernelbench.agent.tools import (
         ToolContext,
+        CompileKernelTool,
+        RunCorrectnessTool,
         SubmitKernelTool,
         ProfileKernelTool,
+        GetGpuSpecsTool,
+        DisassembleKernelTool,
+        ErtRooflineTool,
     )
 
+    compile_tool = CompileKernelTool()
+    correctness_tool = RunCorrectnessTool()
     submit_tool = SubmitKernelTool()
     profile_tool = ProfileKernelTool()
+    specs_tool = GetGpuSpecsTool()
+    disassemble_tool = DisassembleKernelTool()
+    ert_tool = ErtRooflineTool()
 
     if ready_event is not None:
         ready_event.set()
@@ -110,6 +120,16 @@ def run_eval_server(
             ctx = _build_server_context(args)
             if kind == "submit":
                 result = submit_tool.execute(ctx, kernel_code=args["kernel_code"])
+            elif kind == "compile":
+                result = compile_tool.execute(ctx, kernel_code=args["kernel_code"])
+            elif kind == "correctness":
+                result = correctness_tool.execute(ctx, kernel_code=args["kernel_code"])
+            elif kind == "specs":
+                result = specs_tool.execute(ctx)
+            elif kind == "disassemble":
+                result = disassemble_tool.execute(ctx, kernel_code=args["kernel_code"])
+            elif kind == "ert":
+                result = ert_tool.execute(ctx)
             elif kind == "profile":
                 # Restore the agent's prior profile summary so deltas work
                 # correctly — see ProfileKernelTool.execute.

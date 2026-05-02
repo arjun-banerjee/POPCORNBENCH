@@ -32,9 +32,8 @@ class EvalRPCClient:
         self._response_q = response_q
         self._default_timeout_s = default_timeout_s
 
-    def submit_kernel(self, ctx, kernel_code: str):
-        args = {
-            "kernel_code": kernel_code,
+    def _ctx_args(self, ctx) -> dict:
+        return {
             "ref_arch_src": ctx.ref_arch_src,
             "backend": ctx.backend,
             "precision": ctx.precision,
@@ -44,17 +43,36 @@ class EvalRPCClient:
             "timing_method": ctx.timing_method,
             "verbose": ctx.verbose,
         }
+
+    def submit_kernel(self, ctx, kernel_code: str):
+        args = {"kernel_code": kernel_code, **self._ctx_args(ctx)}
         return self._call("submit", args)
+
+    def compile_kernel(self, ctx, kernel_code: str):
+        args = {"kernel_code": kernel_code, **self._ctx_args(ctx)}
+        return self._call("compile", args)
+
+    def run_correctness(self, ctx, kernel_code: str):
+        args = {"kernel_code": kernel_code, **self._ctx_args(ctx)}
+        return self._call("correctness", args)
+
+    def get_gpu_specs(self, ctx):
+        args = self._ctx_args(ctx)
+        return self._call("specs", args)
+
+    def disassemble_kernel(self, ctx, kernel_code: str):
+        args = {"kernel_code": kernel_code, **self._ctx_args(ctx)}
+        return self._call("disassemble", args)
+
+    def ert_roofline(self, ctx):
+        args = self._ctx_args(ctx)
+        return self._call("ert", args)
 
     def profile_kernel(self, ctx, kernel_code: str):
         args = {
             "kernel_code": kernel_code,
-            "ref_arch_src": ctx.ref_arch_src,
-            "backend": ctx.backend,
-            "precision": ctx.precision,
-            "build_dir": ctx.build_dir,
-            "verbose": ctx.verbose,
             "previous_summary": ctx._last_profile_summary,
+            **self._ctx_args(ctx),
         }
         result, new_summary = self._call("profile", args, return_aux=True)
         # Update the agent's local context so the NEXT profile gets a delta

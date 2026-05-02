@@ -262,6 +262,11 @@ class CompileKernelTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        # When the agent has an eval RPC client, route compile to the
+        # per-GPU server so the agent process never initializes CUDA.
+        if ctx.eval_client is not None:
+            return ctx.eval_client.compile_kernel(ctx, kernel_code)
+
         stdout_buf = StringIO()
         context: dict = {}
         build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
@@ -330,6 +335,11 @@ class RunCorrectnessTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        # Route through the per-GPU eval server when available so only one
+        # run_correctness allocates GPU memory at a time.
+        if ctx.eval_client is not None:
+            return ctx.eval_client.run_correctness(ctx, kernel_code)
+
         build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
         try:
             result: KernelExecResult | None = _run_with_oom_retry(
@@ -456,6 +466,9 @@ class ProfileKernelTool(Tool):
     _profile_cache: dict[str, "ToolResult"] = {}
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        if ctx.eval_client is not None:
+            return ctx.eval_client.profile_kernel(ctx, kernel_code)
+
         import hashlib
         import json
         import subprocess
@@ -615,6 +628,9 @@ class GetGpuSpecsTool(Tool):
     input_schema = {"type": "object", "properties": {}, "required": []}
 
     def execute(self, ctx: ToolContext, **_) -> ToolResult:
+        if ctx.eval_client is not None:
+            return ctx.eval_client.get_gpu_specs(ctx)
+
         from kernelbench.prompts.hardware.gpu_specs import GPU_SPEC_INFO
         from kernelbench.agent.nsight_parser import _DEVICE_NAME_TO_SPEC_KEY
 
@@ -893,6 +909,9 @@ class DisassembleKernelTool(Tool):
     input_schema = _KERNEL_CODE_SCHEMA
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
+        if ctx.eval_client is not None:
+            return ctx.eval_client.disassemble_kernel(ctx, kernel_code)
+
         from kernelbench.sass import (
             check_cuobjdump_available,
             check_nvdisasm_available,
@@ -974,6 +993,9 @@ class ErtRooflineTool(Tool):
     input_schema = {"type": "object", "properties": {}, "required": []}
 
     def execute(self, ctx: ToolContext, **_) -> ToolResult:
+        if ctx.eval_client is not None:
+            return ctx.eval_client.ert_roofline(ctx)
+
         from kernelbench.ert import run_ert_benchmarks
 
         try:
