@@ -259,6 +259,13 @@ def run_one(
     multi_gpu_mode = bool(par_cfg_outer.get("multi_gpu", False))
     if not multi_gpu_mode:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(work.device_id)
+    # Allow PyTorch's allocator to grow segments dynamically. With many
+    # agents sharing one GPU, the default expandable=False allocator
+    # fragments aggressively and OOMs at modest peak usage; expandable
+    # segments cut OOM rate substantially under contention.
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+    )
     device = torch.device("cuda:0")
     if run_cfg.get("gpu_arch"):
         arch = run_cfg["gpu_arch"]

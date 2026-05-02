@@ -53,6 +53,11 @@ def run_eval_server(
     # only sees this one GPU (it then becomes cuda:0 from inside the server).
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ.setdefault("KB_EVAL_SERVER_GPU", str(gpu_id))
+    # Match the agent allocator config so cross-process pressure drops
+    # cleanly via empty_cache instead of fragmenting.
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+    )
 
     try:
         import torch  # noqa: F401

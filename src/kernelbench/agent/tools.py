@@ -87,6 +87,48 @@ def _retry_eval_on_lock(eval_fn: Callable[[], Any]) -> Any:
         time.sleep(sleep_s)
     return None
 
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda oom" in msg or "cudaerrormemoryallocation" in msg
+
+
+def _run_with_oom_retry(fn: Callable[[], Any], *, max_retries: int = 2) -> Any:
+    """Run fn, catching CUDA OOM and retrying after empty_cache + gc.
+
+    Concurrent agents on the same GPU can transiently push memory pressure
+    over the line. Most OOMs clear if we drop cached blocks and yield for
+    a moment. After max_retries the underlying exception is re-raised so
+    the caller can record a real failure.
+    """
+    import gc
+    last_exc: BaseException | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except BaseException as exc:  # noqa: BLE001
+            if not _is_cuda_oom(exc):
+                raise
+            last_exc = exc
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            sleep_s = 0.5 * (2 ** attempt) + random.uniform(0, 0.5)
+            time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
+
 from kernelbench.eval import (
     KernelExecResult,
     eval_kernel_against_ref,
@@ -289,19 +331,35 @@ class RunCorrectnessTool(Tool):
 
     def execute(self, ctx: ToolContext, kernel_code: str, **_) -> ToolResult:
         build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
-        result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
-            original_model_src=ctx.ref_arch_src,
-            custom_model_src=kernel_code,
-            num_correct_trials=ctx.num_correct_trials,
-            num_perf_trials=0,
-            measure_performance=False,
-            verbose=ctx.verbose,
-            build_dir=build_dir,
-            device=ctx.device,
-            backend=ctx.backend,
-            precision=ctx.torch_precision,
-            check_for_excessive_speedup=False,
-        ))
+        try:
+            result: KernelExecResult | None = _run_with_oom_retry(
+                lambda: _retry_eval_on_lock(lambda: eval_kernel_against_ref(
+                    original_model_src=ctx.ref_arch_src,
+                    custom_model_src=kernel_code,
+                    num_correct_trials=ctx.num_correct_trials,
+                    num_perf_trials=0,
+                    measure_performance=False,
+                    verbose=ctx.verbose,
+                    build_dir=build_dir,
+                    device=ctx.device,
+                    backend=ctx.backend,
+                    precision=ctx.torch_precision,
+                    check_for_excessive_speedup=False,
+                ))
+            )
+        except BaseException as exc:
+            if _is_cuda_oom(exc):
+                return ToolResult(
+                    tool_name=self.name,
+                    success=False,
+                    output=(
+                        "run_correctness FAILED: CUDA out of memory after "
+                        "retries. The GPU is contested; reduce activation "
+                        "memory in your kernel or wait and try again."
+                    ),
+                    metadata={"error": "cuda_oom"},
+                )
+            raise
 
         if result is None:
             return ToolResult(
@@ -672,20 +730,36 @@ class SubmitKernelTool(Tool):
             return ctx.eval_client.submit_kernel(ctx, kernel_code)
 
         build_dir = _per_kernel_build_dir(ctx.build_dir, kernel_code)
-        result: KernelExecResult | None = _retry_eval_on_lock(lambda: eval_kernel_against_ref(
-            original_model_src=ctx.ref_arch_src,
-            custom_model_src=kernel_code,
-            num_correct_trials=ctx.num_correct_trials,
-            num_perf_trials=ctx.num_perf_trials,
-            measure_performance=True,
-            timing_method=ctx.timing_method,
-            verbose=ctx.verbose,
-            build_dir=build_dir,
-            device=ctx.device,
-            backend=ctx.backend,
-            precision=ctx.torch_precision,
-            check_for_excessive_speedup=True,
-        ))
+        try:
+            result: KernelExecResult | None = _run_with_oom_retry(
+                lambda: _retry_eval_on_lock(lambda: eval_kernel_against_ref(
+                    original_model_src=ctx.ref_arch_src,
+                    custom_model_src=kernel_code,
+                    num_correct_trials=ctx.num_correct_trials,
+                    num_perf_trials=ctx.num_perf_trials,
+                    measure_performance=True,
+                    timing_method=ctx.timing_method,
+                    verbose=ctx.verbose,
+                    build_dir=build_dir,
+                    device=ctx.device,
+                    backend=ctx.backend,
+                    precision=ctx.torch_precision,
+                    check_for_excessive_speedup=True,
+                ))
+            )
+        except BaseException as exc:
+            if _is_cuda_oom(exc):
+                return ToolResult(
+                    tool_name=self.name,
+                    success=False,
+                    output=(
+                        "submit_kernel FAILED: CUDA out of memory after "
+                        "retries. The GPU is contested or the kernel's "
+                        "working set exceeds device memory."
+                    ),
+                    metadata={"error": "cuda_oom"},
+                )
+            raise
 
         if result is None:
             return ToolResult(
