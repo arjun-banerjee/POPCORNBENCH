@@ -3,10 +3,10 @@
 A small helper used by SubmitKernelTool (and optionally ProfileKernelTool)
 to push a request onto a per-GPU Manager queue and block on the response.
 
-Each call gets its own Manager().Queue() for the response so we never have
-to demultiplex shared queues — the queue is garbage collected once the
-caller drops the reference. This costs ~10-50ms per call which is noise
-compared to multi-second evals.
+Each agent worker is given a single response Queue proxy, allocated by the
+main process before the worker is spawned. All of that worker's RPC calls
+land on that one queue and are demultiplexed by request_id. We can't pass
+the Manager itself (not picklable for security reasons), only its proxies.
 """
 
 from __future__ import annotations
@@ -22,13 +22,14 @@ logger = logging.getLogger(__name__)
 class EvalRPCClient:
     """Thin RPC client owned by an agent process.
 
-    Holds a reference to the per-GPU request queue (a Manager Queue proxy)
-    and the Manager itself (so we can ask it for fresh response queues).
+    Holds two Manager queue proxies: the shared per-GPU request queue and
+    a per-agent response queue. Both are allocated by the main process and
+    passed in via run_one's args.
     """
 
-    def __init__(self, request_q, manager, *, default_timeout_s: int = 3600):
+    def __init__(self, request_q, response_q, *, default_timeout_s: int = 3600):
         self._request_q = request_q
-        self._manager = manager
+        self._response_q = response_q
         self._default_timeout_s = default_timeout_s
 
     def submit_kernel(self, ctx, kernel_code: str):
@@ -64,10 +65,9 @@ class EvalRPCClient:
         from kernelbench.agent.tools import ToolResult
 
         rid = uuid.uuid4().hex
-        response_q = self._manager.Queue()
 
         try:
-            self._request_q.put((rid, kind, args, response_q))
+            self._request_q.put((rid, kind, args, self._response_q))
         except Exception as e:
             logger.error("[eval_client] enqueue failed for %s: %s", kind, e)
             return ToolResult(
@@ -77,29 +77,36 @@ class EvalRPCClient:
                 metadata={"error": str(e)},
             )
 
-        try:
-            payload = response_q.get(timeout=self._default_timeout_s)
-        except _queue.Empty:
-            err = f"{kind}_kernel FAILED: eval server did not respond within {self._default_timeout_s}s"
-            logger.warning("[eval_client] %s", err)
-            result = ToolResult(
-                tool_name=f"{kind}_kernel",
-                success=False,
-                output=err,
-                metadata={"error": "eval_rpc_timeout"},
-            )
-            if return_aux:
-                return result, None
-            return result
+        # Drain the response queue until we see OUR id. Defensive: under
+        # normal operation each agent has its own response queue and never
+        # sees a stranger's reply, but on a sweep restart a stale entry
+        # could linger. Skip those instead of treating them as ours.
+        deadline_s = self._default_timeout_s
+        while True:
+            try:
+                payload = self._response_q.get(timeout=deadline_s)
+            except _queue.Empty:
+                err = f"{kind}_kernel FAILED: eval server did not respond within {self._default_timeout_s}s"
+                logger.warning("[eval_client] %s", err)
+                result = ToolResult(
+                    tool_name=f"{kind}_kernel",
+                    success=False,
+                    output=err,
+                    metadata={"error": "eval_rpc_timeout"},
+                )
+                if return_aux:
+                    return result, None
+                return result
 
-        try:
-            rid_resp, status, data = payload
-        except Exception as e:
-            return _err_result(kind, f"malformed response: {e}", return_aux)
+            try:
+                rid_resp, status, data = payload
+            except Exception as e:
+                return _err_result(kind, f"malformed response: {e}", return_aux)
 
-        if rid_resp != rid:
-            # Should be unreachable since each call gets its own queue.
-            return _err_result(kind, "response/request id mismatch", return_aux)
+            if rid_resp == rid:
+                break
+            logger.warning("[eval_client] discarding stale response %s "
+                           "(waiting for %s)", rid_resp, rid)
 
         if status == "error":
             err_text = data.get("error", "unknown error")

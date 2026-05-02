@@ -236,14 +236,14 @@ def run_one(
     sem,
     perf_lock,
     eval_request_q=None,
-    eval_manager=None,
+    eval_response_q=None,
 ) -> Optional[dict]:
     """Run a single (model, level, problem) work item.
 
-    `eval_request_q` and `eval_manager`, if set, point at the per-GPU FIFO
-    eval queue and the Manager that owns it. submit_kernel calls then RPC
-    to the dedicated eval-server process for this GPU instead of running
-    locally — see eval_server.py.
+    When `eval_request_q` and `eval_response_q` are both set, submit_kernel
+    RPCs to the per-GPU FIFO eval server instead of running locally. The
+    response queue is allocated by the main process (Manager objects are
+    not picklable; only their proxies are) and is dedicated to this worker.
     """
     model_cfg = sweep["models"][work.model_idx]
     run_cfg = sweep["run"]
@@ -338,11 +338,11 @@ def run_one(
             # perf trials — they push and immediately go back to making
             # LLM calls on the next turn.
             eval_client = None
-            if eval_request_q is not None and eval_manager is not None:
+            if eval_request_q is not None and eval_response_q is not None:
                 from kernelbench.agent.eval_client import EvalRPCClient
                 eval_client = EvalRPCClient(
                     request_q=eval_request_q,
-                    manager=eval_manager,
+                    response_q=eval_response_q,
                     default_timeout_s=int(par_cfg.get("eval_rpc_timeout_s", 3600)),
                 )
 
@@ -736,6 +736,13 @@ def main():
     total_workers = num_gpus * par_cfg["agents_per_gpu"]
     t0 = time.time()
     completed = 0
+    # Pre-allocate one response queue per work item. Manager Queue proxies
+    # are picklable; the Manager itself is not, so we cannot pass `manager`
+    # into a worker for it to allocate queues on demand.
+    eval_response_qs: list = [
+        manager.Queue() if use_eval_queue else None for _ in work_items
+    ]
+
     try:
         with ProcessPoolExecutor(max_workers=total_workers) as executor:
             futs = {
@@ -747,9 +754,9 @@ def main():
                     per_model_sems[w.model_idx],
                     perf_locks[w.device_id],
                     eval_request_qs[w.device_id],
-                    manager if use_eval_queue else None,
+                    eval_response_qs[i],
                 ): w
-                for w in work_items
+                for i, w in enumerate(work_items)
             }
             with tqdm(total=len(futs), desc="sweep") as pbar:
                 for fut in as_completed(futs):
