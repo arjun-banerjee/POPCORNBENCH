@@ -55,7 +55,7 @@ import torch
 # When eval_kernel_against_ref returns None (e.g. torch JIT extension lock-file
 # contention from oversubscribed agents on the same GPU), retry transparently
 # instead of reporting failure to the model — it's our infra, not a bad kernel.
-_LOCK_RETRY_ATTEMPTS = 5
+_LOCK_RETRY_ATTEMPTS = 8
 _LOCK_RETRY_BASE_SLEEP_S = 0.5  # exponential backoff with jitter
 
 
@@ -75,14 +75,38 @@ def _per_kernel_build_dir(base_build_dir: str | None, kernel_code: str) -> str |
     return sub
 
 
-def _retry_eval_on_lock(eval_fn: Callable[[], Any]) -> Any:
-    """Call eval_fn(); if it returns None, retry with exponential backoff."""
+def _retry_eval_on_lock(
+    eval_fn: Callable[[], Any],
+    *,
+    build_dir: str | None = None,
+) -> Any:
+    """Call eval_fn(); if it returns None, retry with exponential backoff.
+
+    `eval_kernel_against_ref` returns None when it hits a lock-file or
+    "No such file or directory" error during cpp_extension build. These
+    can be transient (truly concurrent builds) or persistent (stale state
+    left by a crashed earlier process — most common after we respawn an
+    eval server on a CUDA-fatal kernel and the build dir is half-written).
+
+    To recover from the persistent case, we wipe the build dir between
+    retries so the next attempt starts from a clean slate. The dir is
+    re-created lazily by torch.utils.cpp_extension on the next build.
+    """
+    import shutil
     for attempt in range(_LOCK_RETRY_ATTEMPTS):
         result = eval_fn()
         if result is not None:
             return result
         if attempt == _LOCK_RETRY_ATTEMPTS - 1:
             return None
+        # Best-effort wipe of any stale build state. Safe to fail (e.g. if
+        # a sibling process is currently writing to the dir).
+        if build_dir and os.path.isdir(build_dir):
+            try:
+                shutil.rmtree(build_dir)
+                os.makedirs(build_dir, exist_ok=True)
+            except OSError:
+                pass
         sleep_s = _LOCK_RETRY_BASE_SLEEP_S * (2 ** attempt) + random.uniform(0, 0.25)
         time.sleep(sleep_s)
     return None
@@ -355,7 +379,7 @@ class RunCorrectnessTool(Tool):
                     backend=ctx.backend,
                     precision=ctx.torch_precision,
                     check_for_excessive_speedup=False,
-                ))
+                ), build_dir=build_dir)
             )
         except BaseException as exc:
             if _is_cuda_oom(exc):
@@ -761,7 +785,7 @@ class SubmitKernelTool(Tool):
                     backend=ctx.backend,
                     precision=ctx.torch_precision,
                     check_for_excessive_speedup=True,
-                ))
+                ), build_dir=build_dir)
             )
         except BaseException as exc:
             if _is_cuda_oom(exc):
