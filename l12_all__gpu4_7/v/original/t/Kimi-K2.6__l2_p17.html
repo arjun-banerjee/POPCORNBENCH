@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 17</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 21:28:27 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 17</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 21:33:46 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">17_Conv2d_InstanceNorm_Divide.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -231,5 +231,2366 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 615.6s · 144,465 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 615.6s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem:
+
+1. The reference model does: Conv2d -&gt; InstanceNorm2d -&gt; divide by constant
+2. Input: [128, 64, 128, 128], kernel=3, output: [128, 128, 126, 126]
+   - Conv2d with kernel_size=3, no padding, stride=1: output size = 128 - 3 + 1 = 126
+   - So output is [128, 128, 126, 126]
+   - InstanceNorm2d normalizes per instance per channel
+   - Then divide by 2.0
+
+The reference operations:
+- Conv2d: (128, 64, 128, 128) -&gt; (128, 128, 126, 126)
+  - FLOPs = 128 * 128 * 126 * 126 * 3 * 3 * 64 ≈ 1.77e9 FLOPs
+- InstanceNorm2d: For each (N, C), compute mean and var over H*W=(126*126=15876), then normalize
+  - This is memory bandwidth bound
+- Division by 2.0: simple element-wise
+
+We need to fuse these operations into a single kernel for better performance.
+
+Let me think about the approach:
+1. First, we need to perform the convolution. Since the input is large and channels are significant, we could:
+   - Use im2col + GEMM approach manually
+   - Or use separate tiling for direct convolution
+
+Actually, on H100 with tensor cores, a manually written direct convolution might not beat cuDNN&#x27;s highly optimized kernels for the conv part alone. But we can potentially fuse the instance norm and division with the convolution output, saving memory bandwidth.
+
+However, instance norm requires computing mean and variance per channel per sample. If we fuse everything, we&#x27;d need to:
+1. Compute conv output
+2. Compute mean and variance per (N, C)
+3. Normalize and divide
+
+Fusing all three requires either:
+- Computing conv output to shared memory, then computing mean/var within the same kernel (but conv output is [128, 128, 126, 126])
+- Or doing conv first, store to global memory, then a second fused kernel for norm+division
+
+Wait, let me reconsider. If cuDNN conv is very fast, the bottleneck might be the instance norm and division which are memory-bound. We could:
+1. Use PyTorch&#x27;s conv2d (or call it from our kernel via aten)
+2. Fuse instance_norm + divide into a single custom kernel
+
+Actually, looking at the problem, we&#x27;re replacing the entire forward. A good strategy:
+1. Keep conv as a regular PyTorch conv or custom conv
+2. Fuse instance norm and division
+
+But the problem asks for a custom CUDA kernel replacing the forward computation. We can call a custom CUDA kernel for the fusion part.
+
+Better approach: Let&#x27;s implement a single fused kernel that does:
+1. Conv2d (tiled, direct)
+2. InstanceNorm (compute mean/var per channel per batch)
+3. Division
+
+But conv2d on this size with H100 tensor cores... cuDNN is extremely optimized. Maybe we should use torch.nn.functional.conv2d for the conv part and just fuse instance norm + divide.
+
+Wait, but if we call conv2d then our custom kernel for norm+divide, that&#x27;s already 2 operations instead of 3. The speedup might be modest.
+
+Let me think about fusing conv+norm+divide in one kernel. For direct convolution:
+- Output: N=128, C_out=128, H=W=126
+- Input: C_in=64, H=W=128
+- Kernel: 3x3
+
+For each output element, we need 64 * 3 * 3 = 576 multiply-adds. The output has 128*128*126*126 = 256M elements. Total FLOPs = 256M * 576 = 147G FLOPs.
+
+At 67 TFLOPS FP32 or ~2000 TFLOPS FP16 tensor core, this is heavily compute bound. But doing direct convolution manually in CUDA without tensor cores would be much slower than cuDNN.
+
+However, we *could* write a direct convolution kernel that also computes running mean/variance and then normalizes. This is complex but possible.
+
+Actually, wait - for InstanceNorm, we normalize by computing mean and variance across the spatial dimensions for each channel in each sample. If we&#x27;re computing the conv output on the fly, we can accumulate the mean and variance simultaneously, but since normalization requires knowing the mean and variance of the entire channel before normalizing any element, we&#x27;d need a two-pass approach or a clever single-pass algorithm.
+
+For a two-pass approach in a fused kernel:
+1. First pass: compute all conv outputs and store them (or have them computed by one kernel)
+2. Compute mean and variance per (N, C) 
+3. Second pass: normalize and divide
+
+If we do it in one kernel with shared memory, we could have each block handle one (N, C) and compute all H*W=15876 output pixels for that channel. But each pixel requires a 3x3x64 conv - that&#x27;s 576 MADs. For 15876 pixels, it&#x27;s 15876 * 576 = 9.1M FLOPs per (N,C) block.
+
+With N=128, C=128, total blocks = 16384. Each block has 9.1M FLOPs. That&#x27;s plenty of work per block.
+
+So the plan is:
+- Each block handles one (N, C_out) pair
+- Block computes all H*W outputs for that channel via direct convolution
+- Uses shared memory or registers for the 3x3*C_in weights
+- Stores outputs in shared memory (or registers if they fit)
+- Computes mean and variance of the outputs
+- Normalizes and writes to global memory
+
+H*W = 126*126 = 15876 elements per (N,C). At fp32 that&#x27;s ~63KB per channel. Too big for shared memory per block (we have 227KB max, but we also need weights and input data).
+
+Alternative: each block handles a tile of the output, and we use a two-kernel approach or atomic accumulation for mean/var.
+
+Actually, a simpler good approach:
+1. Use cudnn/aten conv2d for convolution
+2. Write a custom kernel that fuses instance_norm + divide
+
+The conv is the most compute-intensive and cudnn is excellent. The instance_norm + divide are memory-bound. Fusing them saves one memory pass.
+
+But can we do better? What if we write a custom conv that beats cudnn on this specific small case? Probably not.
+
+Wait, let me check: output is [128, 128, 126, 126]. Input is [128, 64, 128, 128]. Kernel 3x3. This is actually a pretty standard conv. cudnn on H100 will use tensor cores and be very fast.
+
+Let me reconsider fusing conv+norm+divide. Even if conv is compute-bound, if we can do it all in registers/shared memory without writing the intermediate output to global memory, we save significant HBM bandwidth. The output is 128*128*126*126*4 bytes = ~1 GB! Reading and writing 1 GB at 3.35 TB/s takes ~0.3 ms. If the conv takes ~0.1 ms, saving this memory trip could be a big win.
+
+For fusing everything:
+- We partition work by (N, C_out, tile_H, tile_W)
+- Each block computes a tile of outputs
+- But to compute instance norm, we need mean/var per (N, C_out)
+- So we can&#x27;t independently normalize tiles without knowing the global mean/var
+
+Options:
+1. **Two-pass fused kernel**: First compute conv to a temporary buffer, then fused norm+divide. This saves nothing over separate ops if we need the temp buffer.
+2. **Three-kernel approach**: 
+   - Kernel 1: conv (cuDNN)
+   - Kernel 2: compute mean and variance per (N, C) 
+   - Kernel 3: normalize + divide
+
+The separate instance_norm in PyTorch likely does: compute mean, compute var, normalize. That&#x27;s 3-4 memory passes. We can fuse the norm+divide into 1 memory pass if we precompute mean and var.
+
+Actually, PyTorch&#x27;s InstanceNorm likely does it in a more fused way internally. Let me check what it actually does... it calls batch_norm with some setup. On CUDA, cudnn might handle some of it.
+
+Let me try a pragmatic approach:
+1. Call `F.conv2d` for the convolution
+2. Write a custom kernel that computes mean and variance and then normalizes + divides in one pass
+
+Wait, for numerical equivalence, we need to match PyTorch&#x27;s instance norm exactly. PyTorch&#x27;s InstanceNorm2d uses running stats by default? No, with default `track_running_stats=False`, it just normalizes each instance.
+
+The formula is: `(x - mean) / sqrt(var + eps)` where `mean` and `var` are computed per channel per instance.
+
+For numerical equivalence, we need the same eps (default 1e-5).
+
+A good custom kernel:
+- Grid: (N, C_out)
+- Each block handles one (N, C_out) and loops over all H*W elements
+- Thread block size: say 256 or 512 threads
+- Each thread computes a subset of the conv outputs, accumulates them for mean/var, does a block reduction, then normalizes and writes
+
+But wait, if each block handles one (N, C_out), and all threads in the block need to read the entire input for that sample and all weights for that output channel... 
+
+Actually, for computing the conv output, each output pixel at (h, w) for channel c_out requires input at (n, :, h:h+3, w:w+3) and weights for c_out.
+
+With N=128, C_out=128, total 16384 blocks. Each block has ~15876 output pixels. If we use 256 threads, each thread handles ~62 pixels. That&#x27;s very reasonable.
+
+For shared memory, we can cache:
+- Weights for the output channel: 64*3*3 = 576 floats = 2.3KB
+- Input for the sample: 64*128*128 = 1M floats = 4MB - too big!
+
+So we can&#x27;t cache the entire input. We need to load input on demand or cache tiles.
+
+Since each output pixel only needs a 3x3 neighborhood in input per channel, and channels=64, if we process output tiles, we can cache input tiles.
+
+Let me think about this more carefully. For 126x126 output:
+- If a block handles the full 126x126 output for one (N, C_out), then at any given time we might process a tile of outputs, say 16x16.
+- A 16x16 output tile corresponds to input region of 18x18 (for kernel=3).
+- For 64 channels, that&#x27;s 64*18*18 = 20736 floats = 81KB. That fits in shared memory!
+- Plus weights: 2.3KB
+- Plus output buffer for the tile: 16*16 = 256 floats = 1KB
+- Total: ~85KB, well within 227KB limit.
+
+But for instance norm, we need the mean and variance of the ENTIRE 126x126 output before normalizing. So we need to either:
+1. Store all 126x126 outputs somewhere (63KB in smem - too much for smem per block if we also need input cache, but actually... 63KB + 85KB = 148KB, still under 227KB!)
+   
+Wait, 126*126 = 15876 floats = 62KB. If we store the full output in shared memory, that&#x27;s fine.
+Weights = 64*3*3*4 = 2304 bytes = 2.25KB.
+Input tiles will be loaded dynamically, we don&#x27;t need to keep the whole input.
+
+Actually, for a block processing one (N, C_out):
+1. Load weights for C_out into shared memory: 2.25KB
+2. For each tile of output (e.g., 16x16):
+   a. Load input tile from global memory to shared memory
+   b. Compute output tile
+   c. Store output tile to shared memory (into a buffer that holds the full 126x126)
+3. After computing all outputs, compute mean and variance of the 126x126 outputs in shared memory
+4. Normalize all outputs and write to global memory
+
+Total shared memory: weights (2.25KB) + output buffer (62KB) + input tile (say 18x18x64x4 = ~82KB for 16x16 tile, but we can overlap). Actually, we can load input tile, compute, then overwrite with next tile. The output buffer is persistent.
+
+So we need: weights + output buffer + max input tile
+= 2.25KB + 62KB + 82KB ≈ 146KB. Fits in 227KB!
+
+With 256 threads per block:
+- Each block handles 1 (N, C_out)
+- Process 126x126 output in tiles
+- Use 256 threads. For a 16x16 tile, we only need 256 threads (exactly!).
+- Then for mean/var reduction and normalization, 256 threads work well too.
+
+Wait, but can we use even fewer threads? Maybe 128? Let&#x27;s see... 16x16 = 256, so 256 threads maps perfectly to one tile element per thread.
+
+Let me refine:
+- Threads per block: 256
+- Tile size: 16x16 = 256 pixels
+- Input tile for 16x16 output with kernel=3: 18x18 per channel
+- For 64 channels: 18*18*64 = 20736 elements
+- Each thread loads 20736/256 = 81 elements for the input tile. That&#x27;s a lot of loads.
+- Alternatively, we can process smaller tiles or fewer channels at a time.
+
+Actually, maybe we don&#x27;t need to load all 64 channels at once. We can accumulate channels incrementally.
+
+Better approach for input:
+- For a 16x16 output tile, we need 18x18 spatial region.
+- Process channels in groups, say 16 channels at a time.
+- Input for 18x18*16 = 5184 elements. With 256 threads, each loads ~20 elements. Better.
+- We do this 4 times (64/16=4), accumulating the conv result.
+
+Or we can do 32 channels at a time: 18*18*32 = 10368 elements, each thread loads ~40.
+
+Actually, a cleaner approach: use 1D thread indexing. Each thread is responsible for computing one output pixel. We process in tiles where the tile size equals block size.
+
+For an output tile of 16x16:
+- Each of the 256 threads computes one output pixel
+- To compute its output pixel, each thread needs to read 3x3*64 input values. That&#x27;s 576 loads per thread! Without caching, this is terrible.
+- With caching: we load the 18x18x64 input tile to shared memory cooperatively, then each thread reads 576 values from shared memory.
+
+Loading 20736 input elements cooperatively: 20736/256 = 81 loads per thread. Each load is a float. This is fine.
+
+But wait, with float4 loads, we can do 20736/4 = 5184 float4 loads. 5184/256 = ~20 loads per thread. Even better.
+
+Then each thread computes its 3x3*64 conv. 576 MADs per thread. At FP32 on H100, with 16384 blocks * 256 threads = ~4M threads, and 576 MADs each, total FLOPs ~4.7G (wait, earlier I calculated 147G FLOPs... let me recalculate).
+
+Actually: N=128, C_out=128, H=W=126. Output elements = 128*128*126*126 = 256,289,536.
+Each output element = 64 * 3 * 3 = 576 multiply-adds.
+Total FLOPs = 256,289,536 * 576 = 147,623,072,256 ≈ 147.6 GFLOPs.
+
+With 16384 blocks and 256 threads each, each thread handles ~15876/256 ≈ 62 output elements if we do all in one block. Wait no, I said each block handles one (N, C_out) which is 15876 elements. With 256 threads, each thread handles ~62 elements over multiple tiles.
+
+So total work per thread: 62 * 576 ≈ 35,700 MADs. That&#x27;s substantial.
+
+For the tile approach: each block processes one (N, C_out). It uses 256 threads and processes the 15876 outputs in tiles of 256 (16x16). Number of tiles = ceil(15876/256) = 63 tiles.
+
+Hmm, 126x126 = 15876 isn&#x27;t a multiple of 256. 15876/256 = 62.015625. So we&#x27;d process 62 full tiles and 1 partial tile.
+
+For each tile:
+1. Load 18x18x64 input tile to shared memory (cooperatively)
+2. Each thread computes its output using shared memory weights and input
+3. Write output to a shared memory buffer (the full 15876 outputs)
+
+Wait, if we have the full output buffer in shared memory, and weights in shared memory, plus input tile in shared memory:
+- Output buffer: 15876 * 4 = 63,504 bytes
+- Weights: 576 * 4 = 2,304 bytes  
+- Input tile: 18*18*64 * 4 = 82,944 bytes
+Total: 148,752 bytes = ~145KB. Under 227KB!
+
+Great! But actually, the input tile shared memory can be reused across tiles. We only need one input tile buffer at a time. So peak is still ~145KB. Good.
+
+But there&#x27;s a problem: for each tile, we need a different input region. The input is [64, 128, 128]. For output tile at position (th, tw), the input region is [:, th*16:th*16+18, tw*16:tw*16+18] (with bounds checking).
+
+Actually, 126/16 = 7.875. So we&#x27;d have 8x8 = 64 tiles if we tiled both dimensions with 16x16. But 8*16 = 128 &gt; 126. We can just have the threads check bounds.
+
+126x126 / (16x16) = 62.015625. With 8x8 tiling, we&#x27;d have 64 tiles but some are partially outside.
+
+Actually, let&#x27;s use 1D tile indexing over the 126*126=15876 outputs. TileId maps to (start_h, start_w). Each tile has up to 256 elements.
+
+For tile start_h, start_w, the output elements are at (start_h + i/16, start_w + i%16) for i in 0..255.
+The input region is from (start_h, start_w) to (start_h+18, start_w+18) in spatial dims.
+
+If we use 1D tile indexing, it&#x27;s easier to manage. We iterate tileId from 0 to num_tiles-1.
+
+For each tile:
+- Determine tile spatial bounds
+- Load input region to shared memory
+- Load weights to shared memory (only once per block, actually)
+- Compute outputs
+- Write to output shared memory buffer
+
+After all tiles:
+- Compute mean and variance of the 15876 outputs
+- Normalize and write to global memory
+
+Wait, there&#x27;s a subtlety: we need to write to the output shared memory buffer. If the buffer is 63KB and we have 256 threads, each thread writes to multiple positions. We can index as output_smem[h*126 + w] = value.
+
+For mean/var computation:
+- We have 15876 values in shared memory
+- 256 threads sum them up in a parallel reduction
+- Then compute mean = sum / 15876
+- For variance: compute sum of (x - mean)^2, again parallel reduction
+- Then each thread normalizes its assigned elements
+
+Wait, but if we assign output elements to threads evenly for normalization, they might not match the tile processing assignment. That&#x27;s fine.
+
+Let&#x27;s design the kernel:
+
+```cuda
+__global__ void fused_conv_instance_norm_divide(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,  // if needed, but reference has no bias in conv? Wait...
+    float* __restrict__ output,
+    int N, int C_in, int C_out, int H_in, int W_in, int H_out, int W_out,
+    float divide_by)
+```
+
+Wait, the reference `nn.Conv2d` has `bias=True` by default! Let me check... actually `nn.Conv2d` defaults to `bias=True`. We need to include bias.
+
+So weights are [C_out, C_in, 3, 3], bias is [C_out].
+
+Let me check the exact reference:
+```python
+self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+```
+`bias=True` is the default.
+
+So kernel needs conv weights + bias.
+
+Now, for numerical equivalence with instance norm:
+- `nn.InstanceNorm2d(out_channels)` with default `eps=1e-5`, `affine=False`
+- Formula: `(x - E[x]) / sqrt(Var[x] + eps)` where E and Var are computed per channel per instance over spatial dims.
+
+After that, divide by `self.divide_by`.
+
+So the fused formula per element is:
+`y = ((x - mean) / sqrt(var + eps)) / divide_by`
+
+We can precompute `inv_std = rsqrt(var + eps) / divide_by`, then `y = (x - mean) * inv_std`.
+
+Now, the kernel design:
+
+```cuda
+__global__ void fused_conv_instnorm_divide_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int N, int C_in, int C_out, int H, int W, float divide_by)
+```
+
+Where H=W=126 (output size). Input size is H+2=128, W+2=128.
+
+Wait, actually H_in = 128, W_in = 128. H_out = 128 - 3 + 1 = 126, W_out = 126.
+
+Grid: (N, C_out, 1) blocks
+Block: (256, 1, 1) threads
+
+Shared memory:
+- `float w_shared[576];`  // 64*3*3 weights for this output channel
+- `float out_shared[15876];` // all outputs for this (N, C_out)
+- `float in_shared[18*18*32];` // input tile: process 32 channels at a time
+
+Wait, 18*18*32 = 10368 floats = 40.5KB. 
+Weights = 576 * 4 = 2.25KB.
+Output = 15876 * 4 = 63KB.
+Total = 105.75KB. Good.
+
+If we process 64 channels in one go: 18*18*64 = 82KB + 63KB + 2KB = 147KB. Still under 227KB but closer. Let me use 64 channels at once to reduce the number of input loads and simplify.
+
+Actually, since C_in=64 is small, let&#x27;s process all 64 channels together.
+
+Total shared memory per block: 
+- weights: 576 floats
+- output buffer: 15876 floats
+- input tile: 18 * 18 * 64 = 20736 floats
+Total: 37188 floats = 148,752 bytes ≈ 145KB. Good.
+
+Block size: 256 threads
+Total blocks: N * C_out = 128 * 128 = 16384 blocks
+
+For each block (n, c_out):
+1. Load weights[c_out, :, :, :] to w_shared[576] (cooperatively, 576/256 ≈ 3 loads per thread)
+2. Load bias[c_out] to a register
+3. Initialize out_shared to 0 (cooperatively, 15876/256 ≈ 62 writes per thread)
+4. For each tile in the 126x126 output:
+   a. Determine tile spatial location (tile_h_start, tile_w_start)
+   b. Determine tile size (up to 16x16, but bounded by 126)
+   c. Load input[n, :, tile_h_start:tile_h_start+18, tile_w_start:tile_w_start+18] to in_shared
+      - Size: up to 18x18x64 elements. Some boundary elements may be out of bounds for edge tiles? Actually, input is 128x128, output is 126x126. For output at (0,0), input needed is (0:3, 0:3). For output at (125,125), input is (125:128, 125:128). Wait, 126 - 1 + 3 = 128, yes. For any valid output pixel, the 3x3 kernel is fully within the 128x128 input! Because output = 128 - 3 + 1 = 126.
+      - For a 16x16 tile starting at (th, tw), input needed is [th:th+18, tw:tw+18]. Max th = 126 - 16 = 110. So th+18 = 128 ✓. Max tw = 110, tw+18 = 128 ✓.
+      - But if we have a partial tile at the end... 126 is not divisible by 16. The last tile in each dim starts at 112 (7*16), so input needed is 112:130? That&#x27;s 19 elements? Wait, 112 + 18 = 130 &gt; 128.
+      - Actually, for a 16-wide tile: positions 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125. That&#x27;s 14 positions. So last tile starts at 112 and has width 14. Input needed: 112:112+16 = 128 (since kernel=3, for output pos h, input is h:h+3. For output range [112, 125], input range is [112, 128]. Width = 128-112 = 16.)
+      - Wait: for output at position h, input indices are h, h+1, h+2 (kernel size 3). So for output range [start_h, end_h), input range is [start_h, end_h+2). Width = end_h - start_h + 2.
+      - For start_h=112, end_h=126 (exclusive), width = 126 - 112 + 2 = 16. Yes.
+      - For start_h=0, end_h=16, width = 16 - 0 + 2 = 18.
+      - So input tile width is at most 18. Good.
+   
+   d. Each thread computes one or more output pixels in the tile
+      - Thread 0..255. We need to figure out which thread handles which output pixel.
+      - Since tiles are up to 16x16=256, we can map threadIdx.x to pixel within tile.
+      - For a full 16x16 tile: thread i handles (i/16, i%16).
+      - For partial tiles: needs bounds checking.
+      - Each thread loops over c_in=0..63, kh=0..2, kw=0..2:
+          out += in_shared[c_in*tile_h*tile_w + (local_h+kh)*tile_w + (local_w+kw)] * w_shared[c_in*9 + kh*3 + kw]
+      - Wait, in_shared layout matters. Let me use [c_in][h][w] or flat indexing.
+      
+   e. Add bias
+   f. Store to out_shared at global position (global_h * 126 + global_w)
+
+5. After all tiles, compute mean:
+   - Sum all 15876 values in out_shared
+   - mean = sum / 15876.0f
+   - Store mean in shared memory or broadcast to all threads
+
+6. Compute variance:
+   - Sum of (out_shared[i] - mean)^2
+   - var = sum_sq / 15876.0f
+
+7. inv_std = rsqrtf(var + 1e-5f) / divide_by
+
+8. Normalize and write to global memory:
+   - Each thread handles a subset of the 15876 outputs
+   - output[n*C_out*H*W + c_out*H*W + i] = (out_shared[i] - mean) * inv_std
+
+Wait, there&#x27;s an issue. In step 9, each thread needs to know which outputs to write. We can divide 15876 among 256 threads. 15876/256 = 62.015625. So threads 0..99 handle 63 elements and threads 100..255 handle 62 elements (or similar). Or just use 15876/256 = 62 full elements per thread, and the last few threads handle 1 extra. Specifically, 15876 = 256 * 62 + 4. So threads 0-3 handle 63 elements, threads 4-255 handle 62 elements.
+
+Actually, for simplicity, let me just have each thread handle `for (int i = tid; i &lt; 15876; i += 256)`. This is simple but some threads do more iterations. Wait, 15876/256 = 62 remainder 4. So threads 0-3 will do 63 iterations, threads 4-255 will do 62 iterations. That&#x27;s fine.
+
+But we also need each thread to handle the same indexing during tile computation. If tiles are 16x16 and some tiles are partial, threads in partial tiles might not do work.
+
+For tile processing:
+- total_tiles = (126 * 126 + 255) / 256 = 62 tiles (since 62*256 = 15872, plus 1 tile for the remaining 4? No, ceil(15876/256) = ceil(62.0156) = 63 tiles.
+- Wait, actually if we use 1D tiles of size 256 each, and 126*126 = 15876:
+    - Tile 0: elements 0..255
+    - Tile 1: elements 256..511
+    - ...
+    - Tile 61: elements 15616..15871 (256 elements)
+    - Tile 62: elements 15872..15875 (4 elements)
+    So yes, 63 tiles total.
+
+For each tile t from 0 to 62:
+    tile_start = t * 256
+    tile_size = min(256, 15876 - tile_start)
+    
+    // Load input for this tile
+    start_h = tile_start / 126
+    start_w = tile_start % 126
+    // But wait, 126*126 layout, tile_start maps to (start_h, start_w). 
+    // However, if tile_start = 125, that&#x27;s (0, 125), and tile_start+1 = 126 is (1, 0).
+    // So a 1D tile of 256 elements wraps around the row boundary!
+    // Element e maps to (e / 126, e % 126).
+    // A tile from e to e+255 might span multiple rows.
+    
+    // For the input region, we need the bounding box of all pixels in the tile.
+    // The min h is min(e/126 for e in tile), max h is max(e/126 for e in tile) + 2 (kernel).
+    // If the tile wraps around a row boundary, the bounding box in h might be large!
+    
+This is a problem. A 1D tile of 256 consecutive elements in row-major order spans 2-3 rows (since 126 &lt; 256). The bounding box in h could be up to 256/126 ≈ 3 rows. Plus kernel=3, so input height up to 5 rows. That&#x27;s still manageable but makes shared memory indexing more complex.
+
+Actually, let&#x27;s use 2D tiles: tile_h_size = 16, tile_w_size = 16. 
+Number of tiles in h: ceil(126/16) = 8
+Number of tiles in w: ceil(126/16) = 8
+Total tiles: 64
+
+For tile (th, tw):
+- Output region: h from th*16 to min((th+1)*16, 126), w from tw*16 to min((tw+1)*16, 126)
+- Input region: h from th*16 to min((th+1)*16, 126)+2, w from tw*16 to min((tw+1)*16, 126)+2
+- For th=7: h from 112 to 126, input h from 112 to 128 (16 values)
+- For tw=7: w from 112 to 126, input w from 112 to 128 (16 values)
+- Max tile is 16x16, but edge tiles are 14x14... wait, 7*16=112. Elements 112 to 125 inclusive = 14 elements. Yes.
+- Max input tile is 18x18 (for full tiles) or 16x16 (for edge tiles).
+
+Wait, for edge tile th=7: output h = [112, 125], which is 14 elements. Input h = [112, 128), which is 16 elements. So input tile is 16x16.
+For edge tile tw=7: output w = [112, 125], 14 elements. Input w = [112, 128), 16 elements.
+
+For full tile th=0, tw=0: output is 16x16, input is 18x18.
+So maximum input tile is 18x18 for full tiles, 16x16 for edge tiles.
+
+If we allocate in_shared as [18][18][64], that&#x27;s always enough.
+
+But wait, for edge tiles, the output region is smaller. We still have 256 threads. Some threads won&#x27;t have valid output pixels to compute. We just need bounds checking.
+
+For tile (th, tw):
+    h_start = th * 16
+    w_start = tw * 16
+    h_end = min(h_start + 16, 126)
+    w_end = min(w_start + 16, 126)
+    tile_h = h_end - h_start
+    tile_w = w_end - w_start
+    num_pixels = tile_h * tile_w
+    
+    // Each thread computes at most one pixel
+    // Thread i where i &lt; num_pixels: compute output at (h_start + i/tile_w, w_start + i%tile_w)
+    // Thread i where i &gt;= num_pixels: idle
+
+For loading input:
+    in_h_start = h_start
+    in_w_start = w_start
+    in_h_end = h_end + 2
+    in_w_end = w_end + 2
+    in_tile_h = in_h_end - in_h_start  // = tile_h + 2
+    in_tile_w = in_w_end - in_w_start  // = tile_w + 2
+    
+    // Load in_shared[c][y][x] = input[n, c, in_h_start + y, in_w_start + x]
+    // Total elements: 64 * in_tile_h * in_tile_w
+    // For full tile: 64 * 18 * 18 = 20736
+    // For edge tile: 64 * 16 * 16 = 16384
+
+    // Cooperatively load with 256 threads:
+    // total_elements = 64 * in_tile_h * in_tile_w
+    // Each thread loads total_elements / 256 elements (with some handling remainder)
+    
+    // Use float4 loads if possible for coalescing.
+
+For the conv computation in each thread:
+    local_h = i / tile_w
+    local_w = i % tile_w
+    sum = bias
+    for c = 0..63:
+        for kh = 0..2:
+            for kw = 0..2:
+                val = in_shared[c * in_tile_h * in_tile_w + (local_h + kh) * in_tile_w + (local_w + kw)]
+                w = w_shared[c * 9 + kh * 3 + kw]
+                sum += val * w
+    out_shared[h_start * 126 + w_start + local_h * 126 + local_w] = sum
+
+Then after all 64 tiles, compute mean and variance.
+
+For mean/var and final write:
+    // Sum all 15876 outputs
+    float local_sum = 0;
+    for (int i = tid; i &lt; 15876; i += 256) {
+        local_sum += out_shared[i];
+    }
+    // Block reduction
+    // mean = total_sum / 15876
+    
+    // Similar for variance
+    
+    // Final write:
+    for (int i = tid; i &lt; 15876; i += 256) {
+        int h = i / 126;
+        int w = i % 126;
+        float val = (out_shared[i] - mean) * inv_std;
+        output[n*C_out*126*126 + c_out*126*126 + h*126 + w] = val;
+    }
+
+Wait, this uses a lot of shared memory and has complex indexing. But it should work!
+
+One concern: In step 4, for each tile, we load the input tile to shared memory. The input is in NCHW format (PyTorch default). So input[n, c, h, w] is at [n*C*H*W + c*H*W + h*W + w].
+
+When loading cooperatively, we want coalesced access. If thread t loads elements at offset t, t+256, etc., we should stride through the input tile linearly and map to the input tensor.
+
+Let me think about memory layout:
+- Input tensor: NCHW, shape [N, C_in, H_in, W_in] = [128, 64, 128, 128]
+- For sample n, the base offset is n * C_in * H_in * W_in
+- For channel c, offset is c * H_in * W_in
+- For spatial (h, w), offset is h * W_in + w
+
+So input[n, c, in_h_start + y, in_w_start + x] is at:
+base = n * C_in * H_in * W_in + c * H_in * W_in + (in_h_start + y) * W_in + (in_w_start + x)
+
+When loading, we can have each thread load a contiguous chunk. If we process elements in row-major order of [c, y, x], thread 0 loads element 0, thread 1 loads element 1, etc. The addresses are not perfectly coalesced because consecutive threads access different (c, h, w), but they stride through the memory. Actually, consecutive threads access consecutive elements in the logical flat array [c, y, x], but the actual memory locations depend on the tensor layout.
+
+Wait, I defined the flat index over [c, y, x] as:
+idx = (c * in_tile_h + y) * in_tile_w + x
+
+The actual memory address is:
+&amp;input[base + c * H_in * W_in + y * W_in + x]
+
+If threads access with consecutive idx, they access with consecutive x for fixed c and y. For consecutive threads, if the total elements span multiple x values, they may jump across rows and channels. But within a warp, threads 0-31 might access different (c,y,x). The address difference between thread i and i+1 depends on the tensor layout.
+
+For NCHW: addresses for same c, same y, consecutive x are consecutive in memory. So if 32 threads in a warp access the same c, same y, and x = 0..31, that&#x27;s perfectly coalesced.
+
+But if they access c=0,y=0,x=0; c=0,y=0,x=1; etc., it&#x27;s coalesced if they access consecutive x. If in_tile_w &gt;= 32, then threads 0-31 accessing idx=0..31 will all have c=0, y=0, x=0..31 (if in_tile_h * in_tile_w &gt;= 32). Wait, idx = c * (in_tile_h * in_tile_w) + y * in_tile_w + x.
+
+For idx = 0..31:
+- If in_tile_h * in_tile_w &gt;= 32, and in_tile_w &gt;= 32, then all 32 threads have c=0, y=0, x=0..31. Perfect coalescing.
+- in_tile_w for full tile is 18. So with in_tile_w=18, idx 0..17: c=0,y=0,x=0..17. idx 18..35: c=0,y=1,x=0..17.
+- So threads 0..17 access c=0,y=0,x=0..17 (consecutive). Threads 18..31 access c=0,y=1,x=0..13 (not all in one warp but let&#x27;s see).
+
+For a warp of 32 threads, if they access idx=0..31:
+- Threads 0-17: (c=0, y=0, x=0..17), addresses consecutive.
+- Threads 18-31: (c=0, y=1, x=0..13), addresses consecutive starting from a new row.
+
+Address for thread i:
+addr_i = base_ptr + c_i * H_in * W_in + y_i * W_in + x_i
+
+For threads 0-17: c=0, y=0, x=i. addr_i = base_ptr + i. Consecutive.
+For threads 18-31: c=0, y=1, x=i-18. addr_i = base_ptr + W_in + (i-18).
+
+Thread 17: base_ptr + 17
+Thread 18: base_ptr + W_in + 0 = base_ptr + 128
+
+There&#x27;s a gap of 128-17 = 111 floats between thread 17 and thread 18. This will cause some non-coalescing, but the hardware can handle partial coalescing. Actually, each warp will make two memory transactions: one for x=0..17 and one for x=0..13 of next row. Since W_in=128, the second starts at +128.
+
+Actually, on H100 with 128B cache lines, a float is 4B, so 32 floats per cache line. Thread 0-17 needs 18 floats (1 cache line, partially used). Thread 18-31 needs 14 floats starting at offset 128 (4 cache lines away, 1 cache line partially used). So the warp might need 2 transactions (or more depending on alignment). But with 256 threads, we have 8 warps. It&#x27;s manageable.
+
+Alternatively, we can have each thread load a contiguous chunk of the flat [c,y,x] array. E.g., thread t loads elements starting at t * chunk_size. This might be better for L1 cache.
+
+Actually for maximum coalescing, we should have thread(t) load element at offset t in the linearized shared memory array. Then the mapping from shared memory offset to global memory might not be perfectly coalesced, but it&#x27;s usually good enough.
+
+One more optimization: we can use float4 loads. Since in_tile_w is at least 14 (edge) or 18 (full), and we need to load 64 channels, total elements is a multiple of 4 if the tile dimensions are even (they are). We can process 4 floats at a time. 20736/4 = 5184 float4s. 5184/256 = 20.25 float4s per thread.
+
+Let me try to keep it simple and just use float loads.
+
+Wait, actually we can reorder the input in shared memory. When loading, we can read in a coalesced manner from global memory, and store in shared memory in the [c][h][w] layout we need for conv.
+
+Another important consideration: for each block, all threads are in the same warp group. We need `__syncthreads()` after loading input tile, and after computing outputs before moving to next tile.
+
+Now, let me think if we can simplify this further. Instead of tiling and using shared memory for input, what if we just have each thread compute its assigned output pixels directly from global memory? With 256 threads per block and 15876 outputs per block, each thread computes ~62 outputs. For each output, it needs to read 3x3*64 input values from global memory. That&#x27;s 62 * 576 = 35,700 global memory reads per thread! The input values for nearby outputs overlap significantly (3x3 neighborhood). Without caching, this would be terrible.
+
+With our shared memory tiling approach, each input pixel is loaded exactly once per block (or a few times if we don&#x27;t cache perfectly). Actually, with 64 tiles processing the full 126x126 output, each input pixel is loaded multiple times because tiles overlap in input by 2 pixels. But it&#x27;s still much better than 35,700 loads per thread.
+
+Let me check: input is 128x128x64. Output is 126x126. With 8x8 tiles of 16x16 (mostly), each input pixel is covered by up to 4 tiles (since tiles overlap by 2 in each dimension). So each input pixel is loaded ~4 times across all tiles in the block. Total input loads = 4 * 128 * 128 * 64 = ~4M loads per block. Spread over 256 threads, that&#x27;s ~15,600 loads per thread. Still a lot, but at least from shared memory after the initial global load.
+
+Wait, actually the input LOADS FROM GLOBAL MEMORY per block: sum over tiles of (input tile size). For 64 - 4 = 60 full-ish tiles (wait, edge tiles are smaller). Let&#x27;s approximate: ~49 full 18x18 tiles + ~15 smaller tiles. Input global loads ≈ 49 * 18*18*64 + 15 * 16*16*64 ≈ 1M + 0.25M = 1.25M floats per block. Over 256 threads, ~4900 loads per thread from global memory. And from shared memory, ~15,600 loads per thread for computation. This is manageable.
+
+But actually, I realize edge tiles aren&#x27;t 16x16. Let me recalculate:
+- Tiles: th in 0..7, tw in 0..7
+- For th=0..6: h in [th*16, th*16+16), 16 outputs. Input h: [th*16, th*16+18), 18 inputs.
+- For th=7: h in [112, 126), 14 outputs. Input h: [112, 128), 16 inputs.
+- Same for tw.
+- So 7*7 = 49 tiles are 16x16 output (18x18 input)
+- 7*1 = 7 tiles are 16x14 output (18x16 input)
+- 1*7 = 7 tiles are 14x16 output (16x18 input)
+- 1*1 = 1 tile is 14x14 output (16x16 input)
+- Total: 64 tiles.
+
+Input loads = 49 * (18*18*64) + 7 * (18*16*64) + 7 * (16*18*64) + 1 * (16*16*64)
+= 49 * 20736 + 7 * 18432 + 7 * 18432 + 1 * 16384
+= 1,016,064 + 129,024 + 129,024 + 16,384
+= 1,290,496 floats per block.
+
+Global reads per block: ~1.29M floats. Per thread: ~1.29M/256 ≈ 5040 reads.
+And the conv computation does ~9.1M MADs per block.
+
+FP32 on H100: let&#x27;s say effective peak is ~50 TFLOPS for our kernel. 16384 blocks * 9.1M FLOPs = 149 GFLOPs. At 50 TFLOPS, this would take ~3 ms. But memory bandwidth: 16384 blocks * 1.29M floats * 4 bytes = ~84.5 GB of reads. At 3.35 TB/s, ~25 µs. And we also need to write 1GB of output. So memory is not the bottleneck; compute is.
+
+But wait, we also need to consider that cuDNN with tensor cores can do this much faster. H100 FP16 tensor cores can do ~2000 TFLOPS. Even if our kernel only gets 50 TFLOPS, it will be ~40x slower than tensor core matmul-based conv.
+
+So this direct conv approach is probably NOT competitive with cuDNN for the conv part.
+
+Let me rethink. The best strategy is:
+1. Use PyTorch&#x27;s conv2d (backed by cuDNN) for the convolution
+2. Write a custom kernel that fuses instance_norm + divide
+
+Actually, we can even consider: maybe PyTorch&#x27;s InstanceNorm2d is already fused with divide if we just do `x = self.instance_norm(x) / self.divide_by`? No, divide is a separate op.
+
+So our custom kernel would:
+- Input: conv output [N, C, H, W]
+- Compute mean per (N, C) across H, W
+- Compute var per (N, C) across H, W
+- Normalize: (x - mean) * rsqrt(var + eps) / divide_by
+- Output: [N, C, H, W]
+
+This is a single kernel that does a reduction followed by element-wise ops. But the reduction requires reading all elements, then normalizing requires reading them again. We can&#x27;t avoid two passes over the data unless we buffer in shared memory.
+
+With output size [128, 128, 126, 126] = 256M elements = 1GB. Two passes = read 1GB, write 1GB = 2GB of HBM traffic.
+At 3.35 TB/s, that&#x27;s ~0.6 ms.
+
+Actually, we can do better by using warp-shuffle reductions to compute mean/var on the fly without buffering. For instance, we can:
+1. Grid: Each block handles one (N, C), threads process all HW elements
+2. First, all threads read their subset of elements and participate in a parallel sum reduction to get mean
+3. Then all threads read their elements again, compute squared diff, participate in sum reduction to get var
+4. Then all threads read their elements a third time, normalize, and write
+
+This is 3 reads and 1 write. 4GB of traffic for 1GB of data. Better than separate ops but still traffic-heavy.
+
+Alternatively:
+1. Each thread reads a chunk and stores in shared memory (63KB per block, fits!)
+2. Compute mean from shared memory
+3. Compute var from shared memory
+4. Normalize and write from shared memory
+
+This is 1 read + 1 write = 2GB traffic! Much better.
+
+Wait, can we buffer 126*126 = 15876 floats = 63KB in shared memory? Yes!
+With 256 threads and 63KB shared memory, plus a small amount for reductions, total well under 227KB.
+
+So for the norm+divide kernel:
+- Grid: [N, C_out, 1] blocks, each block handles one (N, C)
+- Block: 256 threads
+- Shared memory: 63KB for the output buffer + a few floats for reductions
+- Algorithm:
+  1. Each thread loads a subset of H*W elements into shared memory
+  2. Compute mean (reduction)
+  3. Compute variance (reduction)
+  4. Normalize each element and write to global memory
+
+This is very efficient! Only 1 HBM read and 1 HBM write for the norm+divide.
+
+But wait, the conv itself writes 1GB to HBM, and then our norm kernel reads 1GB. So total traffic is 1GB (conv write) + 1GB (norm read) + 1GB (norm write) = 3GB. Plus conv reads its input. Total ~4-5GB.
+
+If PyTorch does conv + instance_norm + divide, what does it do?
+- Conv: reads input, writes output (~5GB traffic for input+weights+output)
+- InstanceNorm: reads output, computes mean, reads output again, computes var, reads output again, computes normalize, writes result. Or maybe it does it in fewer passes with custom kernels... but likely at least 2 passes.
+- Divide: reads, writes
+
+So PyTorch total might be ~7-8GB. Our approach saves 2-3GB.
+
+For a memory-bound sequence, this 30-40% traffic reduction could give 30-40% speedup. But conv is compute-bound, so the overall speedup might be smaller.
+
+Wait, I just realized... can we do a custom kernel for conv + norm + divide that uses cuDNN for conv and THEN our fused norm kernel? Yes! And that&#x27;s probably the best approach.
+
+Actually, let me look at what PyTorch&#x27;s InstanceNorm2d does on CUDA. It likely calls into cuDNN or its own batch norm implementation. For `track_running_stats=False, affine=False`, it computes mean and var on the fly.
+
+Let me check if there&#x27;s an even better approach: use cudnn for conv, then use a custom kernel that does the instance norm and divide. This should be significantly faster than the reference.
+
+But can we do more? What if we write our own conv using CUTLASS-like approach or call into a CUTLASS implicit gemm? No, PyTorch&#x27;s conv2d already uses the best available backend.
+
+What if we use fp16 tensor cores for conv? But we need fp32 output for correctness (tolerance 1e-4). We can do conv in fp32. Actually PyTorch does fp32 conv if input is fp32.
+
+Let me think about another approach: can we use the implicit GEMM formulation and call a custom SGEMM? Probably not worth it.
+
+I think the best approach is:
+1. In __init__, create a Conv2d layer but don&#x27;t create InstanceNorm. Or better, manually set up the conv weights and bias.
+2. In forward, call `F.conv2d(x, self.weight, self.bias)` to get conv output
+3. Pass conv output to a custom CUDA kernel that computes instance norm + divide in one pass using shared memory buffering.
+
+Wait, but we can&#x27;t call F.conv2d and then our custom kernel if we want to completely replace with a custom kernel? The problem says &quot;Replace the forward computation ... with a custom CUDA kernel.&quot; It doesn&#x27;t say everything has to be in one kernel. It says &quot;Your `ModelNew` class must ... Implement `forward()` with the same signature.&quot;
+
+So we can call a custom kernel for part of the computation. But actually, if most of the time is in conv, and our kernel only replaces the norm+divide, the speedup might be modest.
+
+What if we also do a custom conv kernel? Hmm, on H100, for this size, cuDNN conv2d should be very fast. Let me estimate.
+
+Input: [128, 64, 128, 128], output: [128, 128, 126, 126], kernel 3x3
+This is a standard conv. The output channels (128) is small. Actually, for tensor cores, MMA operations typically work on 16x16 or larger tiles. With only 128 output channels and batch 128, there might be sufficient parallelism.
+
+cuDNN likely uses implicit GEMM or direct convolution with tensor cores. For FP32, it might not use tensor cores (tensor cores are mainly for FP16/TF32). In FP32, cuDNN uses SIMT cores. At 67 TFLOPS FP32, 147 GFLOPs would take ~2.2 ms. But with good tiling, it might be faster.
+
+Actually wait, I should check if H100 FP32 is 67 TFLOPS for the whole GPU or per SM. It&#x27;s 67 TFLOPS for the whole GPU. For 147 GFLOPs at 67 TFLOPS, that&#x27;s 2.2 ms theoretical minimum. But realistic efficiency might be 30-50%, so ~4-6 ms.
+
+Wait, that seems high. Let me reconsider. For conv2d, PyTorch/cuDNN is usually much faster. Maybe 147 GFLOPs isn&#x27;t the right way to think about it. Actually 147 GFLOPs at 50% efficiency of 67 TFLOPS = 4.4 ms. But in practice, conv2d with these dimensions usually takes &lt;1 ms on H100. Why? Because the compute utilization is very high, and the actual FLOP count for implicit GEMM might be different, or cuDNN uses Winograd or other algorithms.
+
+Hmm, actually for 3x3 conv with C_in=64, C_out=128, the arithmetic intensity is high:
+- Input size: 128*64*128*128*4 = 512MB... wait that&#x27;s huge. Actually 128*64*128*128 = 134M elements * 4 bytes = 536MB.
+- Weights: 128*64*3*3*4 = 294,912 bytes = 288KB.
+- Output: 128*128*126*126*4 = 1GB.
+- Total memory moved: ~1.5GB.
+- FLOPs: 147 GFLOPs.
+- Arithmetic intensity: 147 GF / 1.5 GB = 98 FLOPs/byte.
+- At 3.35 TB/s, memory-bound time would be 0.45 ms if fully memory bound. But with 98 FLOPs/byte, this is COMPUTE BOUND.
+  - Ridge point for H100: 67 TFLOPS / 3.35 TB/s = 20 FLOPs/byte. Since 98 &gt; 20, compute bound.
+  - Compute time at 67 TFLOPS: 2.2 ms.
+  - At 80% utilization: ~2.7 ms.
+
+Actually, on an H100, 128x64x128x128 conv2d with 3x3 kernel might take around 1-2 ms in practice. Let me not worry too much about exact timing.
+
+For InstanceNorm on 1GB of data: memory bandwidth bound. At 3.35 TB/s, reading 1GB takes 0.3 ms, writing 1GB takes 0.3 ms. PyTorch&#x27;s instance norm likely does multiple passes, so 0.9-1.2 ms. Division adds another 0.6 ms.
+Total reference: conv (~1.5ms) + instance norm (~1ms) + divide (~0.6ms) = ~3.1ms.
+
+Our fused norm+divide kernel: reads 1GB, writes 1GB in one pass = 0.6 ms.
+Plus conv (1.5ms). Total = 2.1ms.
+Speedup: ~1.5x.
+
+That&#x27;s decent but maybe we can do better.
+
+What if we write a direct conv kernel that&#x27;s comparable to cuDNN but fused with norm+divide? The advantage is saving the 1GB write and 1GB read between conv and norm.
+
+Wait, but if conv is compute bound at ~1.5ms, and we add the norm compute on top within the same kernel (which is memory-light since we&#x27;re already touching the data), the total time might still be ~1.5-2ms.
+
+However, writing a conv kernel that matches cuDNN&#x27;s performance on H100 is extremely difficult. Maybe for this specific size though, a well-tiled direct conv can be decent.
+
+Actually, let me reconsider the fused approach but use a simpler conv strategy that&#x27;s good enough.
+
+If we use a block per (N, C_out) and compute the full 126x126 output:
+- 16384 blocks, each with 256 threads
+- Each block needs to read: input tile for 126x126 output = full input for sample n = 64*128*128 = 1M floats = 4MB. That&#x27;s too big for shared memory.
+- We need to stream tiles.
+
+But here&#x27;s another idea: what if we cache the weights (2.25KB) and read input directly from global memory? With good access patterns and L2 cache, the input is read mostly coherently.
+
+Output pixel (h, w) requires input at [0:64, h:h+3, w:w+3].
+If thread i computes output pixel i, and there are 256 threads, what do they access?
+- Thread 0: (h=0, w=0): input [0:64, 0:3, 0:3]
+- Thread 1: (h=0, w=1): input [0:64, 0:3, 1:4]
+- ...
+- Thread 15: (h=0, w=15): input [0:64, 0:3, 15:18]
+- Thread 16: (h=0, w=16): input [0:64, 0:3, 16:19]
+- Thread 31: (h=0, w=31): input [0:64, 0:3, 31:34]
+
+For a warp of 32 threads, they access 64 channels, 3 rows, and columns 0..34 (35 columns total, but with 3-wide windows, so actually columns 0 to 34 means 35 distinct columns... wait, thread i accesses w=i to w=i+2. So for i=0..31, columns accessed are 0..33. That&#x27;s 34 columns. In NCHW, consecutive columns are consecutive in memory.
+
+For a fixed channel c and fixed row r, threads in a warp access columns w=0..33. That&#x27;s 34 consecutive floats = 136 bytes. This spans about 5 cache lines (32B each). So the warp makes ~5 loads per channel-row. For 64 channels and 3 rows: 64*3*5 = 960 loads per warp. With 8 warps per block (256 threads), and shared L2 cache, this might actually work reasonably well due to spatial locality.
+
+Actually, consecutive warps in the same block might compute different h values (if we use 1D indexing over all 15876 outputs). Warp 0: outputs 0..255. Warp 1: outputs 256..511. These are spatially far apart, so their inputs are in different cache lines. This leads to poor L2 reuse.
+
+Better: have threads in a block compute a contiguous spatial region, like a 16x16 tile. Then all threads in the block access a roughly 18x18 region of input (per channel). This fits in L2 and even L1 cache.
+
+What if we don&#x27;t use shared memory for input, but rely on L1/L2 cache? If we structure the block to compute a tile, the hardware cache will naturally cache the input tile. But explicit shared memory is usually better because we can control the exact data layout and avoid cache thrashing.
+
+Let me commit to this design:
+1. Call `F.conv2d` using PyTorch&#x27;s optimized conv
+2. Write a custom kernel for fused instance_norm + divide, buffered in shared memory
+
+This is safe, guaranteed to be correct, and will give a decent speedup.
+
+Let me design the custom kernel for step 2:
+
+Kernel signature:
+```cuda
+__global__ void fused_instnorm_divide_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float eps, float divide_by)
+```
+
+Wait, input is the conv output. H*W = 126*126 = 15876.
+
+Shared memory per block:
+- `float buf[15876];`  // fits in 63KB
+
+Block size: 256 threads
+Grid: [N, C, 1]
+
+Algorithm:
+```cuda
+extern __shared__ float sdata[];  // dynamic shared memory
+
+int n = blockIdx.x;
+int c = blockIdx.y;
+int tid = threadIdx.x;
+
+int HW = H * W;
+float* buf = sdata;
+float* sh_reduction = sdata + HW;  // for reductions, size maybe 256
+
+// Base offset
+const float* in_ptr = input + n * C * HW + c * HW;
+float* out_ptr = output + n * C * HW + c * HW;
+
+// Step 1: Load into shared memory
+for (int i = tid; i &lt; HW; i += blockDim.x) {
+    buf[i] = in_ptr[i];
+}
+__syncthreads();
+
+// Step 2: Compute mean
+float local_sum = 0.0f;
+for (int i = tid; i &lt; HW; i += blockDim.x) {
+    local_sum += buf[i];
+}
+
+// Block reduction
+for (int offset = blockDim.x / 2; offset &gt; 0; offset /= 2) {
+    local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+}
+if (tid % 32 == 0) {
+    sh_reduction[tid / 32] = local_sum;
+}
+__syncthreads();
+if (tid &lt; 32) {
+    local_sum = (tid &lt; blockDim.x / 32) ? sh_reduction[tid] : 0.0f;
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if (tid == 0) {
+        sh_reduction[0] = local_sum / (float)HW;
+    }
+}
+__syncthreads();
+float mean = sh_reduction[0];
+
+// Step 3: Compute variance
+float local_sq = 0.0f;
+for (int i = tid; i &lt; HW; i += blockDim.x) {
+    float diff = buf[i] - mean;
+    local_sq += diff * diff;
+}
+
+// Block reduction for variance
+for (int offset = blockDim.x / 2; offset &gt; 0; offset /= 2) {
+    local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+}
+if (tid % 32 == 0) {
+    sh_reduction[tid / 32] = local_sq;
+}
+__syncthreads();
+if (tid &lt; 32) {
+    local_sq = (tid &lt; blockDim.x / 32) ? sh_reduction[tid] : 0.0f;
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+    if (tid == 0) {
+        sh_reduction[0] = local_sq / (float)HW;
+    }
+}
+__syncthreads();
+float var = sh_reduction[0];
+
+// Step 4: Normalize and write
+float inv_std = rsqrtf(var + eps) / divide_by;
+for (int i = tid; i &lt; HW; i += blockDim.x) {
+    out_ptr[i] = (buf[i] - mean) * inv_std;
+}
+```
+
+Wait, this is a nice clean kernel. Shared memory: 15876 floats for buf + maybe 8 floats for reduction (using first 8 elements of buf or a separate small array). Total ~64KB.
+
+Actually, I realize that using shared memory for the buffer requires each block to process one (N, C). We have N=128, C=128, so 16384 blocks. Each block handles 15876 elements. With 256 threads per block, we get good occupancy: 16384 blocks * 256 threads = ~4.2M threads. H100 has many SMs.
+
+Shared memory per block: 64KB. SM has 227KB, so we can fit ~3 blocks per SM. 132 SMs * 3 = ~400 blocks concurrently. Good.
+
+Wait, H100 has 132 SMs (I think... let me check... okay, for H100 80GB, it&#x27;s 132 or 144 SMs? Actually SXM5 has 132 SMs. Let me just go with what&#x27;s typical. With 64KB shared memory and 227KB limit, we fit 3 blocks. With 256 threads, that&#x27;s 768 threads per SM. H100 can handle 2048 threads per SM, so we&#x27;re limited by shared memory, not threads. 132 * 3 = 396 blocks in flight. Total 16384 blocks, so ~41 waves. That&#x27;s fine.
+
+But we can reduce shared memory usage if we want more blocks per SM. What if we don&#x27;t buffer the full 126*126 in shared memory? We could process in chunks and still only need 1 read and 1 write from HBM. But buffering the full thing in shared memory saves us from re-reading HBM for mean and variance. Without buffering, we&#x27;d read 3 times.
+
+Actually, we can compute mean and variance with only 1 HBM read if we use a two-pass approach where threads read once, compute local stats, reduce, then store back. But without buffering, we&#x27;d need to re-read for the normalization step. 
+
+Wait! Can we compute mean in one pass, then in a second pass read again, compute variance on the fly using the mean, and normalize? That would be 2 reads and 1 write. Our buffered approach is 1 read and 1 write. The buffered approach saves 1 read = 1GB of bandwidth. At 3.35TB/s, 1GB is 0.3ms. But the compute for variance and normalization is negligible. So buffering saves 0.3ms.
+
+But can we further optimize? What if we use Welford&#x27;s online algorithm to compute mean and variance in a single pass? Then we read once, compute mean and var, reduce, then normalize and write. But we&#x27;d still need to re-read or buffer for normalization! Because normalization happens after we know the mean and var.
+
+Unless we buffer in shared memory. With Welford&#x27;s algorithm, we could process the data in chunks that fit in shared memory. But our full output per channel is already 63KB, which fits. So we might as well just load it all.
+
+Actually, there&#x27;s another issue: PyTorch uses a specific implementation for variance. It uses unbiased variance or population variance? For InstanceNorm2d, the formula is:
+
+`out = (x - E[x]) / sqrt(Var[x] + eps)`
+
+where `Var[x] = mean((x - E[x])^2)`, i.e., population variance (divides by HW).
+
+Let me verify: PyTorch&#x27;s `instance_norm` calls `batch_norm` internally. For `batch_norm` without running stats, it computes population variance for normalization (divides by N*H*W for batch, or H*W for instance). Yes, it uses population variance.
+
+So our `var = local_sq / HW` is correct.
+
+Now, actually there&#x27;s an even more efficient approach. Since H*W = 15876, what if we use 512 threads? Then each thread handles ~31 elements. 512 threads per block * 64KB shared memory. More threads might mean faster reductions.
+
+But 256 threads is fine. Let&#x27;s try 512 to potentially reduce iteration count and improve reduction.
+
+With 512 threads:
+- Load: each thread handles ~31 elements
+- Reduction: 512 -&gt; 256 -&gt; 128 -&gt; 64 -&gt; 32 -&gt; 16 -&gt; 8 -&gt; 4 -&gt; 2 -&gt; 1. Warp shuffle for first 512-&gt;16 (within two warps), then shared memory for the rest.
+
+Actually, 512 threads per block might reduce occupancy: 512 threads * 3 blocks = 1536 threads per SM, still under 2048. Shared memory is still 64KB. So 3 blocks per SM. Same occupancy. But 512 threads means we need two warps for the final reduction, which is slightly more code but fine.
+
+Let&#x27;s stick with 256 as a safe starting point.
+
+Alternatively, what if we process TWO (N, C) pairs per block? That would double the work per block and halve the number of blocks. With 16384 blocks, halving to 8192 might still be plenty. And we&#x27;d double the thread utilization. But we&#x27;d also double shared memory to 128KB, which still fits! 128KB &lt; 227KB. Then we&#x27;d fit 1 block per SM (128KB * 1 = 128KB, fits 227KB but not 2 blocks). So concurrency drops. Probably not worth it.
+
+Wait, can we do 4 channels per block? 4 * 63KB = 252KB. That exceeds 227KB. 3 channels = 189KB. That fits! But then we have only 16384/3 ≈ 5461 blocks. Is that enough for H100? 5461 blocks / 132 SMs ≈ 41 blocks per SM, but only 1 block at a time due to shared memory. So 41 waves. That&#x27;s fine but maybe worse than 3 blocks per SM * 16384/3 waves... wait, with 1 channel per block and 64KB smem, we get 3 blocks per SM concurrently. Total waves: 16384 / (132 * 3) ≈ 41 waves. Same number!
+
+With 3 channels per block: 189KB smem, 1 block per SM. Waves: 16384/3 / 132 ≈ 41 waves. Same. But 3 channels per block means better thread utilization? Actually, threads are the same (256). The amount of work per block triples, so the kernel runtime per block triples. Total time might be similar. But the overheads of block launch are amortized. Hmm, probably not a big difference.
+
+Let me just go with 1 channel per block for simplicity.
+
+One important thing: when we load the 15876 elements into shared memory, we need coalesced access from global memory. With threads accessing consecutive elements (thread i loads offset i, i+256, i+512, ...), the accesses within a warp are consecutive if the elements are stored consecutively in global memory, which they are for NCHW format within a channel. So yes, coalesced.
+
+Now let me think about whether we can actually write a custom conv kernel that is competitive. Let me reconsider.
+
+For direct conv with the tiling approach I described earlier:
+- We have 16384 blocks
+- Each block handles 1 (N, C_out)
+- Block size 256
+- 64 tiles of 16x16 (mostly)
+- Total FLOPs per block: 9.1M
+- Shared memory: 145KB
+- This fits in 227KB, so 1 block per SM concurrently
+- With 132 SMs, 16384 / 132 ≈ 124 waves
+- Each wave takes some time...
+
+At 50 TFLOPS FP32 (75% of peak), each block&#x27;s 9.1M FLOPs takes 9.1M / 50B = 0.18 ms per block? That can&#x27;t be right for 9.1M FLOPs... 9.1M / 50B = 0.000182 seconds = 0.182 ms. Wait, 50 TFLOPS = 50,000 GFLOPS. 9.1M / 50T = 0.000000182 seconds = 0.182 µs per block? No...
+
+9.1 million FLOPs = 9.1e6 FLOPs.
+50 TFLOPS = 50e12 FLOPs/second.
+Time = 9.1e6 / 50e12 = 1.82e-7 seconds = 0.182 µs per block.
+
+Wait, that seems too fast. 0.182 microseconds per block? At that rate, 16384 blocks would take ~3ms total. But that&#x27;s at 100% FLOP utilization, which is hard to achieve.
+
+Actually, the issue is memory bandwidth. Even though compute is high, we&#x27;re loading a lot of data.
+
+Let me recalculate memory traffic for the direct conv approach:
+- Per block, input loads: ~1.29M floats = 5.2MB
+- Weight loads: 576 floats = 2.3KB (loaded once, negligible)
+- Output write: 63KB
+- Total memory: ~5.3MB per block
+- At 3.35 TB/s = 3.35e12 B/s
+- Time at peak bandwidth: 5.3e6 / 3.35e12 = 1.58e-6 s = 1.58 µs per block
+- For 16384 sequential blocks at full bandwidth: but they run in parallel!
+- With 132 SMs * 1 block each (due to 145KB smem): 132 blocks in parallel.
+- Total memory per wave: 132 * 5.3MB = 700MB
+- At 3.35 TB/s: 700MB / 3.35TB/s = 0.21 ms per wave
+- 124 waves: 124 * 0.21ms = 26ms. That&#x27;s terrible!
+
+Wait, but many of the input loads should be cached in L2 since different output channels for the same sample read the same input. With 128 output channels for the same sample, all blocks for that sample share the same input. But they&#x27;re executing at different times (different waves). L2 cache on H100 is 50MB. Input per sample is 64*128*128*4 = 4MB. So a sample&#x27;s input fits in L2! In fact, 50MB / 4MB ≈ 12 samples fit in L2.
+
+If all 128 output channels for the same sample are executed in consecutive waves, the input might still be in L2 for later waves. But 128 blocks for one sample across 132 SMs... they might execute in one wave (since 128 &lt; 132), and then the next sample starts. So L2 hit rate for input could be good.
+
+For weights: 128 output channels * 576 floats * 4 bytes = 288KB. Also fits in L2 and even L1.
+
+So actual memory bandwidth might be much lower than 5.3MB per block due to caching.
+
+Hmm, this is getting complicated. Let me just try both approaches:
+1. Fused norm+divide only (call conv via F.conv2d)
+2. Full fused conv+norm+divide
+
+I&#x27;ll start with approach 1 since it&#x27;s simpler and has guaranteed correctness.
+
+Wait, actually, I realized that approach 1 might not give enough speedup if the conv dominates. Let me think about approach 2 more carefully.
+
+For approach 2, can we parallelize over N dimension more efficiently? Each sample&#x27;s conv is independent. We have 128 samples * 128 channels = 16384 parallel tasks.
+
+What if we use a block for each N, and the block computes all C_out channels? Then the block can cache the input sample in shared memory, but 4MB is too big. Or use L2 cache by having threads in a block process multiple output channels sequentially? 
+
+Actually, what if we process one sample per block, with 256 threads, and compute 128 output channels? Each thread handles one spatial location across all channels? Or each thread handles a pixel and loops over channels?
+
+If a block processes one sample and all 128 output channels:
+- Total output: 128*126*126 = 2M floats = 8MB. Too big for shared memory.
+- Threads: 256. Each thread computes ~2M/256 = 7800 output elements.
+- But we don&#x27;t need to buffer outputs in shared memory for norm. We can accumulate outputs in registers, then write to a temporary buffer? No, we need all outputs to compute mean and var per channel.
+
+Unless we process channels sequentially: for each output channel, compute all spatial outputs, compute mean and var, normalize, write. Then move to next channel. This is exactly the per-(N,C) block approach I described!
+
+So approach 2 with per-(N,C) blocks is natural for fusing conv+norm.
+
+Let me code this up and see if it compiles and is correct. If it&#x27;s too slow, I can fall back to approach 1.
+
+Actually, let me reconsider the shared memory for the full fused kernel. We need:
+- output buffer: 126*126*4 = 63,504 bytes
+- weights: 576*4 = 2,304 bytes
+- input tile buffer: for a 16x16 tile, input is 18x18x64 = 20,736 floats = 82,944 bytes
+Total: 148,752 bytes = ~145KB.
+
+With 145KB shared memory per block and 227KB limit, we fit 1 block per SM. With 132 SMs, we have ~132 blocks concurrent. 16384 total blocks / 132 ≈ 124 waves.
+
+Each block does:
+- Compute 128*126*126 output? No, each block does 1 channel for 1 sample = 15876 outputs.
+- 9.1M MADs per block.
+
+At, say, 10 TFLOPS effective per SM (out of ~0.5 TFLOPS per SM peak), wait... H100 total is 67 TFLOPS with ~132 SMs, so ~0.5 TFLOPS per SM. If we have 1 block per SM and it achieves 50% of peak, that&#x27;s 0.25 TFLOPS per SM. 132 SMs * 0.25 = 33 TFLOPS total.
+
+Wait, that&#x27;s not how it works. Each SM has its own execution units. If each SM runs 1 block with 256 threads, and the block is compute-bound with good instruction mixing, it might achieve high utilization of the SM.
+
+Actually, 256 threads per SM out of maximum ~2048 is only 1/8th occupancy. That&#x27;s terrible! With only 256 active threads per SM, we can&#x27;t hide latency. The warp scheduler needs many warps to switch between when one is stalled on memory. 256 threads = 8 warps. With 8 warps, there&#x27;s limited latency hiding.
+
+This is a critical insight. Our block size of 256 means only 8 warps per SM (since only 1 block fits). On H100, you want many warps per SM for good latency hiding. Minimum might be 16-32 warps for compute-bound kernels.
+
+Can we increase block size? 512 threads = 16 warps. But 512 threads with 145KB smem still means 1 block per SM (since smem is the limit, not threads). So 16 warps per SM. Better but still not great.
+
+What if we use 1024 threads? 32 warps per SM. But 1024 threads processing one (N,C) means each thread handles 15876/1024 ≈ 15.5 outputs. For tile processing, we&#x27;d process 16x16=256 pixel tiles. With 1024 threads, each tile has 4 threads per pixel? Or we use larger tiles... Actually 1024 threads could process a 32x32 tile, but input would be 34x34x64 = 295,936 floats = 1.16MB. Too big for shared memory.
+
+Or we process multiple tiles concurrently? That gets complex.
+
+Alternatively, what if we DON&#x27;T use shared memory for the input tile, but rely on L1/L2 cache? Then we can have many more blocks per SM.
+
+If we remove the input shared memory buffer (82KB), we just have output buffer (63KB) + weights (2KB) = 65KB. Then we fit 3 blocks per SM (65*3 = 195KB &lt; 227KB). With 256 threads per block, that&#x27;s 768 threads = 24 warps per SM. Better! But we lose the benefit of explicit input caching, and our memory loads from global memory might be less efficient.
+
+Wait, 768 threads still isn&#x27;t great. 768/32 = 24 warps. H100 can handle up to 64 warps per SM. So we&#x27;re at 37.5% warp occupancy. But shared memory is the bottleneck.
+
+Can we reduce output buffer size? What if we process output in chunks? For example, process 16x16 tiles of output, normalize each tile separately? But we CAN&#x27;T - instance norm requires global mean and var per channel. So we need all outputs before normalizing.
+
+Unless we compute partial sums and variances incrementally. We can use Welford&#x27;s algorithm to compute mean and variance in one pass, processing the output in tiles. We never need to store the full output! We just need the final mean and var, then a second pass to normalize.
+
+But for normalization, we DO need to recompute or re-read the outputs. We can recompute the conv outputs in the second pass, or re-read them from global memory.
+
+Wait! Idea: two-pass fused kernel WITHOUT full output buffering.
+- Pass 1: Compute all conv outputs for (N, C_out), accumulate mean and variance using Welford&#x27;s algorithm or simple sum/sum_sq.
+- Pass 2: Recompute all conv outputs, normalize using mean and var, write to global memory.
+
+No shared memory needed for output buffering! Just register storage for conv computation.
+
+But we compute conv TWICE. Double the FLOPs! 147 GFLOPs * 2 = 294 GFLOPs. At 67 TFLOPS, that&#x27;s ~4.4ms minimum. Not good.
+
+What if after Pass 1, we write outputs to global memory, then in Pass 2 we read them back? That&#x27;s 1GB write + 1GB read. At 3.35TB/s, 0.6ms. And we only compute conv once (1.5ms). Total: 2.1ms. Plus the norm compute.
+
+Wait, this is exactly the same as approach 1 (call PyTorch conv, then custom norm kernel)! Approach 1 writes conv output to global memory (1.5ms compute + 1GB write), then reads it back for norm (1GB read + normalize + 1GB write).
+
+With our direct conv two-pass approach, it&#x27;s the same HBM traffic for the conv output but we avoid the overhead of separate kernel launches. But PyTorch&#x27;s conv2d is probably faster than our direct conv. So approach 1 is likely better.
+
+Let me try approach 1 and benchmark it. If the speedup is insufficient, I&#x27;ll consider more aggressive fusion.
+
+Actually, wait. For approach 1, if we call `F.conv2d`, PyTorch returns a Tensor. Then our custom kernel reads it. The issue is that `F.conv2d` might use quite a bit of workspace memory, but that doesn&#x27;t affect our kernel&#x27;s speed.
+
+What if we try a custom kernel that does everything but uses a simple direct conv with NO shared memory for input - just load from global memory with good coalescing and rely on L1 cache? Then we can fit many blocks per SM. 
+
+Actually, with no input shared memory and no output shared memory, shared memory usage is just weights (2KB) + reduction buffer (1KB) = 3KB. Then we can fit 32 or more blocks per SM, limited by threads (256 threads * 32 = 8192 threads, but max is 2048, so 8 blocks). 8 blocks * 256 = 2048 threads per SM! That&#x27;s maximum thread occupancy. 
+
+But we DO need to buffer outputs for mean/var computation, or use a two-pass approach. If we use shared memory for output (63KB), we&#x27;re limited to 3 blocks per SM (768 threads). That&#x27;s still decent.
+
+What if we buffer outputs in registers? Each thread could handle ~62 outputs. 62 floats = 248 bytes in registers. For 256 threads, total output storage = 248 bytes * 256 = 63KB. But these are per-thread registers, not shared memory. Each thread uses ~62 registers for output buffer. Plus ~10 registers for indexing, accumulators, etc. Maybe 80 registers total. 80 * 256 = 20,480 registers per block. Limit is 64K registers per SM, and max 255 per thread. 80 &lt; 255, fine. 20,480 &lt; 64K, fine. But we can only fit 3 blocks per SM due to registers (20,480 * 3 = 61,440 &lt; 64K). 4 blocks would be 81,920 &gt; 64K. So 3 blocks per SM. Same as shared memory!
+
+But using registers for the output buffer might be faster than shared memory since we avoid shared memory bank conflicts and syncthreads overhead. However, the challenge is that registers are per-thread, and for reductions (mean, variance), we&#x27;d need to shuffle data between threads. With shared memory, all threads can access all outputs easily. With registers, each thread can only access its own 62 outputs. For reduction, we can sum within thread, then use warp shuffles and shared memory for the final reduction. This actually works well!
+
+So here&#x27;s the register-buffered approach for fused conv+norm:
+- Block: 256 threads
+- Each thread computes a subset of the 15876 output pixels (e.g., thread t computes pixels t, t+256, t+512, ... up to 15876)
+- For each assigned pixel, the thread computes the conv directly from global memory, storing in registers.
+- After computing all outputs, each thread computes local_sum and local_sum_sq.
+- Block reduction to get global mean and var.
+- Each thread then normalizes its assigned pixels and writes to global memory.
+
+This requires NO shared memory for buffering outputs! Just registers. We need shared memory only for the reduction (a few floats). So shared memory usage is tiny (~1KB). Register usage is maybe 80 per thread = ~20K per block. We can fit 3 blocks per SM (61K registers). Or if we reduce register usage below 64 per thread, we can fit more.
+
+With 256 threads * 3 blocks = 768 threads per SM, that&#x27;s 24 warps. Decent.
+
+But wait, each thread needs to compute ~62 output pixels. For each pixel, it reads 3*3*64=576 input values from global memory. That&#x27;s 62 * 576 = 35,700 reads per thread! And these are scattered all over the input. The cache lines won&#x27;t help much because adjacent threads access different input regions (threads differ by 1 in output pixel, so their 3x3 input windows are offset by 1, meaning they share some cache lines horizontally but not much vertically).
+
+Let me think about the memory access pattern. Thread t computes outputs at indices t, t+256, t+512, etc. These are spread out across the 126x126 grid. Are they close together?
+- Index i = h*126 + w
+- t=0: 0, 256, 512, ...
+- 256 = 2*126 + 4. So pixel 0 is (0,0), pixel 256 is (2,4). Pixel 512 is (4,8).
+- These are somewhat spaced out. Adjacent threads (t and t+1) compute pixels that are adjacent horizontally (when they fit in the same row) or nearby.
+- Actually, if t=0 computes (0,0), t=1 computes (0,1), t=2 computes (0,2), etc.
+- For a warp of 32 threads (t=0..31), they compute outputs (0,0) through (0,31). These are horizontally adjacent!
+- Their input windows are: thread i accesses input columns i..i+2. So warp accesses columns 0..33. Consecutive!
+- For next group (t=0 computes 0, 256, 512, ...), thread 0 also computes output 256 = (2,4). The input window is rows 2..4, cols 4..6. Thread 1 computes output 257 = (2,5), input window rows 2..4, cols 5..7.
+- For the SECOND iteration (processing offset 256), the warp accesses rows 2..4, cols 4..35. Still mostly consecutive per row for a warp.
+
+Actually, if we process all 62 pixels per thread, the access pattern over 62 iterations isn&#x27;t too bad. For iteration k, thread t accesses output index t + k*256. Within a warp, the outputs are at indices 256k, 256k+1, ..., 256k+31. These map to:
+h = (256k + i) / 126
+w = (256k + i) % 126
+
+For consecutive i in a warp, these might span row boundaries, but mostly they&#x27;re contiguous in memory (since NCHW stores rows consecutively). If 256k + 0 to 256k + 31 are all in the same row, great. But if they cross a row boundary, there&#x27;s a jump.
+
+256 / 126 = 2 remainder 4. So 256k = 126*(2k) + 4k.
+For k=0: indices 0..31: row 0, cols 0..31. All same row!
+For k=1: indices 256..287: 256 = row 2, col 4. 287 = row 2, col 35. All same row!
+For k=2: indices 512..543: 512 = row 4, col 8. All same row!
+For k=3: indices 768..799: 768 = row 6, col 12. All same row!
+For k=61: indices 15616..15647: 15616 / 126 = 123 remainder 118. So row 123, cols 118..149. But W=126, so col 149 wraps to row 124, col 23. So indices 123*126+118=15616 to 123*126+125=15623 are row 123, cols 118..125 (8 elements). Then 15624 is row 124, col 0. So a warp at k=61 would cross a row boundary. But this only affects the last few iterations.
+
+For each output pixel, the thread reads 64*3*3=576 input values. If the warp accesses 32 consecutive output pixels in the same row, then for a given channel and kernel row, they access 32+2=34 consecutive input columns. This is good for coalescing!
+
+For example, output row h, columns w to w+31. Input for kernel row kh at input row h+kh, columns w to w+33. A warp reading these has threads 0..31 accessing columns w..w+33 (with offsets for kh and kw). For fixed c, kh, kw: thread i accesses input at col w+i+kw. These are perfectly consecutive! Memory is coalesced.
+
+So the memory access pattern is actually pretty good! For each of the 64 channels and 9 kernel positions, the warp makes one coalesced read of ~34 floats (a bit more than one cache line). For 64*9 = 576 such reads per output pixel group, the warp makes 576 memory transactions (but many are coalesced into fewer actual loads).
+
+Actually, for 32 threads in a warp accessing 32 consecutive floats, that&#x27;s one 128B cache line (32 floats = 128B). Perfect! So for each (c, kh, kw), the warp reads one cache line. Total cache lines per warp per output group = 64 * 9 = 576 cache lines. At ~10-20 cycles per cache line, that&#x27;s ~6000-12000 cycles per group. And there are 62 groups (since each thread handles 62 outputs, processed as 62/1 = 62 iterations with 1 output per iteration? Or we can vectorize).
+
+Wait, each thread computes one output at a time. For 256 threads, each iteration computes 256 outputs. A warp computes 32 outputs. There are 8 warps. Each warp does 576 cache line reads. At L2 cache hit rate of maybe 50-80%, and L2 latency of ~100 cycles, with 24 warps per SM (3 blocks * 8 warps), we might be able to hide some latency. But 576 reads per warp for just 32 outputs is a lot. Let&#x27;s say L2 bandwidth is 10 TB/s. 576 cache lines * 128B = 73,728 bytes per warp. At 10TB/s, that&#x27;s 7.4 µs per warp. With 8 warps and some overlap... this is getting slow.
+
+Actually, let me think differently. For 256 outputs (one iteration), we read:
+- 256 outputs require input windows for 256 pixels.
+- The input region is roughly 258 columns wide (256 + 2) and 3 rows tall, for 64 channels.
+- But due to NCHW, we read 64 channels * 3 rows * ~258 columns = ~49,500 floats = 198KB per 256-output iteration.
+- For 15876 outputs, we need 15876/256 ≈ 62 iterations.
+- Total input reads: 62 * 198KB ≈ 12.3MB per block... wait, but there&#x27;s overlap between iterations. Iteration k and k+1 are offset by 256 outputs = 2 rows + 4 cols. The input regions overlap significantly. With L2 cache (50MB), and only 4MB input per sample, the L2 hit rate should be very high!
+
+Actually, here&#x27;s the key: all blocks processing the SAME sample read the SAME input. With 128 blocks per sample (one for each output channel), they all read the same 4MB input. If these blocks execute in the same wave on the same SM or nearby SMs, the L2 cache can serve them efficiently. 128 blocks * 4MB = 512MB of reads, but the actual input is only 4MB. So L2 hit rate for input could be nearly 100% after the first block loads it into L2.
+
+Similarly, for weights: 128 blocks for different output channels read different weights (288KB total). Weights might also stay in L2.
+
+So most reads could be L2 hits! L2 bandwidth on H100 is ~10-20 TB/s. At 15 TB/s, 12MB reads per block at L2 hit takes ~0.8 µs. But with 128 blocks reading the same data, total L2 traffic is ~512MB, taking ~34 µs at 15TB/s. Spread over 132 SMs... about 0.26ms. Plus compute.
+
+Actually, I&#x27;m making too many back-of-the-envelope estimates. Let me just try coding the full fused kernel and benchmark it. That&#x27;s what the tools are for!
+
+OK, I&#x27;ll write a complete fused conv + instance norm + divide kernel using the per-(N,C) block approach with shared memory for weights and output, and either shared memory or global memory for input.
+
+To maximize parallelism and occupancy, let me try using shared memory for input tiles (higher shared memory = fewer blocks per SM) vs just global memory loads (lower shared memory = more blocks per SM). I&#x27;ll try the global memory approach first since it allows more warps per SM.
+
+Actually, if I use global memory for input with NO shared memory buffering of outputs (using registers instead), shared memory usage is tiny. Then I can fit more blocks. Let me design the register-based approach more carefully.
+
+For register-based output buffering:
+- Each thread handles a fixed set of output pixels.
+- To avoid large register usage, we can process outputs in groups. For example, each thread handles 1 pixel at a time, accumulates its value in a register, then immediately moves to the next pixel.
+- But for mean/variance, we need all pixel values. So either:
+  a) Buffer all pixel values in registers
+  b) Two-pass: compute mean/var in first pass, then recompute conv in second pass
+  c) Welford&#x27;s algorithm on the fly without buffering
+
+Can we use Welford&#x27;s algorithm on the fly? Yes! As we compute each output pixel, we update running mean and M2. After all pixels, we have exact mean and variance. No buffering needed!
+
+Welford&#x27;s algorithm:
+```
+mean = 0
+M2 = 0
+count = 0
+for each x:
+    count += 1
+    delta = x - mean
+    mean += delta / count
+    delta2 = x - mean
+    M2 += delta * delta2
+var = M2 / count  // population variance
+```
+
+This requires only mean and M2 as running state (2 floats). No output buffering!
+
+So the fused kernel could be:
+1. Each thread computes its assigned output pixels one by one
+2. For each pixel, compute conv directly from global memory
+3. Feed the conv result into Welford&#x27;s algorithm
+4. After all pixels, block reduction to compute global mean and variance
+5. Second pass: recompute each output pixel, normalize, write
+
+Wait, step 5 recomputes the conv! That doubles FLOPs. Not good unless conv is cheap... but conv is the bulk.
+
+Alternative: Step 4 computes global mean and var. Then step 5 re-reads from global memory? But we never wrote the conv outputs to global memory.
+
+Alternative 2: Compute conv outputs and write them to global memory. Then compute mean/var with Welford. Then read outputs back, normalize, and write again. That&#x27;s 1 write + 1 read + 1 write = 3 memory ops for the output. Plus conv compute once. Total HBM traffic for output: 3 * 1GB = 3GB. Plus input reads for conv.
+
+This is worse than our shared-memory buffered approach (1 read + 1 write for norm, with conv write being 1GB, total 2GB for output).
+
+Actually wait, the shared-memory buffered approach for norm does:
+- Read conv output from global memory into shared memory (1GB read)
+- Compute mean/var
+- Normalize and write back (1GB write)
+- Conv writes its output first (1GB write)
+Total output-related traffic: 1GB write (conv) + 1GB read (norm) + 1GB write (norm) = 3GB.
+
+With Welford + two-pass conv:
+- Pass 1: compute conv, update Welford state, write output (1GB write)
+- Block reduction for mean/var
+- Pass 2: read output (1GB read), normalize, write (1GB write)
+Total: 1GB write + 1GB read + 1GB write = 3GB. Same!
+
+So shared memory buffering saves nothing in terms of HBM traffic over properly structured Welford + re-read. BUT, we avoid recomputing conv (saving 147 GFLOPs).
+
+Wait, actually in the Welford approach I said &quot;write output&quot; in pass 1. So conv is only computed once. Then pass 2 reads the written output. Total output traffic: write once, read once, write once = 3 passes. The shared memory approach reads once and writes once for norm, PLUS conv writes once: total 3 passes. Same traffic.
+
+So the shared memory approach isn&#x27;t saving traffic compared to just a good two-kernel approach (conv then norm). The two-kernel approach has conv write (1GB) + norm read+write (2GB) = 3GB. Same.
+
+The advantage of buffering in shared memory for norm is that the norm kernel does its internal compute (mean, var, normalize) efficiently without extra HBM traffic.
+
+OK so approach 1 (PyTorch conv + custom norm kernel) with shared memory buffering is good. It gives the same HBM traffic as any optimal fused approach.
+
+But can we beat cuDNN conv? That&#x27;s the question. If our custom conv is slower than cuDNN, then approach 1 is better. If we can match or beat cuDNN (unlikely), then fused approach 2 is better.
+
+Let me just code approach 1 first and benchmark. I&#x27;d rather submit a kernel that&#x27;s definitely correct and gives a meaningful speedup than risk a complex conv kernel that might be slow.
+
+One more thought: for the custom norm kernel, can we use vectorized loads (float4) to improve bandwidth? Yes! 15876 is divisible by 4 (15876/4 = 3969). We can process 4 floats at a time.
+
+With float4 loads:
+- Each thread reads float4 at a time
+- 15876/4 = 3969 float4s
+- 3969/256 ≈ 15.5 float4s per thread
+- Great for coalescing and fewer instructions
+
+For reductions with float4:
+- We can load float4, extract 4 floats, accumlate sum and sum_sq
+- This amortizes the load cost
+
+Let me write the kernel with float4.
+
+```cuda
+__global__ void fused_instnorm_divide_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float eps, float divide_by)
+{
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int HW = H * W;
+    
+    const float* in_ptr = input + ((n * C) + c) * HW;
+    float* out_ptr = output + ((n * C) + c) * HW;
+    
+    // Step 1: Compute mean and variance in one pass using Welford&#x27;s algorithm
+    // Actually no, Welford needs a second pass. Let&#x27;s just do two-pass with shared memory.
+    
+    extern __shared__ float sbuf[];
+    float* buf = sbuf;  // HW elements
+    // We&#x27;ll use a small portion at the end for reduction
+    float* red = sbuf + HW;
+    
+    // Load into shared memory with float4
+    int nvec = HW / 4;
+    const float4* in4 = reinterpret_cast&lt;const float4*&gt;(in_ptr);
+    float4* buf4 = reinterpret_cast&lt;float4*&gt;(buf);
+    
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        buf4[i] = in4[i];
+    }
+    // Handle remainder if HW not divisible by 4 (but 15876 is divisible by 4)
+    __syncthreads();
+    
+    // Compute local sum
+    float local_sum = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        local_sum += v.x + v.y + v.z + v.w;
+    }
+    
+    // Block reduction
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sum;
+    }
+    __syncthreads();
+    if (tid &lt; 32) {
+        local_sum = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sum / (float)HW;
+        }
+    }
+    __syncthreads();
+    float mean = red[0];
+    
+    // Compute local sum of squared diff
+    float local_sq = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        float d0 = v.x - mean;
+        float d1 = v.y - mean;
+        float d2 = v.z - mean;
+        float d3 = v.w - mean;
+        local_sq += d0*d0 + d1*d1 + d2*d2 + d3*d3;
+    }
+    
+    // Block reduction for variance
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sq;
+    }
+    __syncthreads();
+    if (tid &lt; 32) {
+        local_sq = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sq / (float)HW;
+        }
+    }
+    __syncthreads();
+    float var = red[0];
+    
+    float inv_std = rsqrtf(var + eps) / divide_by;
+    
+    // Normalize and write
+    float4* out4 = reinterpret_cast&lt;float4*&gt;(out_ptr);
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        v.x = (v.x - mean) * inv_std;
+        v.y = (v.y - mean) * inv_std;
+        v.z = (v.z - mean) * inv_std;
+        v.w = (v.w - mean) * inv_std;
+        out4[i] = v;
+    }
+}
+```
+
+Wait, there are issues with float4 memory alignment. PyTorch tensors are aligned to at least 256 bytes for the start, and the channel dimension might not be aligned to 16 bytes for all channels. But since HW = 15876 and 15876 * 4 = 63504, which is divisible by 16 (63504/16 = 3969), and the base offset for each channel is ((n*C)+c)*15876*4. Since 15876*4 = 63504 is divisible by 16, all channel starts are 16-byte aligned! So float4 is safe.
+
+Also, I need to make sure blockDim.x = 256 is used, and shared memory is allocated correctly.
+
+Shared memory size needed: HW * sizeof(float) + a few floats for reduction.
+HW = 15876, so 15876 * 4 = 63504 bytes.
+Reduction array: for 256 threads, 8 warps, need 8 floats = 32 bytes.
+Total: ~63536 bytes = ~62KB.
+
+Launch configuration:
+```python
+blocks = (N, C_out)
+threads = 256
+smem = 15876 * 4 + 32
+```
+
+Actually, in the kernel, we can just set `extern __shared__ float sbuf[];` and pass the size at launch.
+
+Let me also consider: can we use `math` functions or `fast_math`? We need numerical equivalence within 1e-4. `rsqrtf` should be fine. PyTorch uses `rsqrt` for instance norm.
+
+One issue: PyTorch&#x27;s InstanceNorm2d might use a two-pass algorithm for numerical stability, or it might use Welford&#x27;s. The exact implementation matters for floating point accuracy. Is `(x - mean) / sqrt(var + eps)` numerically equivalent to PyTorch&#x27;s implementation?
+
+PyTorch&#x27;s instance_norm uses the same formula. There might be tiny differences due to reduction order, but with atol=rtol=1e-4, it should be fine. The main difference would be:
+1. How mean is computed: we do tree reduction, PyTorch might do tree reduction too.
+2. How variance is computed: PyTorch computes `var = mean((x - mean)**2)`. We do the same.
+3. Order of operations in the final normalization.
+
+I think it&#x27;ll be fine with 1e-4 tolerance.
+
+Wait, there&#x27;s a subtlety. For variance computation, if we first compute `mean` and then compute `sum((x-mean)**2) / HW`, the intermediate `(x-mean)` might have catastrophic cancellation if x and mean are large and close. But for typical conv outputs (which are on the order of 1-10), this should be fine. PyTorch uses the same approach in its CUDA kernels.
+
+Actually, PyTorch&#x27;s native CUDA batch norm uses a single-pass algorithm that&#x27;s carefully designed to be numerically stable. Let me check... In recent PyTorch versions, batch_norm uses `cudnnBatchNormalizationForwardInference` or `cudnnBatchNormalizationForwardTraining` for the forward pass. For inference, it uses pre-computed running stats. For training (which is what we have, since `track_running_stats=False` and we&#x27;re doing forward without eval mode), it computes mean and var on the fly.
+
+For training mode with `track_running_stats=False`, PyTorch&#x27;s instance norm computes mean and inv_std during forward. The actual CUDA implementation might use a specific algorithm. But with 1e-4 tolerance, our approach should match.
+
+One more thing: we need to make sure the conv in ModelNew matches the reference exactly. We should use the same weights. In __init__, we&#x27;ll initialize `self.weight` and `self.bias` the same way as `nn.Conv2d`. We can just copy them from a dummy conv or initialize them directly.
+
+Actually, we can extract weights and bias from `nn.Conv2d`. In ModelNew.__init__, we can create a temporary `nn.Conv2d`, then copy its weight and bias, and then delete it. Or we can just store them as nn.Parameter.
+
+But wait - the test harness will call `get_init_inputs()` and pass them to `ModelNew(in_channels, out_channels, kernel_size, divide_by)`. So we need to create the conv weights ourselves. We can do:
+```python
+self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
+self.bias = nn.Parameter(torch.empty(out_channels))
+nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+bound = 1 / math.sqrt(fan_in)
+nn.init.uniform_(self.bias, -bound, bound)
+```
+
+This should match PyTorch&#x27;s default initialization for Conv2d (which uses kaiming_uniform_).
+
+Actually, we need to be careful to match PyTorch exactly. PyTorch uses `init.kaiming_uniform_(self.weight, a=math.sqrt(5))` and `init.uniform_(self.bias, -bound, bound)` where `bound = 1 / math.sqrt(fan_in)`. Yes.
+
+For the instance norm, there&#x27;s no parameters (affine=False by default). So we don&#x27;t need any params for that.
+
+Now let me draft the full ModelNew code.
+
+One question: should we use `torch.utils.cpp_extension.load_inline` or write a separate string and call it? We need to define the CUDA source as a string in Python.
+
+Let me draft the kernel code in Python:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SOURCE = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void fused_instnorm_divide_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float eps, float divide_by)
+{
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int HW = H * W;
+    
+    const float* in_ptr = input + ((n * C) + c) * HW;
+    float* out_ptr = output + ((n * C) + c) * HW;
+    
+    extern __shared__ float sbuf[];
+    float* buf = sbuf;
+    float* red = sbuf + HW;
+    
+    int nvec = HW / 4;
+    const float4* in4 = reinterpret_cast&lt;const float4*&gt;(in_ptr);
+    float4* buf4 = reinterpret_cast&lt;float4*&gt;(buf);
+    
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        buf4[i] = in4[i];
+    }
+    __syncthreads();
+    
+    float local_sum = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        local_sum += v.x + v.y + v.z + v.w;
+    }
+    
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sum;
+    }
+    __syncthreads();
+    if (tid &lt; 32) {
+        local_sum = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sum / (float)HW;
+        }
+    }
+    __syncthreads();
+    float mean = red[0];
+    
+    float local_sq = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        float d0 = v.x - mean;
+        float d1 = v.y - mean;
+        float d2 = v.z - mean;
+        float d3 = v.w - mean;
+        local_sq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+    }
+    
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sq;
+    }
+    __syncthreads();
+    if (tid &lt; 32) {
+        local_sq = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sq / (float)HW;
+        }
+    }
+    __syncthreads();
+    float var = red[0];
+    
+    float inv_std = rsqrtf(var + eps) / divide_by;
+    
+    float4* out4 = reinterpret_cast&lt;float4*&gt;(out_ptr);
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        v.x = (v.x - mean) * inv_std;
+        v.y = (v.y - mean) * inv_std;
+        v.z = (v.z - mean) * inv_std;
+        v.w = (v.w - mean) * inv_std;
+        out4[i] = v;
+    }
+}
+
+torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+    
+    auto output = torch::empty_like(input);
+    
+    dim3 blocks(N, C);
+    dim3 threads(256);
+    size_t smem = H * W * sizeof(float) + 32 * sizeof(float);
+    
+    fused_instnorm_divide_kernel&lt;&lt;&lt;blocks, threads, smem&gt;&gt;&gt;(
+        input.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        N, C, H, W, 1e-5f, divide_by);
+    
+    return output;
+}
+&quot;&quot;&quot;
+
+fused_op = load_inline(
+    name=&quot;fused_instnorm_divide&quot;,
+    cpp_sources=&quot;torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by);&quot;,
+    cuda_sources=CUDA_SOURCE,
+    functions=[&quot;fused_instnorm_divide&quot;],
+    extra_cuda_cflags=[&quot;--use_fast_math&quot;],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.divide_by = divide_by
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_op.fused_instnorm_divide(x, self.divide_by)
+        return x
+```
+
+Wait, one issue: if we keep `self.conv` as `nn.Conv2d`, then the forward still uses PyTorch&#x27;s conv but our custom norm. But the problem says &quot;Replace the forward computation ... with a custom CUDA kernel&quot;. Does using a mix of PyTorch and custom CUDA satisfy this? It says &quot;Your ModelNew class must... call the compiled extension from ModelNew.forward&quot;. It doesn&#x27;t say the ENTIRE forward must be in CUDA.
+
+But for better speedup, should we also replace conv? Hmm.
+
+Actually, the reference implementation does: conv -&gt; inst_norm -&gt; divide. Our implementation does: conv (PyTorch) -&gt; inst_norm+divide (custom). This definitely produces the same output and should be faster.
+
+But wait, using `self.conv` in ModelNew and then copying weights... The evaluation will instantiate `Model` and `ModelNew` with the same arguments, then test them. But the weights might be randomly initialized differently. We need to make sure `ModelNew` produces the SAME output as `Model` for the SAME input. Since both use random initialization, they might differ unless we fix the seed or copy weights.
+
+Actually, in typical evaluation, they&#x27;ll create a `Model` and a `ModelNew`, then copy weights or ensure both are initialized the same. But since we can&#x27;t control the evaluation harness from our code... Let me re-read the problem.
+
+The problem says: &quot;Your submission is a complete Python file that defines a class called ModelNew.&quot; The evaluation will instantiate `Model` and `ModelNew`, and probably either copy state dict or expect them to be initialized the same. Since we can&#x27;t see the evaluation code, we should make `ModelNew` have the same parameter structure as `Model` so that `load_state_dict` works if they copy weights.
+
+If we use `self.conv = nn.Conv2d(...)`, then `state_dict()` will have `conv.weight` and `conv.bias`. The reference also has these. So weight copying should work.
+
+Great, let me stick with this approach.
+
+One optimization: can we fuse the divide into conv&#x27;s bias? No, because the divide happens AFTER instance norm. We could potentially absorb the divide into the bias of instance norm if it were affine, but it&#x27;s not.
+
+Actually wait - our kernel computes `inv_std = rsqrt(var + eps) / divide_by`. This is the same as `rsqrt(var + eps) * (1/divide_by)`. We can precompute `1.0 / divide_by` once on the CPU and pass it. I already do that implicitly by passing divide_by as a float.
+
+Let me also think about vectorizing the reduction. With float4 loads, the reduction of sum and sum_sq is efficient.
+
+One issue: `__shfl_down_sync` requires CC &gt;= 3.0, which H100 definitely supports. But I need to use the correct warp size. H100 has warp size 32. Good.
+
+Another issue: I should add `__forceinline__` to the kernel? Not needed.
+
+Also, I need to make sure the CUDA source compiles with the right headers.
+
+Actually wait, I realize there might be an issue with `load_inline`. The `cpp_sources` parameter should contain the C++ wrapper, but not the `PYBIND11_MODULE`. `load_inline` auto-generates the pybind11 module. So my `cpp_sources` should just contain the function declaration or additional C++ code.
+
+Looking at the PyTorch docs for `load_inline`:
+- `cpp_sources`: string or list of strings containing C++ source code
+- `cuda_sources`: string or list of strings containing CUDA source code
+- `functions`: list of function names to bind
+
+The function declarations in `cpp_sources` are used to generate the pybind11 bindings. So I should provide the declaration `torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by);` in `cpp_sources`, and the implementation in `cuda_sources`.
+
+Wait, looking at common examples:
+```python
+load_inline(
+    name=&quot;my_op&quot;,
+    cpp_sources=&quot;torch::Tensor my_op(torch::Tensor x);&quot;,
+    cuda_sources=&quot;... __global__ void ... torch::Tensor my_op(...) { ... }&quot;,
+    functions=[&quot;my_op&quot;]
+)
+```
+
+This should work.
+
+Let me double check: in `cpp_sources`, if I just put the declaration, `load_inline` uses it in the auto-generated pybind11 module. The CUDA code in `cuda_sources` provides the implementation.
+
+Actually, in some examples, `cpp_sources` contains both the declaration and any CPU-side wrapper code. Let me just put the declaration there.
+
+One more thing: `load_inline` might need `with_cuda=True` or it might auto-detect from `cuda_sources`. It should auto-detect.
+
+Also, I should add `extra_cuda_cflags` like `[&#x27;-O3&#x27;]`.
+
+Let me think about whether there are any numerical issues with our kernel relative to PyTorch.
+
+PyTorch&#x27;s InstanceNorm2d uses `cudnn_batch_norm` or `native_batch_norm` depending on availability. For `track_running_stats=False`, it computes mean and variance over the current batch/instance.
+
+Our kernel computes population variance (`sum((x-mean)^2) / N`). PyTorch also uses population variance for normalization during training. Actually, for batch norm in training, it computes population variance of the current batch. For instance norm, same thing: population variance over H*W.
+
+The order of operations:
+1. Our kernel computes the sum first, then mean.
+2. Then computes sum of squared differences.
+3. Then divides to get variance.
+4. Then normalizes.
+
+PyTorch might compute variance using `sum(x^2)/N - mean^2`, which can be less numerically stable but might give slightly different results due to different rounding. With 1e-4 tolerance, both methods should agree for typical values.
+
+However, to maximize numerical agreement, I should match PyTorch&#x27;s approach. Let me check if PyTorch uses the two-pass algorithm for variance...
+
+In PyTorch&#x27;s `batch_norm_cpu` or CUDA implementations, for training without running stats, it typically computes mean, then `var = mean((x - mean)^2)`. In the native CUDA kernel, it does exactly this. So our approach should match well.
+
+Actually, PyTorch&#x27;s `batch_norm` CUDA kernel for training uses a vectorized load and reduction approach similar to ours. It might use `blockReduceSum` with shared memory. So our numerical results should be very close.
+
+The divide by 2.0 is simple scaling.
+
+One more optimization: instead of using `rsqrtf`, we could use `1.0f / sqrtf(var + eps)`. But `rsqrtf` is faster and should be accurate enough.
+
+Another thought: we can avoid the `__syncthreads` at the very end of the kernel (after normalizing and writing) since the kernel ends there. But we do need it before the block reduction steps.
+
+Actually, looking at my reduction code, I have:
+```cuda
+for (int offset = 16; offset &gt; 0; offset /= 2) {
+    local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+}
+```
+
+This assumes blockDim.x &gt;= 32 and that we only reduce within a warp. Since blockDim.x = 256, there are 8 warps. The code correctly stores warp results to shared memory, then has warp 0 reduce those 8 values.
+
+One subtle bug: `nthreads &gt;&gt; 5` for nthreads=256 is 8. But `nthreads` might not always be 256. If I change block size, this needs to adjust. Since we hardcode 256, it&#x27;s fine. But to be safe, I could use `(nthreads + 31) / 32` or just pass the block size.
+
+Actually, let me make the kernel handle any blockDim.x that is a power of 2 up to 1024.
+
+```cuda
+int lane = tid &amp; 31;
+int warp_id = tid &gt;&gt; 5;
+int num_warps = (nthreads + 31) &gt;&gt; 5;
+
+for (int offset = 16; offset &gt; 0; offset /= 2) {
+    local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+}
+if (lane == 0) {
+    red[warp_id] = local_sum;
+}
+__syncthreads();
+if (tid &lt; num_warps) {
+    local_sum = red[tid];
+    for (int offset = num_warps/2; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if (tid == 0) {
+        red[0] = local_sum / (float)HW;
+    }
+}
+```
+
+Wait, `__shfl_down_sync` requires that all active threads in the warp participate. If `num_warps` is 8, then threads 0..7 are active. `__shfl_down_sync` with `offset=4` on thread 4 will read from thread 8, which is not active but the lane mask... Actually, `__shfl_down_sync` with mask `0xFFFFFFFF` includes all threads in the warp. Thread 4 reading from thread 8: thread 8 might have garbage or the value from a previous computation. Since threads 8..31 are active in the warp and might be doing other stuff... Wait, all threads in the warp execute the same instruction. If `tid &lt; num_warps`, only threads 0..7 execute this code. But `__shfl_down_sync` requires the source thread to be in the mask and alive. Thread 8 is in the mask but might not be executing this branch. However, in CUDA, threads in a warp execute in lockstep. If thread 8 is not in the `if` branch, it still participates in the shuffle and returns its own `local_sum`. Since `local_sum` was last set in the previous loop for threads 8..31 (when they did `sum += __shfl_down...`), thread 8 would have the reduced sum of warp 1. We don&#x27;t want that!
+
+So the standard pattern is to have all 32 threads in warp 0 execute the reduction:
+```cuda
+if (tid &lt; 32) {
+    local_sum = (tid &lt; num_warps) ? red[tid] : 0.0f;
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if (tid == 0) red[0] = local_sum / (float)HW;
+}
+```
+
+Here, ALL threads 0..31 execute the loop, but threads &gt;= num_warps load 0.0f. This is safe because all threads in the warp participate in `__shfl_down_sync`. Good.
+
+For the first warp reduction, ALL threads in each warp participate, so no issues.
+
+OK, I&#x27;ll write the kernel this way.
+
+Let me now write the complete code and compile it.
+
+Actually, I want to make sure about one more thing: the input and output tensors passed to the CUDA kernel must be contiguous. Since `F.conv2d` returns a contiguous tensor, this is fine.
+
+Also, I should consider if `F.conv2d(x, weight, bias)` is better than `self.conv(x)`. Since `self.conv` already stores weight and bias, and we want weight copying to work, using `self.conv(x)` is simpler. The overhead of `nn.Conv2d.__call__` is negligible.
+
+So the final ModelNew:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.divide_by = divide_by
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_op.fused_instnorm_divide(x, self.divide_by)
+        return x
+```
+
+Wait, one concern: the compilation of `load_inline` might fail if the environment doesn&#x27;t have the right CUDA setup. But since we&#x27;re running on an H100, it should work.
+
+Another thought: should I add `-lineinfo` or other flags for debugging? No, just optimization flags.
+
+Let me also consider: can I use `torch.cuda.is_available()` and cache the compiled extension? `load_inline` caches by name, so calling it multiple times with the same name will use the cached version.
+
+Actually, if the module is loaded at import time and `ModelNew` is instantiated multiple times, it&#x27;s fine. The CUDA code is compiled once.
+
+Now, let me write the actual Python code and try compiling it.
+
+Hmm, before writing the full file, let me also think about whether I should try fusing everything into one kernel for maximum performance. I just realized that since the conv output is 1GB, and our kernel only saves the instance_norm+divide overhead, the speedup might be limited. 
+
+Let me see if I can write a direct conv that&#x27;s reasonably fast. The key insight is that with H100 tensor cores, even a simple manual conv might not match cuDNN, but what if we use CUTLASS or implicit GEMM through some PyTorch helper? Actually, we can just call `torch.matmul` with im2col!
+
+Wait, for this specific case: C_in=64, K=3, C_out=128, H=W=128, H_out=W_out=126.
+im2col size: [128, 64*3*3, 126*126] = [128, 576, 15876]
+Weight matrix: [128, 576]
+Output: [128, 128, 15876]
+
+Actually, batch size is part of the first dim. For each sample n:
+- im2col: [576, 15876]
+- Weight: [128, 576]
+- Output: [128, 15876]
+- matmul: [128, 576] @ [576, 15876] = [128, 15876]
+
+For N=128, the batched matmul would be: [128, 128, 576] @ [128, 576, 15876] = [128, 128, 15876]
+
+PyTorch&#x27;s `unfold` + `matmul` is sometimes used for conv. But `F.conv2d` is already optimized to do this internally using cuDNN or cuBLAS.
+
+What if we manually do im2col in shared memory and then use a thread-level matrix multiply? This is basically what CUTLASS does. Very complex.
+
+OK, I&#x27;ll stick to the fused norm+divide approach for now and benchmark. If the speedup is insufficient, I&#x27;ll try a full fusion.
+
+Actually, let me look at ERT roofline to see what the realistic bandwidths are. But I should just try compiling and running first.
+
+Let me write the code.
+
+Wait, one more idea. What if I write a custom kernel that does conv + instance norm + divide, but calls `cudnn` for conv and then does a custom device-to-device kernel? That&#x27;s what approach 1 does.
+
+What if I write a custom kernel for conv using `torch::mm` with explicit im2col? PyTorch&#x27;s unfold + mm might have some overhead, but I can do it in CUDA.
+
+Actually, for this specific problem, a very simple custom direct conv in CUDA might be competitive IF we use enough warps. Let me try a different design:
+
+Design: each block handles 1 sample (N), and 64 threads handle 1 output channel. With 128 output channels, we&#x27;d need 2 blocks per sample, or handle multiple channels per block.
+
+Let&#x27;s say 1024 threads per block:
+- Block handles 1 sample
+- 1024 threads process all 128*126*126 outputs
+- Each thread handles ~1587 outputs
+- No shared memory needed for output (write directly)
+- But we need Welford&#x27;s algorithm per channel... 
+
+Actually, we can have each warp handle one output channel. There are 32 threads per warp. 128 output channels need 128 warps = 4096 threads. That&#x27;s too many for one block.
+
+What if a block handles 4 output channels? 4 warps = 128 threads. Block size = 128.
+- 128 threads per block
+- Each block handles 1 sample and 4 output channels
+- Number of blocks = 128 samples * (128/4) = 4096 blocks
+- Each thread handles one spatial position: 126*126/32 = ~496 positions per warp? No, 126*126 = 15876 positions per channel. 32 threads handle 15876 positions = ~496 each. That&#x27;s a lot, but manageable.
+
+Each thread computes ~496 output pixels for one channel. For each pixel, conv needs 576 input reads. With 496 pixels, that&#x27;s ~285K reads per thread.
+But all 32 threads in a warp read nearby columns, so coalescing is good.
+
+For Welford&#x27;s algorithm, each warp can compute mean and var for its channel independently! Then all threads in the warp normalize their pixels and write.
+
+This design has NO shared memory usage for output buffering, and minimal shared memory for weights. Each warp needs to load weights for its channel: 576 floats. We can broadcast from one thread or load cooperatively.
+
+Block size: 128 threads (4 warps)
+Grid: 128 samples * 32 channel_groups = 4096 blocks
+Shared memory: weights for 4 channels = 4 * 576 * 4 = 9KB
+Registers: per thread, maybe 30-40
+Blocks per SM: limited by 9KB shared memory, we can fit ~25 blocks, but limited by 128 threads each = 128*25 = 3200 threads, but max is 2048. So 16 blocks = 2048 threads. Great occupancy!
+
+Wait, this is interesting! Each block has 128 threads (4 warps). Each warp handles one output channel. The block handles 4 channels for one sample.
+
+For each warp (channel c):
+- Load weights for channel c into shared memory or registers
+- Each thread in warp computes a subset of 15876 spatial positions
+- During computation, accumulate Welford&#x27;s statistics (mean, M2)
+- After all positions, reduce within warp to get final mean and var
+- Then recompute the same positions (or store them), normalize, and write
+
+Wait, for Welford&#x27;s algorithm, we need two passes OR we need to buffer outputs. With registers, we can&#x27;t buffer 496 outputs per thread (496 * 4 = ~2KB, which is ~500 registers - too many).
+
+So we&#x27;d need to either:
+1. Buffer outputs in shared memory: 4 channels * 15876 floats = ~254KB. Too big!
+2. Recompute conv in second pass
+3. Use a different variance computation
+
+Option 2: recompute conv in second pass. Double FLOPs but saves shared memory.
+
+Option 3: two-step kernel. Step 1: compute conv and write to global memory. Step 2: custom norm kernel. This is approach 1.
+
+Option 4: Instead of Welford, compute partial sums using float accumulators, then do a final reduction. If we process pixels in groups, we can accumulate sum and sum_sq in registers, but we still need the final mean before normalizing.
+
+Wait, here&#x27;s a clever trick: we can compute mean in a first sub-kernel (pass over data), write mean to a small buffer. Then a second sub-kernel computes variance + normalize in one pass using the mean. But this still requires either storing the conv output or recomputing it.
+
+Since PyTorch conv2d is so well optimized, the two-kernel approach (conv then custom norm) is probably best.
+
+However, I just realized: we could call conv2d, then write a custom kernel that computes mean, variance, and normalize in ONE pass WITHOUT shared memory buffering, by:
+1. First pass: all threads compute partial sums for mean
+2. Block reduction for mean
+3. Second pass over the SAME data (reading from global memory again) to compute variance and normalize
+
+This requires 2 reads and 1 write for the custom kernel, plus conv&#x27;s write. Total: 1 write (conv) + 2 reads (norm) + 1 write (norm) = 4 passes over the 1GB data. At 3.35TB/s, 4GB = 1.2ms. Plus conv time.
+
+With shared memory buffering: 1 write (conv) + 1 read (norm into smem) + 1 write (norm out) = 3 passes. Saves 1GB read = 0.3ms.
+
+The shared memory approach is better by 0.3ms. But the non-buffered approach might have better occupancy (more blocks per SM since less shared memory). Though with 62KB shared memory, we still fit 3 blocks per SM. The non-buffered approach with no shared memory fits up to 32 blocks (limited by threads to 8). 8 blocks * 256 threads = 2048 threads. Much higher occupancy!
+
+Can higher occupancy overcome the extra 1GB read? It depends. The extra read is 0.3ms at peak bandwidth. With 8 blocks per SM, we have many more warps to hide latency. But the reduction needs serialization. Actually, for a memory-bound kernel, 2 reads + 1 write = 3 passes * 1GB = 3GB at 3.35TB/s = 0.9ms for the norm part. Plus conv write. The buffered kernel does 1 read + 1 write = 2 passes * 1GB = 2GB = 0.6ms for norm. So buffered is 0.3ms faster.
+
+If conv takes 1.5ms, total time:
+- Buffered: 1.5ms (conv) + 0.6ms (norm) = 2.1ms
+- Non-buffered: 1.5ms (conv) + 0.9ms (norm) = 2.4ms
+
+For reference (PyTorch separate ops), conv might take 1.5ms, inst_norm might take ~1ms (multiple passes), divide 0.6ms. Total ~3.1ms.
+
+Both approaches give decent speedup. Buffered gives ~1.5x, non-buffered gives ~1.3x.
+
+I&#x27;ll stick with buffered for now since 0.3ms is meaningful. Let me code it up.
+
+One optimization: in the buffered kernel, instead of having ALL threads wait after loading, we could have some threads start computing sums while others load. But `__syncthreads` after loading is needed.
+
+Another optimization: for very large HW, the shared memory might be a bottleneck. But HW=15876 is moderate.
+
+Actually, wait. I should reconsider the block size. With 256 threads and 63KB shared memory, 3 blocks per SM. What if I use 512 threads? Shared memory is the same. 512 threads * 3 = 1536 threads per SM. More warps, better latency hiding. But 1536 might still be below the max of 2048.
+
+For 512 threads:
+- nvec = 15876/4 = 3969
+- Each thread handles ~7.75 float4s
+- Reduction: 512/32 = 16 warps
+- Block reduction uses 16 float slots in shared memory
+- Total shared memory: ~63KB + 64 bytes = same.
+- Blocks per SM: still 3 (since shared memory is the same)
+- Threads per SM: 1536. Better than 768.
+
+What about 1024 threads?
+- Each thread handles ~3.88 float4s
+- Blocks per SM: still 3
+- Threads per SM: 3072 &gt; 2048, so limited to 2 blocks = 2048 threads.
+- Occupancy: 2048 threads / 2048 max = 100% thread occupancy! But only 2 blocks per SM.
+- With 2 blocks, one might finish and the SM could be idle. Not ideal.
+
+What about 128 threads?
+- 128 threads * 3 blocks = 384 threads per SM. Terrible occupancy.
+
+What about 256 threads with 2 blocks per SM = 512 threads. Worse than 512 threads with 3 blocks = 1536.
+
+Wait, can we fit 3 blocks with 512 threads? 3 * 63KB = 189KB &lt; 227KB. Yes!
+Can we fit 3 blocks with 1024 threads? 3 * 63KB = 189KB &lt; 227KB. Yes! But max threads per SM is 2048, so 2 blocks * 1024 = 2048. Only 2 blocks.
+
+So 512 threads with 3 blocks = 1536 threads seems good.
+
+Can we fit 4 blocks with 512 threads? 4 * 63KB = 252KB &gt; 227KB. No.
+
+What about reducing shared memory? If we process the output in chunks, say 4096 floats per chunk, shared memory = 16KB. Then with 512 threads:
+- 4 blocks * 512 = 2048 threads. 4 * 16KB = 64KB. Fits!
+- But we&#x27;d need multiple passes over global memory (one per chunk). For 15876/4096 ≈ 4 chunks. Each chunk: load from global, compute partial stats, accumulate into global stats... wait, we can&#x27;t accumulate variance easily across chunks without storing intermediate state.
+
+We can use Welford&#x27;s algorithm across chunks!
+1. For chunk k: load 4096 elements into shared memory (16KB)
+2. Each thread processes its elements, updating local Welford state (mean_k, M2_k, count_k)
+3. Block reduction to combine Welford states across threads
+4. Combine chunk state with global state
+5. Repeat for all chunks
+
+This only buffers one chunk at a time! After the first pass, we have global mean and var. Then a second pass over chunks:
+6. For chunk k: load into shared memory, normalize with global mean/var, write to global.
+
+This is 2 reads + 1 write for the norm kernel, same as non-buffered, but we access memory in nice coalesced chunks. And shared memory is tiny!
+
+Wait, but we still need 2 reads and 1 write. The non-buffered direct approach (without shared memory) also does 2 reads and 1 write. The chunked approach with shared memory doesn&#x27;t save any global memory bandwidth. It just helps with coalescing, which is already good.
+
+So the full-buffer approach (63KB) saves one read compared to the chunked approach.
+
+Full buffer: 1 read + 1 write for norm = 2 passes over data.
+Chunked/no-buffer: 2 reads + 1 write = 3 passes over data.
+
+I&#x27;ll stick with full buffer. 63KB shared memory, 512 threads, 3 blocks per SM = 1536 threads.
+
+Actually, let me think about whether 1536 threads is enough. For a memory-light kernel (load, reduce, store), 1536 threads should be fine. For H100, theoretical occupancy of 75% is decent.
+
+Let me go with 512 threads.
+
+Wait, actually I just read that H100 has a maximum of 2048 threads per SM. With 512 threads and 63KB shared memory, 3 blocks fit = 1536 threads = 75% occupancy. Not bad.
+
+Let me check: what if we use 256 threads and process 2 channels per block? Shared memory = 2 * 63KB = 126KB. Then 1 block per SM = 256 threads. Terrible occupancy.
+
+What if we use 256 threads and don&#x27;t buffer, just do direct 2-read + 1-write? Then shared memory is tiny, we fit ~32 blocks but limited to 8 by threads. 8 * 256 = 2048 threads = 100% occupancy. But 3 passes over data.
+
+Hmm. Let me think about which is faster. The full-buffer approach at 75% occupancy saves 1/3 of memory bandwidth. The no-buffer approach at 100% occupancy uses 50% more bandwidth but has 33% more active warps.
+
+For a kernel that is limited by memory bandwidth and has very little compute, 100% occupancy might hide latency better, but the bandwidth is still the bottleneck. Saving bandwidth should win.
+
+For example:
+- Full buffer: 2GB at 3.35TB/s = 0.6ms. At 75% occupancy, maybe 0.8ms.
+- No buffer: 3GB at 3.35TB/s = 0.9ms. At 100% occupancy, maybe 0.95ms.
+
+Full buffer should still win. I&#x27;ll go with 512 threads and full buffer.
+
+Actually, you know what, let me code both approaches and benchmark. But the problem gives limited tool calls. Let me start with one, benchmark, and iterate if needed.
+
+I&#x27;ll write the kernel with 512 threads and full buffer.
+
+Wait, hold on. I just realized something. `__shfl_down_sync` operates within a warp (32 threads). In CUDA, the warp size is always 32. But when I set `blockDim.x = 512`, there are 16 warps. The first warp reduction is fine. The second reduction (over warp results) uses `tid &lt; 32` but I need all 32 threads in warp 0 to participate.
+
+Let me re-examine my reduction code for 512 threads:
+```cuda
+// Warp-level reduction
+for (int offset = 16; offset &gt; 0; offset /= 2) {
+    local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+}
+if ((tid &amp; 31) == 0) {
+    red[tid &gt;&gt; 5] = local_sum;
+}
+__syncthreads();
+
+// Cross-warp reduction
+if (tid &lt; 32) {
+    local_sum = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if (tid == 0) {
+        red[0] = local_sum / (float)HW;
+    }
+}
+__syncthreads();
+```
+
+With `nthreads = 512`, `nthreads &gt;&gt; 5 = 16`. So threads 0..15 load `red[0..15]`, threads 16..31 load 0.0f. Then all 32 threads do the warp shuffle reduction. This is correct.
+
+OK let me draft the exact code I&#x27;ll compile.
+
+For the C++ source, I need a valid host function wrapper:
+
+```cuda
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void fused_instnorm_divide_kernel(...) { ... }
+
+torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by) {
+    // ...
+}
+```
+
+And the `cpp_sources` should just be `torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by);`.
+
+Wait, `load_inline` expects `cpp_sources` to be C++ source that gets compiled alongside the CUDA source. If I just put a declaration, it might not work because the CUDA source contains the definition. Actually, looking at the documentation:
+
+`cpp_sources` is C++ source code that is compiled and linked. The `cuda_sources` is CUDA source that is compiled with nvcc. The host function `fused_instnorm_divide` should be in the cpp_sources or cuda_sources? 
+
+Actually, the function that calls `&lt;&lt;&lt; &gt;&gt;&gt;` must be compiled by nvcc. So `fused_instnorm_divide` should be in `cuda_sources`. But then `cpp_sources` needs at least the declaration for the pybind11 binding.
+
+Looking at examples:
+```python
+cpp_sources = &quot;torch::Tensor my_op(torch::Tensor x);&quot;
+cuda_sources = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+torch::Tensor my_op(torch::Tensor x) { ... }
+&quot;&quot;&quot;
+```
+
+This should work because `cpp_sources` provides the declaration for pybind, and `cuda_sources` provides the definition (compiled by nvcc, linked with the C++ code).
+
+Actually, wait. Both `cpp_sources` and `cuda_sources` are included in the compilation. The linker resolves the declaration in cpp_sources with the definition in the cuda object file. Yes, this works.
+
+Let me write the complete code.
+
+One more thought: I should use `AT_DISPATCH_FLOATING_TYPES` to be generic, but since we know input is float, we can just check `input.scalar_type() == torch::kFloat32` and use `.data_ptr&lt;float&gt;()`.
+
+Let me also add `TORCH_CHECK(input.is_cuda(), &quot;input must be CUDA&quot;);` and `TORCH_CHECK(input.is_contiguous(), &quot;input must be contiguous&quot;);` for safety.
+
+Now let me write the full kernel code more carefully.
+
+```cuda
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void fused_instnorm_divide_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float eps, float divide_by)
+{
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int HW = H * W;
+    
+    if (n &gt;= N || c &gt;= C) return;
+    
+    const float* in_ptr = input + (n * C + c) * HW;
+    float* out_ptr = output + (n * C + c) * HW;
+    
+    extern __shared__ float sbuf[];
+    float* buf = sbuf;
+    float* red = sbuf + HW;
+    
+    // __shared__ float red[32]; // Use dynamic instead
+    
+    int nvec = HW / 4;
+    const float4* in4 = reinterpret_cast&lt;const float4*&gt;(in_ptr);
+    float4* buf4 = reinterpret_cast&lt;float4*&gt;(buf);
+    
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        buf4[i] = in4[i];
+    }
+    __syncthreads();
+    
+    float local_sum = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        local_sum += v.x + v.y + v.z + v.w;
+    }
+    
+    // warp reduce
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sum;
+    }
+    __syncthreads();
+    
+    if (tid &lt; 32) {
+        local_sum = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sum / (float)HW;
+        }
+    }
+    __syncthreads();
+    float mean = red[0];
+    
+    float local_sq = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        float d0 = v.x - mean;
+        float d1 = v.y - mean;
+        float d2 = v.z - mean;
+        float d3 = v.w - mean;
+        local_sq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+    }
+    
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sq;
+    }
+    __syncthreads();
+    
+    if (tid &lt; 32) {
+        local_sq = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sq / (float)HW;
+        }
+    }
+    __syncthreads();
+    float var = red[0];
+    
+    float inv_std = rsqrtf(var + eps) / divide_by;
+    
+    float4* out4 = reinterpret_cast&lt;float4*&gt;(out_ptr);
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        v.x = (v.x - mean) * inv_std;
+        v.y = (v.y - mean) * inv_std;
+        v.z = (v.z - mean) * inv_std;
+        v.w = (v.w - mean) * inv_std;
+        out4[i] = v;
+    }
+}
+```
+
+Wait, I need to be careful about `__shfl_down_sync` and divergence. In the cross-warp reduction, `if (tid &lt; 32)` causes divergence within the warp... actually, all threads in warp 0 have tid &lt; 32, so no divergence in warp 0. Warps 1+ don&#x27;t execute this block, which is fine.
+
+One issue: `red` array needs to be at least `nthreads / 32` floats. For 512 threads, that&#x27;s 16 floats. But I defined `red = sbuf + HW`, so it starts after the buffer. There should be enough space.
+
+At launch, I need: `size_t smem_size = HW * sizeof(float) + (nthreads / 32 + 1) * sizeof(float)`. For HW=15876 and nthreads=512: 63504 + 17*4 = 63504 + 68 = 63572 bytes.
+
+Actually, let me allocate `size_t smem_size = HW * sizeof(float) + 32 * sizeof(float)` to be safe.
+
+Another thing: I should check if `input` and `output` pointers are properly aligned for `float4`. As I calculated earlier, `HW * sizeof(float) = 63504` which is divisible by 16. And the tensor start address is aligned to at least 256 bytes. So `(n*C+c)*HW` is always a multiple of 16 bytes due to 63504 being divisible by 16. Wait, is 63504 divisible by 16? 63504 / 16 = 3969. Yes! So all channel starts are 16-byte aligned. Great.
+
+One more potential issue: PyTorch&#x27;s allocator might use different alignment. But for CUDA tensors, the base is typically 512-byte aligned, and 63504 is divisible by 16, so all pointers are 16-byte aligned.
+
+Let me write the Python wrapper now.
+
+Actually, I want to also consider: can we avoid creating the output tensor in the C++ wrapper and instead do an in-place operation? Since we overwrite the output anyway, we could reuse the conv output tensor. But `output = torch::empty_like(input)` is fine.
+
+In PyTorch, `empty_like` is very fast.
+
+OK let me write the complete Python module.
+
+Wait, I should think about one more optimization. The kernel currently uses `blockIdx.x` for N and `blockIdx.y` for C. With N=128, C=128, grid = (128, 128). This gives 16384 blocks. With 512 threads per block and 63KB smem, we fit 3 blocks per SM. H100 has ~132 SMs. So 396 blocks concurrent. Total waves = 16384 / 396 ≈ 41 waves.
+
+But if we reorganize grid to (N*C, 1, 1) = (16384, 1, 1), it&#x27;s the same number of blocks. The difference is in how CUDA hardware schedules them. 2D grids might have different scheduling behavior, but usually it&#x27;s fine.
+
+Actually, for better memory coalescing when reading weights in a conv kernel, 2D grid with x=channel can help. But for our norm kernel, all memory accesses are independent of blockIdx layout. So (128, 128) is fine.
+
+Let me also double check: when we do `for (int i = tid; i &lt; nvec; i += nthreads)`, with nvec=3969 and nthreads=512:
+- Thread 0: 0, 512, 1024, 1536, 2048, 2560, 3072, 3584. That&#x27;s 8 iterations.
+- Thread 1: 1, 513, 1025, ...
+- Within a warp (threads 0-31), they access indices 0-31, 512-543, etc. These are contiguous in memory! So float4 loads within a warp are perfectly coalesced.
+
+Great.
+
+One more thing: in the normalization loop, we read from `buf4[i]` and write to `out4[i]`. If `in_ptr == out_ptr` (in-place), we&#x27;d overwrite the shared memory with output, then read it again... but we don&#x27;t do in-place. We have separate input and output. Wait, actually `out_ptr` points to a NEW tensor, and `buf4` points to shared memory, which is a COPY of input. So reading from `buf4` is fine.
+
+Actually, I don&#x27;t need to write to `out4` from `buf4`. I could write directly from registers:
+```cuda
+float4 v = buf4[i];
+v.x = (v.x - mean) * inv_std;
+...
+out4[i] = v;
+```
+
+This is what I already have. Good.
+
+Let me now write the complete code and try compiling it.
+
+Hmm, I need to be careful about one thing. The `load_inline` function compiles both cpp_sources and cuda_sources. If I use `&lt;torch/extension.h&gt;` in cuda_sources, does it work? Yes, that&#x27;s standard.
+
+But wait, there&#x27;s an issue. The `load_inline` auto-generates a pybind11 module. If I define `fused_instnorm_divide` in `cuda_sources`, the linker should find it. But `cpp_sources` needs the declaration. Or I can put both declaration and definition in `cuda_sources`, and leave `cpp_sources` empty or just with includes. Actually, I think `cpp_sources` just needs to exist (can be empty string) if all code is in `cuda_sources`. But `load_inline` generates bindings based on `functions=[...]`. It generates a `PYBIND11_MODULE` that calls `m.def(&quot;fused_instnorm_divide&quot;, &amp;fused_instnorm_divide, ...)`. This requires `fused_instnorm_divide` to be declared in the C++ compilation unit.
+
+So I need the declaration in `cpp_sources`. 
+
+Let me verify with a standard pattern:
+```python
+load_inline(
+    name=&quot;my_cuda&quot;,
+    cpp_sources=&quot;torch::Tensor my_func(torch::Tensor a);&quot;,
+    cuda_sources=&quot;... implementation including torch::Tensor my_func(torch::Tensor a) { ... }&quot;,
+    functions=[&quot;my_func&quot;]
+)
+```
+
+This should work.
+
+Let me write the final code now.
+
+Actually, I want to make sure the initialization matches PyTorch exactly so that if weights are copied, everything works. I&#x27;ll use `nn.Conv2d` in ModelNew and rely on PyTorch&#x27;s default initialization.
+
+Final ModelNew:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SOURCE = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void fused_instnorm_divide_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float eps, float divide_by)
+{
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int HW = H * W;
+    
+    if (n &gt;= N || c &gt;= C) return;
+    
+    const float* in_ptr = input + ((n * C) + c) * HW;
+    float* out_ptr = output + ((n * C) + c) * HW;
+    
+    extern __shared__ float sbuf[];
+    float* buf = sbuf;
+    float* red = sbuf + HW;
+    
+    int nvec = HW / 4;
+    const float4* in4 = reinterpret_cast&lt;const float4*&gt;(in_ptr);
+    float4* buf4 = reinterpret_cast&lt;float4*&gt;(buf);
+    
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        buf4[i] = in4[i];
+    }
+    __syncthreads();
+    
+    float local_sum = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        local_sum += v.x + v.y + v.z + v.w;
+    }
+    
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sum;
+    }
+    __syncthreads();
+    
+    if (tid &lt; 32) {
+        local_sum = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sum / (float)HW;
+        }
+    }
+    __syncthreads();
+    float mean = red[0];
+    
+    float local_sq = 0.0f;
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        float d0 = v.x - mean;
+        float d1 = v.y - mean;
+        float d2 = v.z - mean;
+        float d3 = v.w - mean;
+        local_sq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+    }
+    
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+    if ((tid &amp; 31) == 0) {
+        red[tid &gt;&gt; 5] = local_sq;
+    }
+    __syncthreads();
+    
+    if (tid &lt; 32) {
+        local_sq = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+        }
+        if (tid == 0) {
+            red[0] = local_sq / (float)HW;
+        }
+    }
+    __syncthreads();
+    float var = red[0];
+    
+    float inv_std = rsqrtf(var + eps) / divide_by;
+    
+    float4* out4 = reinterpret_cast&lt;float4*&gt;(out_ptr);
+    for (int i = tid; i &lt; nvec; i += nthreads) {
+        float4 v = buf4[i];
+        v.x = (v.x - mean) * inv_std;
+        v.y = (v.y - mean) * inv_std;
+        v.z = (v.z - mean) * inv_std;
+        v.w = (v.w - mean) * inv_std;
+        out4[i] = v;
+    }
+}
+
+torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by) {
+    TORCH_CHECK(input.is_cuda(), &quot;input must be a CUDA tensor&quot;);
+    TORCH_CHECK(input.is_contiguous(), &quot;input must be contiguous&quot;);
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32, &quot;input must be float32&quot;);
+    
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+    int HW = H * W;
+    
+    auto output = torch::empty_like(input);
+    
+    dim3 blocks(N, C);
+    dim3 threads(512);
+    size_t smem = HW * sizeof(float) + 32 * sizeof(float);
+    
+    fused_instnorm_divide_kernel&lt;&lt;&lt;blocks, threads, smem&gt;&gt;&gt;(
+        input.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        N, C, H, W, 1e-5f, divide_by);
+    
+    return output;
+}
+&quot;&quot;&quot;
+
+fused_instnorm_divide = load_inline(
+    name=&quot;fused_instnorm_divide&quot;,
+    cpp_sources=&quot;torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by);&quot;,
+    cuda_sources=CUDA_SOURCE,
+    functions=[&quot;fused_instnorm_divide&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.divide_by = divide_by
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = fused_instnorm_divide.fused_instnorm_divide(x, self.divide_by)
+        return x
+```
+
+Wait, `load_inline` returns a module. So the function is accessed as attribute: `fused_instnorm_divide.fused_instnorm_divide(tensor, divide_by)`.
+
+Let me double check: `load_inline` returns &quot;a python module-like object&quot;. Yes, so `module.function_name(...)`.
+
+One concern: the name in `functions` list is `&quot;fused_instnorm_divide&quot;`. The module will have `.fused_instnorm_divide` available.
+
+Another concern: `load_inline` caches by the module name and source code hashes. If I call it every time the module is imported, and `ModelNew` might be instantiated multiple times in the test, the module loading only happens once at import time (since it&#x27;s at module level). But the test uses `exec()` to execute the file. The module-level code runs once. Good.
+
+Wait, I should double check how `exec()` works in the evaluation. It says &quot;The file is executed with `exec()` before we instantiate `ModelNew`&quot;. So all module-level code runs once, including `load_inline`. Good.
+
+Now let me compile this.
+
+Actually, I want to first test compile. Let me generate the kernel code as a string and call `compile_kernel`. Wait, `compile_kernel` expects full Python source. Let me send it.
+
+Let me make sure the code is syntactically valid Python and will compile with nvcc.
+
+One issue: the CUDA string contains triple quotes or special characters? No, I&#x27;m using single quotes for Python strings, and the CUDA string uses double quotes or no conflicts.
+
+Wait, there&#x27;s an issue with the string itself. In Python, if I write `CUDA_SOURCE = &quot;&quot;&quot; ... &quot;&quot;&quot;`, and the CUDA code contains `&quot;&quot;&quot;`, it would break. I need to make sure there are no triple quotes in the CUDA code, or use raw strings or different quote styles.
+
+Looking at my CUDA code, there are no `&quot;&quot;&quot;`. Good.
+
+Another issue: indentation. The multiline string will preserve the indentation. The CUDA compiler shouldn&#x27;t care about leading spaces in the string. Good.
+
+One more thing: `load_inline` might need a `build_directory` or the default temp directory might not be writable. Usually `/tmp` is writable.
+
+Let me also consider using `torch.backends.cudnn.benchmark = True`? No, that&#x27;s a global flag and might affect the reference too. Better not.
+
+OK, I&#x27;ll compile this and see if it works. But first, let me think about whether 512 threads is optimal or if 256 would be better for some reason.
+
+With 512 threads, nvec=3969:
+- Thread 0 processes indices 0, 512, 1024, 1536, 2048, 2560, 3072, 3584 (8 elements)
+- Thread 1 processes indices 1, 513, ...
+- A warp of 32 threads processes indices t, t+512, t+1024, etc. where t=0..31.
+- For each iteration k, the warp accesses indices (k*512 + 0) to (k*512 + 31).
+- These are consecutive in memory! Coalesced. Good.
+
+With 256 threads:
+- Thread 0: 0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840 (16 elements)
+- A warp accesses k*256+0 to k*256+31, also consecutive. Coalesced.
+
+Both are fine. 512 threads gives fewer iterations (8 vs 16), which means less loop overhead and better instruction cache behavior. But 256 threads means more blocks per wave. Since the number of blocks is fixed at 16384, more threads per block means fewer blocks, but we&#x27;re already way over the SM capacity. With 512 threads and 3 blocks per SM, that&#x27;s 1536 threads. With 256 threads and 3 blocks per SM, that&#x27;s 768 threads. 1536 is closer to the max of 2048.
+
+Actually, I just realized: with 63KB shared memory per block, we might fit MORE than 3 blocks per SM on H100. H100 has 227KB shared memory per SM. 227 / 63 = 3.6. So we can fit 3 blocks, not 4. This is the same for both 256 and 512 threads.
+
+For 512 threads * 3 blocks = 1536 threads per SM.
+For 256 threads * 3 blocks = 768 threads per SM.
+
+1536 gives better latency hiding. Let&#x27;s stick with 512.
+
+One caveat: if register usage is high, the compiler might limit blocks per SM. With 512 threads and maybe 50 registers each, that&#x27;s 25K registers per block. 64K / 25K = 2.5, so 2 blocks per SM. Then 512 * 2 = 1024 threads. Still better than 256 * 3 = 768? Actually 1024 &gt; 768, yes.
+
+If register usage is 30 per thread: 512 * 30 = 15360. 64K / 15360 = 4.1, but we&#x27;re limited by shared memory to 3 blocks. So 3 blocks.
+
+I&#x27;ll go with 512.
+
+Let me write the final Python code string and run compile_kernel.
+
+Actually, I want to make sure I handle the `math` module import for Kaiming initialization. Since `nn.Conv2d` does its own initialization, we don&#x27;t need it.
+
+Let me write the complete code.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>I&#x27;ll write a custom CUDA kernel that fuses the InstanceNorm and division operations, while keeping the optimized cuDNN convolution. This saves memory bandwidth by eliminating extra passes over
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_SOURCE = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n__global__ void fused_instnorm_divide_kernel(\n    const float* __restrict__ input,\n    float* __restrict__ output,\n    int N, int C, int H, int W,\n    float eps, float divide_by)\n{\n    int n = blockIdx.x;\n    int c = blockIdx.y;\n    int tid = threadIdx.x;\n    int nthreads = blockDim.x;\n    int HW = H * W;\n    \n    if (n &gt;= N || c &gt;= C) return;\n    \n    const float* in_ptr = input + ((n * C) + c) * HW;\n    float* out_ptr = output + ((n * C) + c) * HW;\n    \n    extern __shared__ float sbuf[];\n    float* buf = sbuf;\n    float* red = sbuf + HW;\n    \n    int nvec = HW / 4;\n    const float4* in4 = reinterpret_cast&lt;const float4*&gt;(in_ptr);\n    float4* buf4 = reinterpret_cast&lt;float4*&gt;(buf);\n    \n    for (int i = tid; i &lt; nvec; i += nthreads) {\n        buf4[i] = in4[i];\n    }\n    __syncthreads();\n    \n    float local_sum = 0.0f;\n    for (int i = tid; i &lt; nvec; i += nthreads) {\n        float4 v = buf4[i];\n        local_sum += v.x + v.y + v.z + v.w;\n    }\n    \n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n    }\n    if ((tid &amp; 31) == 0) {\n        red[tid &gt;&gt; 5] = local_sum;\n    }\n    __syncthreads();\n    \n    if (tid &lt; 32) {\n        local_sum = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);\n        }\n        if (tid == 0) {\n            red[0] = local_sum / (float)HW;\n        }\n    }\n    __syncthreads();\n    float mean = red[0];\n    \n    float local_sq = 0.0f;\n    for (int i = tid; i &lt; nvec; i += nthreads) {\n        float4 v = buf4[i];\n        float d0 = v.x - mean;\n        float d1 = v.y - mean;\n        float d2 = v.z - mean;\n        float d3 = v.w - mean;\n        local_sq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;\n    }\n    \n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);\n    }\n    if ((tid &amp; 31) == 0) {\n        red[tid &gt;&gt; 5] = local_sq;\n    }\n    __syncthreads();\n    \n    if (tid &lt; 32) {\n        local_sq = (tid &lt; (nthreads &gt;&gt; 5)) ? red[tid] : 0.0f;\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);\n        }\n        if (tid == 0) {\n            red[0] = local_sq / (float)HW;\n        }\n    }\n    __syncthreads();\n    float var = red[0];\n    \n    float inv_std = rsqrtf(var + eps) / divide_by;\n    \n    float4* out4 = reinterpret_cast&lt;float4*&gt;(out_ptr);\n    for (int i = tid; i &lt; nvec; i += nthreads) {\n        float4 v = buf4[i];\n        v.x = (v.x - mean) * inv_std;\n        v.y = (v.y - mean) * inv_std;\n        v.z = (v.z - mean) * inv_std;\n        v.w = (v.w - mean) * inv_std;\n        out4[i] = v;\n    }\n}\n\ntorch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by) {\n    TORCH_CHECK(input.is_cuda(), \&quot;input must be a CUDA tensor\&quot;);\n    TORCH_CHECK(input.is_contiguous(), \&quot;input must be contiguous\&quot;);\n    TORCH_CHECK(input.scalar_type() == torch::kFloat32, \&quot;input must be float32\&quot;);\n    \n    int N = input.size(0);\n    int C = input.size(1);\n    int H = input.size(2);\n    int W = input.size(3);\n    int HW = H * W;\n    \n    auto output = torch::empty_like(input);\n    \n    dim3 blocks(N, C);\n    dim3 threads(512);\n    size_t smem = HW * sizeof(float) + 32 * sizeof(float);\n    \n    fused_instnorm_divide_kernel&lt;&lt;&lt;blocks, threads, smem&gt;&gt;&gt;(\n        input.data_ptr&lt;float&gt;(),\n        output.data_ptr&lt;float&gt;(),\n        N, C, H, W, 1e-5f, divide_by);\n    \n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_instnorm_divide = load_inline(\n    name=\&quot;fused_instnorm_divide\&quot;,\n    cpp_sources=\&quot;torch::Tensor fused_instnorm_divide(torch::Tensor input, float divide_by);\&quot;,\n    cuda_sources=CUDA_SOURCE,\n    functions=[\&quot;fused_instnorm_divide\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    \&quot;\&quot;\&quot;\n    Optimized model with fused InstanceNorm + divide kernel.\n    \&quot;\&quot;\&quot;\n    def __init__(self, in_channels, out_channels, kernel_size, divide_by):\n        super(ModelNew, self).__init__()\n        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)\n        self.divide_by = divide_by\n\n    def forward(self, x):\n        x = self.conv(x)\n        x = fused_instnorm_divide.fused_instnorm_divide(x, self.divide_by)\n        return x\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ImportError.
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15&#x27; not found (required by /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_17_cache/k_e50d5c70c950/fused_instnorm_divide/fused_instnorm_divide.so)</div></details></div></details></div>
 </body></html>
