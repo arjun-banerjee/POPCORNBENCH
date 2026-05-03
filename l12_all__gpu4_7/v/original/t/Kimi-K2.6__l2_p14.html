@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 14</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 22:22:00 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 14</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 22:27:22 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">14_Gemm_Divide_Sum_Scaling.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -793,5 +793,746 @@ Device: NVIDIA H100 80GB HBM3
 
 Ridge point (FP32): 20.09 FLOPs/byte
   Kernels with arithmetic intensity below the ridge point are
-  memory-bound; above it they are compute-bound.</div></details></div></div>
+  memory-bound; above it they are compute-bound.</div></details></div><details class="turn-collapse"><summary><b>turn 2</b> · 1 tool call(s) · 97.3s · 37,353 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>llm latency: 97.3s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem:
+
+1. The model does:
+   - `x @ W.T` where x is (batch_size, input_size) = (1024, 8192) and W is (hidden_size, input_size) = (8192, 8192)
+   - Result: (1024, 8192)
+   - Divide by 2
+   - Sum along dim=1: (1024, 1)
+   - Multiply by scaling_factor
+
+The key insight is that we can fuse all operations into a single kernel:
+- Instead of computing the full GEMM then summing, we can compute each output element as:
+  `output[i] = scaling_factor * sum_j((x[i] @ W[j].T) / 2)`
+  `output[i] = (scaling_factor / 2) * sum_j(sum_k(x[i,k] * W[j,k]))`
+  `output[i] = (scaling_factor / 2) * sum_k(x[i,k] * sum_j(W[j,k]))`
+
+Wait, that&#x27;s a key optimization! We can precompute `col_sums = W.sum(dim=0)` which is (input_size,), and then:
+`output[i] = (scaling_factor / 2) * sum_k(x[i,k] * col_sums[k])`
+`output = (scaling_factor / 2) * (x @ col_sums.unsqueeze(1))`
+
+This reduces the GEMM from (1024, 8192) x (8192, 8192) to (1024, 8192) x (8192, 1), which is massively less compute!
+
+Let me verify: the original does:
+1. x @ W.T -&gt; (1024, 8192) where each element is dot product of x[i] and W[j]
+2. Divide by 2
+3. Sum over j -&gt; for each i: sum_j (x[i] · W[j]) / 2 = (1/2) * x[i] · sum_j(W[j])
+
+Yes! Since sum_j(x[i] · W[j]) = x[i] · sum_j(W[j]) by linearity of dot product.
+
+So the optimized form is:
+1. Compute `w_sum = W.sum(dim=0)` -&gt; (8192,)
+2. Compute `output = (scaling_factor / 2) * (x @ w_sum.unsqueeze(1))` -&gt; (1024, 1)
+
+This is a GEMV (matrix-vector multiplication) instead of a GEMM, which is ~8192x less compute!
+
+We can even fuse this further: compute w_sum once (or cache it), then do a single fused kernel for x @ w_sum.
+
+But wait, W is a parameter that could change. We should compute w_sum in __init__ or in forward when needed.
+
+Actually, since W is an nn.Parameter and gradients flow through it, we need to be careful. The original computes the full GEMM, so gradients flow to W through all elements. Our simplification changes the gradient computation!
+
+Let me re-check: 
+- Original forward: y = sum_j(x @ W_j.T) = x @ sum_j(W_j.T) = x @ (sum_j W_j).T
+- Yes, mathematically equivalent!
+
+For backward:
+- Original: dL/dW = x.T @ dL/dy_expanded where dy_expanded is (1024, 8192)
+- But since dy is the same for all j (after sum and scaling), dy_expanded_j = dL/dy * scaling_factor / 2 for all j
+- So dL/dW = x.T @ (dL/dy * scaling_factor / 2 * 1_{8192}) = (scaling_factor / 2) * x.T @ (dL/dy * 1_{8192})
+- This equals (scaling_factor / 2) * (x.T @ dL/dy) * 1_{8192}^T = (scaling_factor / 2) * outer(sum_rows(x.T * dL/dy), 1)
+- Actually: x.T @ (dL/dy * 1_{8192}) where dL/dy is (1024, 1) and 1_{8192} is (8192,), so we get (8192, 8192)
+- Wait no: dL/dy after sum is (1024, 1). In the original, before sum, after scaling, the gradient w.r.t. the GEMM output is (dL/dy * scaling_factor / 2) repeated across 8192 columns. So dL/dGEMM is (1024, 8192) with all columns equal.
+- Then dL/dW = x.T @ dL/dGEMM, which gives (8192, 8192) where each row j is x.T @ (constant column). But all columns are the same, so dL/dW has all rows equal to the same vector? No wait...
+- Actually dL/dW[j] = x[i]^T * c where c is constant. So each row W[j] gets the same gradient.
+- In simplified version: we compute x @ w_sum where w_sum = sum_j W[j]. The gradient w.r.t. w_sum is x.T @ dL/dy. Then dL/dW[j] = dL/dw_sum (same for all j). So yes, gradients are equivalent.
+
+So the mathematical simplification is valid and preserves gradients properly.
+
+Now, implementation:
+- In __init__, we need to store the same constructor arguments
+- We can precompute w_col_sum = weight.sum(dim=0) as a buffer
+- But we need to handle weight updates. If weight is updated by the optimizer, w_col_sum becomes stale.
+- We can compute w_col_sum on the fly in forward, but that&#x27;s an extra kernel launch
+- Better: register a backward hook or just compute it in forward
+
+Actually, for simplicity and correctness with autograd, let me think about how to do this properly.
+
+Option 1: Compute `w_sum = self.weight.sum(dim=0)` in forward, then `x @ w_sum.unsqueeze(1)`. PyTorch autograd will handle this correctly.
+
+Option 2: Use a custom CUDA kernel that does the fused computation.
+
+For speed, the simplification itself is the biggest win. Even using pure PyTorch:
+```python
+def forward(self, x):
+    w_sum = self.weight.sum(dim=0, keepdim=True)  # (1, 8192)
+    out = torch.matmul(x, w_sum.t())  # (1024, 1)
+    return out * (self.scaling_factor / 2)
+```
+
+This is a GEMV of size (1024, 8192) x (8192, 1) instead of GEMM (1024, 8192) x (8192, 8192).
+
+But the problem asks for a custom CUDA kernel. However, the custom kernel would still need to compute `w_sum` first, or we can bake it into the kernel.
+
+Wait, let me think if we can fuse everything into one kernel including computing w_sum on the fly. 
+
+Actually, we can do:
+1. Precompute w_sum once and store it, updating when weight changes. But that&#x27;s complex with autograd.
+2. Or compute w_sum in a separate kernel, then GEMV.
+
+For maximum performance, we want to fuse the entire forward pass. We could write a kernel that:
+1. Loads x row by row
+2. For each element of x, we need the corresponding w_sum element
+3. Compute dot product
+4. Scale
+
+But computing w_sum requires a reduction over all rows of W. We could precompute w_sum on the CPU or in a previous kernel.
+
+Actually, for the custom CUDA kernel, let me check if we can use the mathematical equivalence and just write a fused kernel. The key question is: does the evaluation check gradients? It only says &quot;Replace the forward computation&quot; and &quot;Produce numerically equivalent outputs&quot;. So as long as forward outputs match, the custom kernel is fine.
+
+For autograd compatibility with the custom CUDA kernel, we need to make sure the backward is correct, or better yet, let PyTorch handle it by using torch operations. But if we write a custom kernel, we need to define backward.
+
+Wait, actually, the simplest approach is to not write a custom CUDA kernel at all but use the mathematical optimization in pure PyTorch. But the task says &quot;Write a custom CUDA kernel&quot;. However, if the mathematical optimization itself gives a huge speedup, that&#x27;s valid.
+
+Let me re-read: &quot;Write a custom CUDA kernel that replaces a PyTorch reference, producing numerically equivalent output faster than the reference.&quot;
+
+So I do need a custom CUDA kernel. But I can also apply the mathematical optimization.
+
+Here&#x27;s my plan:
+1. Mathematical simplification: output = (scaling_factor / 2) * x @ W.sum(dim=0)
+2. Implement this as a custom fused CUDA kernel that computes w_sum on the fly or precomputes it.
+
+For best performance, I&#x27;ll:
+1. Precompute col_sums = W.sum(dim=0) as a buffer
+2. Write a custom kernel that does the GEMV + scaling in one kernel
+
+But I need to handle weight updates. Actually, looking at the reference model, the weight is an nn.Parameter. In typical inference or training, weight can change. 
+
+For simplicity in a custom CUDA kernel context, let me write a kernel that:
+- First computes w_sum from W (via a parallel reduction or using cuBLAS/cuDNN via PyTorch)
+- Then computes the fused GEMV + scale
+
+Actually, I can just use two PyTorch ops for w_sum and then a custom kernel for the GEMV+scale. Or I can compute w_sum in the same custom kernel.
+
+Let me think about a fused kernel approach:
+- Grid: (batch_size,) blocks, each handling one output element
+- Each block computes: `out[i] = (scaling_factor / 2) * sum_k(x[i, k] * sum_j(W[j, k]))`
+- But this requires loading all of W to compute sum_j(W[j, k]) for each k, which is very memory-intensive if done per block.
+
+Better approach:
+- Step 1: Launch a kernel to compute w_sum (reduction over dim 0 of W)
+- Step 2: Launch a kernel to compute GEMV with scaling
+
+Or even simpler:
+- Use PyTorch&#x27;s built-in sum for step 1
+- Use a custom kernel for step 2
+
+But actually, for a single evaluation, we can precompute w_sum and store it. Let me check if there&#x27;s a clean way...
+
+Actually, I realize I don&#x27;t need to worry too much about weight updates during backprop if I compute w_sum from weight each forward pass using PyTorch ops - the overhead of sum is tiny compared to the GEMM we&#x27;re saving.
+
+Let me write a custom CUDA kernel that does a fused GEMV + scale. The kernel takes x (B, M), w_sum (M,), scaling_factor, and computes output (B, 1) = x @ w_sum * (scaling_factor / 2).
+
+For the kernel, I&#x27;ll use shared memory to load tiles of x and w_sum for coalesced access.
+
+Wait, but w_sum is only 8192 elements. Each thread block can handle multiple rows of x. Let me think about tile sizes.
+
+B = 1024, M = 8192
+Output is 1024 elements.
+
+Kernel design:
+- Each thread block computes a subset of output elements
+- Each thread handles one or more rows of x
+- For each row, the thread loads elements of x and multiplies by corresponding w_sum elements, accumulating
+
+Actually, this is basically a dot product per output element. Since w_sum is shared across all output elements, we can:
+- Load w_sum into shared memory (8192 floats = 32KB, fits easily)
+- Each thread/block computes dot product of x[i] with w_sum
+
+Let me design it:
+- Block size: 256 threads
+- Grid: enough blocks to cover all rows
+- Each thread computes 1 or more rows
+- Within each row, threads can cooperate for reduction (but with only 8192 elements, maybe one thread per row is fine if we have enough rows)
+
+With 1024 rows and 256 threads per block, we need 4 blocks. Each block handles 256 rows, each thread handles 1 row.
+
+For each row, a thread does 8192 multiply-adds sequentially. This might not be optimal for memory coalescing since consecutive threads access offset elements.
+
+Better: 
+- Use 256 threads per block
+- Each thread block handles a subset of rows
+- For each chunk of columns (say 256 elements at a time), load x and w_sum into shared memory, then threads do parallel reduction across threads for each row
+
+Actually, let me think more carefully. With 1024 rows and we want to use the GPU fully.
+
+Option A: One thread per row, sequential dot product
+- 1024 threads total (4 blocks x 256 threads)
+- Each thread reads 8192 floats from x (row-major, so contiguous) and 8192 floats from w_sum (same for all threads)
+- x reads are coalesced (consecutive threads read consecutive rows, so thread i reads x[i*8192 + k])
+- w_sum reads are broadcast from L1 cache (since all threads read same address)
+- Should be pretty good!
+
+Option B: Cooperative approach with more parallelism
+- Use more threads, each handling partial dot products
+- E.g., 1024 threads per block, 1024 blocks, but we only have 1024 rows...
+- Could have each block handle 1 row with 1024 threads, each doing 8 multiply-adds, then reduce
+
+Option B might be better for memory bandwidth utilization since we use more threads. Let me think...
+
+For 1024 rows, if we use 1024 threads per block and 1 block per row:
+- Total threads: 1024 * 1024 = 1M threads, which is good for GPU occupancy
+- Each thread does 8192/1024 = 8 multiplies
+- Then warp shuffle reduction
+
+This is very parallel and should utilize the GPU well.
+
+Let me write the kernel:
+
+```cuda
+__global__ void fused_gemv_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w_sum,
+    float* __restrict__ out,
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockDim_x = blockDim.x;  // should be 1024 or 256
+    
+    if (row &gt;= batch_size) return;
+    
+    float sum = 0.0f;
+    for (int col = tid; col &lt; input_size; col += blockDim_x) {
+        sum += x[row * input_size + col] * w_sum[col];
+    }
+    
+    // Warp reduction
+    for (int offset = blockDim_x / 2; offset &gt; 0; offset /= 2) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    }
+    
+    if (tid == 0) {
+        out[row] = sum * scale;
+    }
+}
+```
+
+Wait, we need to be careful: if `blockDim_x &gt; 32`, we can&#x27;t do cross-warp shuffle. We need either:
+- Multiple warp reductions then shared memory reduction, OR
+- Use a shared memory array
+
+With blockDim.x = 1024, that&#x27;s 32 warps. We need shared memory for inter-warp reduction.
+
+```cuda
+__global__ void fused_gemv_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w_sum,
+    float* __restrict__ out,
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (row &gt;= batch_size) return;
+    
+    float sum = 0.0f;
+    for (int col = tid; col &lt; input_size; col += blockDim.x) {
+        sum += x[row * input_size + col] * w_sum[col];
+    }
+    
+    shared[tid] = sum;
+    __syncthreads();
+    
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        out[row] = shared[0] * scale;
+    }
+}
+```
+
+With blockDim.x = 1024, shared memory per block = 4KB. Very small.
+
+Grid = (batch_size,) = (1024,) blocks. Total threads = 1024 * 1024 = 1,048,576. On H100 with 132 SMs (actually need to check), each SM can run up to 2048 threads, so total capacity is ~270K threads. We&#x27;d have about 4 waves of blocks, which is fine.
+
+Actually, we can optimize this further. Instead of 1 block per row, let&#x27;s do fewer blocks with more rows per block, or multiple blocks per row. But 1024 blocks of 1024 threads each should work well.
+
+Wait, I just realized: we need to handle the case where weight changes. For a custom autograd Function, we need to define forward and backward.
+
+Or, we can avoid writing a custom autograd Function and just use the kernel directly if we don&#x27;t need gradients for the evaluation. But typically we do need correct gradients.
+
+Actually, looking at the problem again, it says &quot;Replace the forward computation&quot;. It doesn&#x27;t explicitly say we need to support backprop, but it&#x27;s good practice and the evaluation might check it.
+
+Let me write a custom autograd Function that:
+1. In forward: computes w_sum, calls the custom kernel, saves what we need for backward
+2. In backward: computes gradients
+
+For backward:
+- Given grad_output (B, 1), we need:
+  - grad_x = grad_output @ w_sum.T -&gt; (B, M) = grad_output * w_sum.T
+  - grad_w_sum = x.T @ grad_output -&gt; (M, 1)
+  - Since w_sum = W.sum(dim=0), grad_W[j] = grad_w_sum for all j
+  - So grad_W = grad_w_sum.unsqueeze(0).expand(H, M)
+
+Wait, but in the original, `weight` is (H, M). If we only use w_sum in forward, we need grad_W to have shape (H, M).
+
+In our simplified forward:
+```
+w_sum = weight.sum(dim=0)  # (M,)
+out = (scale_factor / 2) * x @ w_sum.unsqueeze(1)  # (B, 1)
+```
+
+Backward:
+- grad_w_sum = x.T @ grad_out  # (M, 1)
+- grad_W = grad_w_sum.unsqueeze(0).expand(H, M)  # (H, M) - same gradient for all rows
+
+This is correct and equivalent to the original&#x27;s backward.
+
+Let me write a complete solution with custom autograd Function.
+
+Actually, I want to think more carefully about thread configuration. 
+
+For the GEMV kernel:
+- Input: x (1024, 8192), w_sum (8192,), output (1024, 1)
+- We want to maximize memory bandwidth utilization.
+
+The memory access pattern for x:
+- Each block reads one row: 8192 floats = 32KB
+- With 1024 blocks, total x read = 32MB
+- w_sum is read by all blocks: 32KB, cached in L1/L2
+
+Total memory traffic: ~32MB reads + 4KB writes = ~32MB
+At 2.5 TB/s, this should take about 12 microseconds.
+
+But wait, the original GEMM reads:
+- x: 1024 * 8192 = 8MB
+- W: 8192 * 8192 = 64MB
+- Writes: 1024 * 8192 = 8MB
+Total: ~80MB
+
+For the simplified version, we also need to read W once to compute w_sum:
+- W: 64MB read
+- x: 8MB read
+- writes: 4KB
+Total: ~72MB read
+
+Hmm, so total memory traffic is similar. But the original GEMM uses tensor cores and is much more compute-intensive, so it&#x27;s likely compute-bound and well-optimized by cuBLAS. Our simplified version is purely memory-bound.
+
+Wait, but cuBLAS GEMM (1024, 8192) x (8192, 8192) at fp32:
+- FLOPs: 2 * 1024 * 8192 * 8192 = 137 GFLOPs
+- At 52 TFLOPS, compute time = 2.6 ms
+- At 2.5 TB/s bandwidth for 80MB, memory time = 32 microseconds
+
+So GEMM is compute-bound (2.6 ms &gt;&gt; 32 us), and cuBLAS is very efficient.
+
+Our simplified GEMV:
+- FLOPs: 2 * 1024 * 8192 = 16.7 MFLOPs
+- Memory: ~72MB
+- At 2.5 TB/s: 28.8 us
+- At 52 TFLOPS: 0.3 us
+
+So our kernel is memory-bound, and should run in ~30 microseconds.
+
+But the original GEMM takes ~2.6ms. That&#x27;s a HUGE speedup!
+
+Wait, that can&#x27;t be right. cuBLAS GEMM (1024, 8192) x (8192, 8192) is much faster than 2.6ms on H100. Let me recalculate.
+
+Actually, H100 does 67 TFLOPS fp32. And with tensor cores (TF32), it&#x27;s much faster. The cuBLAS GEMM of these sizes probably takes around 0.5-1ms. Still, our memory-bound kernel at ~30us would be 15-30x faster.
+
+Let me check: for a well-optimized GEMM of size (1024, 8192, 8192), I can lookup typical performance. On A100, a similar GEMM might take ~0.1-0.2ms with TF32 tensor cores. On H100, maybe 0.05-0.1ms.
+
+If original takes ~0.1ms (100us) and our kernel takes ~30us, that&#x27;s only a 3x speedup. But wait, the original also does divide, sum, and scale. The sum alone across 8192 elements per row for 1024 rows = 8M elements, which is another kernel launch.
+
+Actually, the reference in PyTorch probably fuses some of these operations. Let me think...
+
+In PyTorch, `x = torch.matmul(x, self.weight.T)` creates a tensor
+`x = x / 2` is probably fused into the GEMM if using TF32 or not
+`x = torch.sum(x, dim=1, keepdim=True)` is a reduction
+`x = x * self.scaling_factor` might be fused with sum
+
+So the reference might involve 2-4 kernel launches.
+
+Our optimized version uses:
+1. `w_sum = self.weight.sum(dim=0)` - one reduction kernel
+2. `out = x @ w_sum.unsqueeze(1)` - one GEMV 
+3. `out * scale` - maybe fused
+
+If we write a custom kernel that fuses everything, or at least fuses the GEMV and scale, we&#x27;d have:
+1. w_sum computation (one kernel)
+2. Fused GEMV+scale (one kernel)
+
+Total 2 kernels.
+
+But can we make it even faster? For instance, can we avoid reading W at all by precomputing w_sum?
+
+If we precompute w_sum in `__init__`, then we don&#x27;t need to read W during forward at all. But we need to update w_sum when W is updated.
+
+One trick: compute w_sum in `__init__` and update it in a pre_forward_hook or similar. But that might be fragile.
+
+Another approach: just compute w_sum lazily and cache it. Since the evaluation might only call forward once, caching doesn&#x27;t help.
+
+Let me write a kernel that computes w_sum on the fly... no, that&#x27;s expensive because all blocks need all of W.
+
+Best approach: Use PyTorch sum for w_sum, then a custom fused GEMV+scale kernel.
+
+Let me implement this and test.
+
+Actually, I realize I should check if cuBLAS GEMV is faster than a custom kernel. torch.matmul(x, w_sum.unsqueeze(1)) where x is (1024, 8192) and w_sum is (8192, 1) uses cuBLAS GEMV. This is very well optimized.
+
+If I just do:
+```python
+def forward(self, x):
+    w_sum = self.weight.sum(dim=0, keepdim=True)
+    return torch.matmul(x, w_sum.t()) * (self.scaling_factor / 2)
+```
+
+This is pure PyTorch, no custom kernel. But the task asks for a custom CUDA kernel.
+
+I could still write a custom CUDA kernel for the GEMV+scale part to show a &quot;custom kernel&quot;, even if the main speedup comes from the algorithmic optimization.
+
+Let me write a custom kernel and see how it performs.
+
+Wait, I just realized: can I precompute the sum and store it, and then handle updates?
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+        self.register_buffer(&#x27;w_sum&#x27;, self.weight.sum(dim=0).detach())
+        
+    def forward(self, x):
+        # Update w_sum if weight changed
+        if self.weight.requires_grad or True:
+            self.w_sum = self.weight.sum(dim=0)
+        return torch.matmul(x, self.w_sum.unsqueeze(1)) * (self.scaling_factor / 2)
+```
+
+Self-updating during forward is fine but adds overhead. Maybe we can just compute it once and hope weight doesn&#x27;t change? No, during training it would.
+
+For the evaluation, they probably call forward once after initialization. So if I compute w_sum in __init__ and use it, the forward is just one GEMV.
+
+But actually, let me look at the evaluation setup. They create ModelNew, then call forward with inputs from get_inputs(). They might also check gradients.
+
+For correctness, I want the gradients to be correct. If I precompute w_sum and detach it, gradients won&#x27;t flow to weight properly.
+
+So I must compute w_sum in forward with autograd tracking. I can use torch.sum or a custom reduction kernel.
+
+Let me write a full custom kernel approach using torch.autograd.Function:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+__global__ void gemv_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w_sum,
+    float* __restrict__ out,
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    if (row &gt;= batch_size) return;
+    
+    float sum = 0.0f;
+    const float* x_row = x + row * input_size;
+    
+    for (int col = tid; col &lt; input_size; col += block_size) {
+        sum += x_row[col] * w_sum[col];
+    }
+    
+    shared[tid] = sum;
+    __syncthreads();
+    
+    for (int s = block_size / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        out[row] = shared[0] * scale;
+    }
+}
+
+torch::Tensor fused_gemv_scale(torch::Tensor x, torch::Tensor w_sum, float scale) {
+    int batch_size = x.size(0);
+    int input_size = x.size(1);
+    
+    auto out = torch::empty({batch_size, 1}, x.options());
+    
+    int threads = 1024;
+    int blocks = batch_size;
+    size_t shared_mem = threads * sizeof(float);
+    
+    gemv_scale_kernel&lt;&lt;&lt;blocks, threads, shared_mem&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        w_sum.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        batch_size,
+        input_size,
+        scale
+    );
+    
+    return out;
+}
+&quot;&quot;&quot;
+
+cpp_source = &quot;&quot;&quot;
+torch::Tensor fused_gemv_scale(torch::Tensor x, torch::Tensor w_sum, float scale);
+&quot;&quot;&quot;
+
+# Using load_inline
+fused_ops = load_inline(
+    name=&#x27;fused_gemv_scale&#x27;,
+    cpp_sources=[cpp_source],
+    cuda_sources=[cuda_source],
+    functions=[&#x27;fused_gemv_scale&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False,
+)
+
+class FusedGemvScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, scale):
+        w_sum = weight.sum(dim=0)
+        ctx.save_for_backward(x, weight)
+        ctx.scale = scale
+        return fused_ops.fused_gemv_scale(x, w_sum, scale)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        scale = ctx.scale
+        w_sum = weight.sum(dim=0)
+        
+        # grad_x = grad_output * w_sum^T * scale
+        grad_x = torch.matmul(grad_output, w_sum.unsqueeze(0)) * scale
+        
+        # grad_w_sum = x^T @ grad_output
+        grad_w_sum = torch.matmul(x.t(), grad_output).squeeze() * scale
+        
+        # grad_weight: each row gets grad_w_sum
+        grad_weight = grad_w_sum.unsqueeze(0).expand_as(weight)
+        
+        return grad_x, grad_weight, None
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+        
+    def forward(self, x):
+        return FusedGemvScale.apply(x, self.weight, self.scaling_factor / 2.0)
+```
+
+Wait, I need to double-check the backward pass.
+
+Forward: `out = scale * (x @ w_sum)` where `w_sum = sum_j weight[j]`
+
+In matrix form: `out = scale * X * w_sum` where X is (B, M), w_sum is (M, 1), out is (B, 1)
+
+`dL/dX = dL/dout * w_sum^T * scale` = (B, 1) @ (1, M) * scale = (B, M) * scale
+
+`dL/dw_sum = X^T * dL/dout * scale` = (M, B) @ (B, 1) * scale = (M, 1) * scale
+
+Since `w_sum = sum_j weight[j]` (sum over dim 0), we have `dL/dweight[j] = dL/dw_sum` for all j.
+
+So `grad_weight = dL/dw_sum.unsqueeze(0).expand(H, M)`
+
+This is correct.
+
+Now, in the backward function:
+```python
+grad_x = grad_output @ w_sum.unsqueeze(0) * scale
+# grad_output is (B, 1), w_sum.unsqueeze(0) is (1, M)
+# Result: (B, M)
+
+grad_w_sum = x.t() @ grad_output * scale
+# x.t() is (M, B), grad_output is (B, 1)
+# Result: (M, 1)
+# Then we squeeze to (M,) and unsqueeze to (1, M) and expand to (H, M)
+```
+
+Wait, I made an error. Let me write it more carefully:
+
+```python
+grad_w_sum = torch.matmul(x.t(), grad_output).squeeze() * scale  # (M,)
+grad_weight = grad_w_sum.unsqueeze(0).expand_as(weight)  # (H, M)
+```
+
+Yes, that&#x27;s correct.
+
+But I realize I should also consider: since `w_sum = weight.sum(dim=0)` and we compute it in forward, autograd on `w_sum = weight.sum(dim=0)` would give `grad_weight[j] = grad_w_sum` for all j automatically if we use PyTorch ops.
+
+But in my custom backward, I compute w_sum manually and expand. That&#x27;s fine.
+
+However, there&#x27;s another subtlety: computing `w_sum = weight.sum(dim=0)` in backward requires reading all of weight again. But for the tiny overhead of a single evaluation, it&#x27;s fine.
+
+Actually, wait. If I write a custom autograd function, I need to make sure `fused_gemv_scale` handles the tensors correctly. The tensors might not be contiguous, or might be on CPU. But in the evaluation, they should be contiguous CUDA tensors.
+
+Let me also think about whether I should compute w_sum in the CUDA kernel directly to save a launch. If I load weight into the kernel and compute w_sum per block, that&#x27;s wasteful. Better to use PyTorch&#x27;s sum which is optimized.
+
+But actually, there&#x27;s a much simpler approach: I can just write the mathematical simplification in pure PyTorch without any custom CUDA kernel. The task says to use a custom CUDA kernel, but maybe they just want the ModelNew class with optimized forward.
+
+Let me re-read: &quot;Write a custom CUDA kernel that replaces a PyTorch reference... Use torch.utils.cpp_extension.load_inline to compile and bind CUDA source at module load time, then call the compiled extension from ModelNew.forward.&quot;
+
+OK so I do need a custom CUDA kernel. Let me finalize my approach.
+
+One more thought: can I fuse the w_sum computation into the same kernel launch? I could compute w_sum first in shared memory, then use it for the GEMV. But each block would need to compute w_sum redundantly, reading all of weight. That would be very wasteful.
+
+Alternative: have the kernel first compute w_sum using atomics, then do GEMV. But this requires global synchronization between the two phases, which is hard without separate kernels.
+
+So I&#x27;ll stick with two steps:
+1. PyTorch sum for w_sum
+2. Custom CUDA kernel for GEMV+scale
+
+Let me optimize the kernel further. Since w_sum is only 8192 elements, I can load it into shared memory once per block, or rely on L2 cache.
+
+Actually, for 1024 blocks each reading 8192 floats from w_sum = 32MB of reads. But they&#x27;re all reading the same data. The L2 cache on H100 is 50MB, so w_sum (32KB) easily fits and stays cached. After the first few blocks read it, all subsequent blocks get L2 hits.
+
+For x, each block reads one row = 32KB. With 1024 rows = 32MB total. This is also well within L2 cache (50MB), so blocks running later might get L2 hits on x rows that were loaded earlier. But x rows are only 32KB each, so unless two blocks on the same SM run consecutively and the L2 cache holds the row, they won&#x27;t benefit much.
+
+Actually, 1024 blocks each reading different rows = 32MB total x reads. The L2 cache is 50MB, so the entire x matrix fits in L2! That means the second wave of blocks will get L2 hits on x. But wait, the kernel writes to output too. Total working set = x (32MB) + w_sum (32KB) + out (4KB) = ~32MB. This easily fits in L2!
+
+So our kernel is essentially L2-bound, not DRAM-bound. At 834 GB/s L2 bandwidth, 32MB takes 38 microseconds. Much better than DRAM.
+
+But let me also think about instruction throughput. Each thread does 8192/1024 = 8 FMAs. With 1M threads, total FMAs = 8M. At 52 TFLOPS, that&#x27;s 0.15 microseconds. So definitely memory-bound.
+
+The main bottleneck is coalesced memory access. Each thread in a block reads elements at stride 1024 within the row. Since threads in a warp read consecutive elements (thread 0 reads col 0, thread 1 reads col 1, ..., thread 31 reads col 31), this is perfectly coalesced! Then in the next iteration, thread 0 reads col 1024, thread 1 reads col 1025, etc. Also perfectly coalesced.
+
+So memory access is optimal.
+
+One more optimization: I can use `float4` loads to read 4 floats at a time. But with input_size=8192 and blockDim=1024, each thread does exactly 8 iterations. Using float4 would reduce to 2 iterations. This could help.
+
+Let me write a float4 version:
+
+```cuda
+__global__ void gemv_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w_sum,
+    float* __restrict__ out,
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    extern __shared__ float shared[];
+    
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    if (row &gt;= batch_size) return;
+    
+    float sum = 0.0f;
+    const float4* x_row4 = (const float4*)(x + row * input_size);
+    const float4* w_sum4 = (const float4*)w_sum;
+    
+    int num_float4 = input_size / 4;
+    
+    for (int i = tid; i &lt; num_float4; i += block_size) {
+        float4 xv = x_row4[i];
+        float4 wv = w_sum4[i];
+        sum += xv.x * wv.x;
+        sum += xv.y * wv.y;
+        sum += xv.z * wv.z;
+        sum += xv.w * wv.w;
+    }
+    
+    shared[tid] = sum;
+    __syncthreads();
+    
+    for (int s = block_size / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        out[row] = shared[0] * scale;
+    }
+}
+```
+
+With input_size=8192, num_float4=2048. Each thread processes 2048/1024 = 2 float4s = 8 floats. Same amount of work, but fewer memory instructions.
+
+However, we need to ensure the pointers are aligned. PyTorch tensors are typically 256-byte aligned, so x + row * 8192 should be 256-byte aligned (since 8192 is a multiple of... well, 8192 * 4 = 32768 bytes, and 32768 % 256 = 0, so yes, each row is 256-byte aligned). w_sum is also aligned. So float4 should work.
+
+Actually, I should verify: PyTorch allocates tensors with alignment at least 256 bytes for GPU tensors. And the row stride is 8192 floats = 32768 bytes, which is 256-byte aligned. So float4 loads are safe.
+
+Let me also consider using half the threads per block but having each thread do more work. Or increasing blocks per row. But 1024 threads per block and 1024 blocks seems like a good configuration.
+
+Actually, with 1024 blocks of 1024 threads = 1,048,576 threads. On H100 with 132 SMs, and maximum 2048 threads per SM, we have 132 * 2048 = 270,336 concurrent threads. So we need about 4 waves. That&#x27;s fine.
+
+But maybe we can reduce block size to 256 and have each thread do more work. 1024 blocks * 256 threads = 262,144 threads, which is almost exactly the concurrency limit. This might be better because:
+1. Less shared memory (1KB vs 4KB per block)
+2. More blocks per SM (32 max)
+3. Each thread does 32 FMAs instead of 8, which might amortize overhead better
+
+Let me try block size 256:
+```cuda
+__global__ void gemv_scale_kernel(...) {
+    ...
+    int block_size = 256;
+    for (int col = tid; col &lt; input_size; col += block_size) {
+        sum += x_row[col] * w_sum[col];
+    }
+    ...
+}
+```
+
+With 256 threads, each thread does 32 iterations. 1024 blocks total.
+
+Actually, I think 256 threads might be better occupancy. With 1024 threads per block and max 2048 threads per SM on H100, we can have at most 2 blocks per SM. With 256 threads, we can have up to 8 blocks per SM (limited by 32 blocks per SM max on H100, but also limited by 2048 threads / 256 = 8 blocks).
+
+More blocks per SM means better latency hiding. So 256 threads per block might be better.
+
+But we have 1024 blocks total and 132 SMs. With 8 blocks per SM max, total concurrent blocks = 1056, which is slightly more than 1024. So all blocks can run concurrently across SMs, with some SMs running 8 blocks and others 7.
+
+Wait, 132 * 8 = 1056 &gt; 1024, so yes, we can fit all blocks. But we&#x27;re limited by thread capacity: 132 * 2048 = 270,336 threads. 1024 * 256 = 262,144 threads. This is just under the limit!
+
+So with 256 threads per block, we can fit almost all threads concurrently. This is great! We essentially have enough parallelism to fill the entire GPU with one wave.
+
+Let me use 256 threads.
+
+For the float4 version with 256 threads:
+- num_float4 = 2048
+- Each thread processes 2048 / 256 = 8 float4s = 32 floats
+- Total threads = 1024 * 256 = 262,144
+- This is perfect
+
+Let me write both versions and test.
+
+Actually, let me compile a simple version first and test correctness.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n__global__ void gemv_scale_kernel(\n    const float* __restrict__ x,\n    const float* __restrict__ w_sum,\n    float* __restrict__ out,\n    int batch_size,\n    int input_size,\n    float scale\n) {\n    extern __shared__ float shared[];\n    \n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    int block_size = blockDim.x;\n    \n    if (row &gt;= batch_size) return;\n    \n    float sum = 0.0f;\n    const float* x_row = x + row * input_size;\n    \n    for (int col = tid; col &lt; input_size; col += block_size) {\n        sum += x_row[col] * w_sum[col];\n    }\n    \n    shared[tid] = sum;\n    __syncthreads();\n    \n    for (int s = block_size / 2; s &gt; 0; s &gt;&gt;= 1) {\n        if (tid &lt; s) {\n            shared[tid] += shared[tid + s];\n        }\n        __syncthreads();\n    }\n    \n    if (tid == 0) {\n        out[row] = shared[0] * scale;\n    }\n}\n\ntorch::Tensor fused_gemv_scale(torch::Tensor x, torch::Tensor w_sum, float scale) {\n    int batch_size = x.size(0);\n    int input_size = x.size(1);\n    \n    auto out = torch::empty({batch_size, 1}, x.options());\n    \n    int threads = 256;\n    int blocks = batch_size;\n    size_t shared_mem = threads * sizeof(float);\n    \n    gemv_scale_kernel&lt;&lt;&lt;blocks, threads, shared_mem&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        w_sum.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        batch_size,\n        input_size,\n        scale\n    );\n    \n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_source = \&quot;\&quot;\&quot;\ntorch::Tensor fused_gemv_scale(torch::Tensor x, torch::Tensor w_sum, float scale);\n\&quot;\&quot;\&quot;\n\nfused_ops = load_inline(\n    name=&#x27;fused_gemv_scale&#x27;,\n    cpp_sources=[cpp_source],\n    cuda_sources=[cuda_source],\n    functions=[&#x27;fused_gemv_scale&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False,\n)\n\nclass FusedGemvScale(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, x, weight, scale):\n        w_sum = weight.sum(dim=0)\n        ctx.save_for_backward(x, weight)\n        ctx.scale = scale\n        return fused_ops.fused_gemv_scale(x, w_sum, scale)\n    \n    @staticmethod\n    def backward(ctx, grad_output):\n        x, weight = ctx.saved_tensors\n        scale = ctx.scale\n        w_sum = weight.sum(dim=0)\n        \n        grad_x = torch.matmul(grad_output, w_sum.unsqueeze(0)) * scale\n        grad_w_sum = torch.matmul(x.t(), grad_output).squeeze() * scale\n        grad_weight = grad_w_sum.unsqueeze(0).expand_as(weight)\n        \n        return grad_x, grad_weight, None\n\nclass ModelNew(nn.Module):\n    def __init__(self, input_size, hidden_size, scaling_factor):\n        super(ModelNew, self).__init__()\n        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))\n        self.scaling_factor = scaling_factor\n        \n    def forward(self, x):\n        return FusedGemvScale.apply(x, self.weight, self.scaling_factor / 2.0)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
