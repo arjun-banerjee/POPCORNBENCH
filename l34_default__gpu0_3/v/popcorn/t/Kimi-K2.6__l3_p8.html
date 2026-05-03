@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 8</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:42:35 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 8</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:47:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">8_EvoformerBlock.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 8</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 8</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -1044,5 +1044,3923 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 323.9s · 192,550 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 323.9s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the model structure and plan a fused CUDA kernel.
+
+The model is:
+1. MSARowSelfAttention(msa_dim=64, num_heads=4)
+   - LayerNorm(msa_dim)
+   - Linear(msa_dim-&gt;msa_dim, bias=False) for q, k, v
+   - reshape q,k,v: (B,S,N,h,d) -&gt; permute(0,1,3,2,4): (B,S,h,N,d)
+   - q @ k.T / sqrt(d) -&gt; (B,S,h,N,N)
+   - softmax
+   - (attn @ v) -&gt; permute(0,1,3,2,4) -&gt; reshape -&gt; (B,S,N,D)
+   - Linear(D-&gt;D)
+   - Residual: msa = msa + output
+
+2. OuterProductMeanSmall(msa_dim=64, pair_dim=64, hidden=32)
+   - LayerNorm(msa_dim)
+   - Linear(msa_dim-&gt;hidden) for a, b
+   - einsum(&quot;bsih,bsjk-&gt;bijhk&quot;, a, b)
+   - divide by S
+   - Linear(hidden*hidden -&gt; pair_dim)
+   - Residual: pair = pair + output
+
+3. TriMulOut(pair_dim=64, hidden=32)
+   - LayerNorm(pair_dim)
+   - Linear(pair_dim-&gt;hidden) for pa, pb, ga, gb
+   - a = pa * sigmoid(ga), b = pb * sigmoid(gb)
+   - einsum(&quot;bikh,bjkh-&gt;bijh&quot;, a, b)
+   - LayerNorm(hidden) + Linear(hidden -&gt; pair_dim)
+   - out2 = sigmoid(gate_out(pair)) * out
+   - Residual: pair = pair + out2
+
+So operations for MSA:
+- Input msa: (B, S, N, D=64)
+- MSA attention with small dimensions
+- OPM: reduces MSA along S dimension to produce pair update
+
+For Pair:
+- OPM adds to pair
+- TriMulOut operates on pair
+
+We can potentially fuse the entire forward pass into one or a few kernels.
+
+Dimensions:
+- B = 2
+- S = 8
+- N = 32
+- D_msa = 64
+- D_pair = 64
+- num_heads = 4, head_dim = 16
+- tri_hidden = 32
+- opm_hidden = 32
+
+Since N=32 is small but S=8 is also small, and D=64 is small, these are very small tensor operations.
+
+PyTorch overhead for many small operations will dominate. The best approach is to fuse as much as possible into a single kernel.
+
+Let me think about what can be fused:
+
+For MSA attention:
+1. LayerNorm on input
+2. Q, K, V projections together
+3. Q*K^T / scale
+4. Softmax
+5. Attn*V
+6. Output projection
+7. Add residual
+
+For OPM:
+1. We need LayerNorm on msa (same as attention input, but different parameters) - wait, actually it uses the UPDATED msa_repr. So OPM takes msa_repr (after residual).
+   - LayerNorm(msa)
+   - Linear to hidden for a and b
+   - outer product mean over S
+   - Linear to pair_dim
+   - add residual to pair
+
+For TriMulOut:
+1. Takes pair (after OPM residual)
+2. LayerNorm(pair)
+3. 4 Linear projections
+4. a = pa * sigmoid(ga), b = pb * sigmoid(gb)
+5. einsum &quot;bikh,bjkh-&gt;bijh&quot;
+6. LayerNorm + Linear
+7. gate = sigmoid(gate_out(pair))
+8. output = gate * o
+9. add residual
+
+Given that all dimensions are small, we could potentially write:
+- Kernel 1: MSA attention + produce a,b for OPM (but OPM uses updated msa, so we need to do attention first, then OPM)
+- Actually, OPM uses msa_repr AFTER the attention residual. So it&#x27;s a sequential dependency.
+
+Wait, but attention produces msa_repr_new = msa_repr + attn_out.
+Then OPM uses msa_repr_new to produce pair update.
+Then TriMul uses pair + opm_out.
+
+So we have sequential dependencies. But each step is small.
+
+The most important thing is to minimize kernel launch overhead. We can:
+- Fuse MSARowSelfAttention into one kernel
+- Fuse OuterProductMean into one kernel  
+- Fuse TriMulOut into one kernel
+
+Each of these small operations launching many kernels is very expensive on GPU.
+
+Let&#x27;s think about MSA attention fuse:
+Input: msa (B, S, N, D)
+Weights: q_weight, k_weight, v_weight (D, D), out_weight (D, D), out_bias (D)
+LM weights: gamma, beta (D)
+
+Within one kernel per (b,s):
+- Load N*D elements (32*64=2048 elements = 8KB)
+- Compute LayerNorm
+- Compute Q, K, V for all n simultaneously (Q = X @ W_q)
+  - N=32, D=64, so Q,K,V each is 32*64
+  - We can have each thread block handle one (b,s)
+  - Compute Q,K,V in shared memory
+  - Then compute attention scores: (N, h, d) @ (N, h, d).T =&gt; (h, N, N)
+  - Apply softmax per head per row
+  - Compute attn @ V =&gt; (h, N, d)
+  - Write back to output buffer
+  - Apply output linear
+  - Add residual
+
+For B=2, S=8: total 16 thread blocks.
+
+But wait, the output of attention is then used for OPM. Maybe we can just write 3 fused kernels.
+
+Actually, let me think more carefully. Each operation with PyTorch has small dimension overhead:
+- B=2, S=8, N=32, D=64
+
+The cost of many kernel launches will be high relative to compute.
+
+Let me design:
+
+Kernel 1: Fused MSA Self Attention
+- Input: msa (B,S,N,D)
+- Output: new_msa (B,S,N,D)
+For each (b, s):
+  1. Load X = msa[b,s] into smem
+  2. LayerNorm(X)
+  3. Compute Q, K, V using fully coalesced matmul-like loading
+     Actually D=64, N=32. To compute Q = X @ W_q: (N, D) @ (D, D). 
+     We can have 32 threads (one per N), each compute one row of Q,K,V (64 dims).
+     Or use 64 threads per N.
+     N*D = 2048. For a warp, that&#x27;s a lot.
+     Let&#x27;s think: each thread block has N=32 elements, each of dimension D=64.
+     If we have 32 warps (1024 threads), each warp handles 1 row.
+     Actually for such small N and D, we should have each thread block handle one (b,s).
+     
+     For Q,K,V: each of N rows needs D dot products of length D.
+     We can compute Q,K,V sequentially to save registers.
+     
+     Let&#x27;s think about the matmuls. Each row n needs:
+     q[n,d] = sum_k X[n,k] * W_q[k,d]
+     With N=32, D=64: 
+     32*64*64 = 131K mul-adds for one projection. 3 projections = 393K.
+     At 67 TFlops, this is ~6 microseconds.
+     
+     For attention:
+     scores = Q @ K.T: for each head h: (N,d) @ (d,N) -&gt; (N,N)
+     num_heads=4, N=32, d=16
+     4 * 32 * 32 * 16 = 65K ops
+     softmax: 4 * 32 * 32 = 4K ops
+     attn @ V: 4 * 32 * 32 * 16 = 65K ops
+     out_linear: 32 * 64 * 64 = 131K ops
+     
+     Total compute per (b,s): ~660K FLOPs
+     16 (b,s) total: ~10.5M FLOPs
+     
+     At 67 TFlops, minimum is 0.15 microseconds. But memory bound is:
+     Read msa: 16 * 32 * 64 * 4 = 131KB
+     Write msa: 131KB
+     Read weights: Q/K/V/out weights = 4 * 64*64*4 = 65KB (cached)
+     Total memory: ~300KB. At 3.35TB/s: 0.09 microseconds.
+     
+     So this is heavily latency/overhead bound. We need to minimize kernel launches.
+
+Kernel 2: Fused OPM + add to pair
+Input: msa (B,S,N,D) - the updated one
+Output: pair (B,N,N,D_pair) - updated
+For each (b, n1, n2) or for each b:
+  We need to compute over all S.
+  
+  OPM steps:
+  1. LayerNorm on msa -&gt; for each (b,s,n)
+  2. a = msa @ W_a, b = msa @ W_b  (S, N, D) -&gt; (S, N, hidden)
+     hidden=32, so S*N*hidden = 8*32*32 = 8192 elements
+  3. outer = einsum(&quot;bsih,bsjk-&gt;bijhk&quot;, a, b) / S
+     This is for fixed b: outer[n1, n2, h1, h2] = sum_s a[s,n1,h1] * b[s,n2,h2] / S
+     For each (n1, n2, h1, h2): sum over S=8.
+     Total output size: N*N*H*H = 32*32*32*32 = 1M elements per batch
+     Wait, 32*32*32*32 = 1,048,576. For B=2, it&#x27;s 2M elements.
+     Each element needs S=8 mul-adds. Total compute: 8M ops.
+  4. Linear: (H*H -&gt; pair_dim=64)
+     1M * 64 = 64M ops per batch
+     
+  So OPM total: ~72M ops for B=2. That&#x27;s more substantial.
+  
+  But again, with PyTorch doing this in many kernels, there&#x27;s overhead.
+  
+  We can fuse OPM into one kernel per b.
+  
+  Strategy for OPM:
+  For each batch b:
+    - Compute a and b for all (s,n,h): (S, N, H)
+      Actually we compute in shared memory or local memory.
+    - Then for each (n1, n2), compute outer[n1,n2,:,:] = sum_s a[s,n1,:] * b[s,n2,:] / S
+    - Then apply linear(H*H -&gt; pair_dim) to get pair_update[b,n1,n2,:]
+    - Add to pair_repr[b,n1,n2,:]
+    
+  We can tile the work. Since H=32, H*H=1024.
+  For each (n1, n2), we have a vector of 1024 elements to reduce from S=8.
+  
+  Actually: for each pair (n1, n2), we compute a matrix M[h1, h2] = sum_s a[s,n1,h1] * b[s,n2,h2] / S.
+  Then we flatten M and multiply by W_out (1024 x 64).
+  
+  Total per batch:
+  - Compute a, b: S*N*(D*H) = 8*32*64*32 = 524K ops, done twice = 1M ops
+  - Outer products: N*N*H*H*S = 32*32*32*32*8 = 8.4M ops
+  - Output linear: N*N*1024*64 = 4.2M ops? Wait N*N=1024, 1024*1024*64 = 67M ops.
+    Actually H*H=1024. For each of N*N=1024 positions, we do matvec(1024, 64).
+    1024 * 1024 * 64 = 67M ops. Yes.
+  
+  Total OPM: ~76M ops for B=2. At 67 TFlops = 1.1 microseconds. 
+  Memory: read msa (2*8*32*64*4=131KB), read pair (2*32*32*64*4=524KB), write pair (524KB).
+  Total ~1.2MB. At 3.35TB/s = 0.36 microseconds.
+  
+  So OPM is compute bound? Actually 76M ops / 1.2MB = 63 FLOP/byte. 
+  H100 needs ~20 FLOP/byte to be compute bound in fp32? 
+  67T / 3.35T = 20. So it&#x27;s roughly balanced.
+
+Kernel 3: TriMulOut
+Input: pair (B,N,N,D_pair=64)
+Output: updated pair
+
+Steps:
+1. LayerNorm(pair)
+2. pa = pair @ W_pa, ga = pair @ W_ga, pb = pair @ W_pb, gb = pair @ W_gb
+   a = pa * sigmoid(ga), b = pb * sigmoid(gb)
+3. o = einsum(&quot;bikh,bjkh-&gt;bijh&quot;, a, b)
+   For each b, i, j, h: sum_k a[b,i,k,h] * b[b,j,k,h]
+   N=32, hidden=32. 
+   For each (b,i,j,h): sum over k=0..31 of a[b,i,k,h]*b[b,j,k,h]
+   Total elements: B*N*N*H = 2*32*32*32 = 65536
+   Each needs N=32 mul-adds. Total: 2M ops
+4. o = LayerNorm(o) @ W_out (H-&gt;D=64)
+   65536 * 64 = 4.2M ops
+5. gate = sigmoid(pair @ W_gate)
+   B*N*N*D*D = 2*32*32*64*64 = 8.4M ops
+6. out = gate * o
+7. pair = pair + out
+
+Total TriMul compute: ~15M ops for B=2.
+Memory: read pair 524KB, write pair 524KB.
+15M ops, 1MB: 15 FLOP/byte. Memory bound-ish.
+
+But again, many kernel launches in PyTorch will hurt.
+
+Fusion strategy:
+We should write 3 fused kernels to match the sequential dependencies.
+
+Wait, there might be a smarter approach: fuse MSA attention and OPM? 
+But OPM uses the **output** of MSA attention (after residual). And MSA output is per-(s,n), while OPM reduces over s.
+We could compute MSA attention, then output to global memory, then fuse OPM separately.
+Or we could have one kernel write MSA output, and another kernel do OPM and TriMul together?
+
+Actually, since OPM output is added to pair, and TriMul uses the updated pair, we need to do OPM before TriMul.
+
+Dependencies:
+1. msa_new = msa + attn(msa)
+2. pair_mid = pair + opm(msa_new)  
+3. pair_new = pair_mid + trimul(pair_mid)
+
+So we need at least 3 kernels due to these dependencies, OR we can fuse 2+3 if we compute trimul from pair_mid inside the same kernel.
+
+Actually, we could do:
+- Kernel 1: msa_new = msa + attn(msa)
+- Kernel 2: pair_new = pair + opm(msa_new) + trimul(pair + opm(msa_new))
+
+But trimul depends on pair_mid = pair + opm(msa_new).
+To compute pair_new inside one kernel:
+  For each (b,i,j):
+    1. Compute opm contribution from msa_new to position (b,i,j)
+    2. pair_mid = pair[b,i,j] + opm_contrib
+    3. Compute trimul contribution for position (b,i,j)
+    
+    But trimul einsum &quot;bikh,bjkh-&gt;bijh&quot; requires for fixed (b,i,j), summing over k and h.
+    So for each output position (b,i,j), we need all a[b,i,k,h] and b[b,j,k,h] for k=0..N-1, h=0..H-1.
+    That means we need the entire pair_mid[b,:,:,:] to compute any (i,j) output.
+    
+    Actually, for a fixed (b,i,j), the trimul output only depends on:
+    - pair_mid[b,i,:,:] (for a)
+    - pair_mid[b,j,:,:] (for b)
+    - pair_mid[b,i,j,:] (for gate)
+    
+    So we CAN compute it per (b,i,j) if we load the i-th row and j-th row of pair_mid into registers/shared memory.
+    
+    For N=32, pair_dim=64, tri_hidden=32:
+    - To compute a and b for row i: we need pair_mid[b,i,0:N,:] -&gt; N*D = 2048 elements.
+    - Similarly for row j.
+    - That&#x27;s 4096 elements loaded per (i,j) pair, but we can cache for all j when i is fixed.
+    
+    Wait, let&#x27;s think about per-batch kernel for steps 2 and 3:
+    
+    For a fixed batch b:
+    OPM first produces pair_update_opm[b,n1,n2,d] for all n1,n2,d.
+    Then TriMul needs pair_mid[b,:,:,:] to produce pair_update_tri[b,:,:,:].
+    
+    Could we fuse them as:
+    1. First compute OPM and write pair_mid to shared memory / global memory
+    2. Then compute TriMul from pair_mid
+    
+    Yes, if we do this per batch b, we can:
+    - Compute OPM and store pair_mid in shared/global memory (N*N*D = 32*32*64 = 64K elements per batch = 256KB)
+    - Then have a second phase in the same kernel compute TriMul using pair_mid.
+    But 256KB fits in shared memory! (228KB per SM on H100, but we can use multiple SMs per batch)
+    
+    Actually if one block handles one batch:
+    - Shared memory: need pair_mid (64K fp32 = 256KB) -&gt; too much for one block? H100 allows 227KB per block, so 256KB &gt; 227KB.
+    - We could store half in shared memory, or use multiple blocks per batch.
+    
+    Alternatively: 
+    - Kernel 1: MSA attention
+    - Kernel 2: OPM -&gt; write pair_mid to global memory
+    - Kernel 3: TriMul using pair_mid
+    
+    But kernel launch overhead for 3 kernels is small. The real overhead is PyTorch&#x27;s many small kernels per operation.
+    With just 3 custom kernels, we should easily beat PyTorch.
+    
+    Wait, but actually we might do even better by fusing Kernel 2 and 3 per batch.
+    
+    Let&#x27;s think about TriMul more carefully:
+    For each b, we need to compute for all i,j:
+    a[b,i,k,h] = pa(pair_mid[b,i,k,:]) * sigmoid(ga(...))
+    b[b,j,k,h] = pb(pair_mid[b,j,k,:]) * sigmoid(gb(...))
+    o[b,i,j,h] = sum_k a[b,i,k,h] * b[b,j,k,h]
+    
+    Notice that a[b,i,k,h] only depends on pair_mid[b,i,k,:], and b[b,j,k,h] on pair_mid[b,j,k,:].
+    
+    For each i, we can precompute A_i[k,h] for all k,h.
+    For each j, precompute B_j[k,h] for all k,h.
+    Then o[i,j,h] = sum_k A_i[k,h] * B_j[k,h]
+    
+    This is like computing N vectors of size N*H and taking pairwise dot products along the k dimension for each h.
+    
+    Per batch b:
+    - Precompute A[b,i,k,h] for all i,k: That&#x27;s N * N * H = 32*32*32 = 32K elements.
+      Actually A_i depends on pair_mid[b,i,k,:] for each k.
+      For each (i,k), we need to compute pa, ga, pb, gb projections.
+      Wait, a uses pa and ga. b uses pb and gb.
+      So we need:
+      A = pa(pair) * sigmoid(ga(pair))  -&gt; (B, N, N, H)
+      B = pb(pair) * sigmoid(gb(pair))  -&gt; (B, N, N, H)
+      
+      Then o[b,i,j,h] = sum_k A[b,i,k,h] * B[b,j,k,h]
+      
+      Wait, the einsum is &quot;bikh,bjkh-&gt;bijh&quot;.
+      So A[b,i,k,h] and B[b,j,k,h]. Note the k dimension is the second N dimension in pair.
+      pair[b,i,k,:] is the edge from i to k.
+      pair[b,j,k,:] is the edge from j to k.
+      
+      So A and B are (B, N, N, H).
+      
+      Precompute A and B: 2 * B * N * N * H elements = 2 * 2 * 32 * 32 * 32 = 128K fp32 = 512KB.
+      Then compute o by summing over k.
+      
+      With B=2, total 256K elements in A and 256K in B. Total 512KB.
+      This does not fit in shared memory per block.
+      
+      But we can process per batch b, or per (b, i) tile.
+      
+      For fixed b and i:
+      - Load A_i[k,h] for all k,h: N*H = 1024 elements = 4KB.
+      - For a tile of j values:
+        - For each j, need B_j[k,h] for all k,h: N*H = 4KB.
+        - Compute dot product over k for each h.
+        - Apply norm_out + linear + gate + output
+        
+      If we process all j for fixed i:
+      - Need A_i: 4KB
+      - Need B_j for j=0..31: 32 * 4KB = 128KB
+      - Total 132KB, which fits in shared memory!
+      
+      For each i, we compute i&#x27;s contribution to all j.
+      Number of i values: 32.
+      So we need 32 iterations, each processing one i and all j.
+      
+      Total work per batch: 32 iterations.
+      In each iteration:
+      - Compute A_i from pair_mid[b,i,0:N,:]: we need to load pair for i-row.
+        Wait, pair_mid[b,i,k,:] for k=0..N-1: N * D = 32 * 64 = 2048 elements = 8KB.
+        Compute A_i[k,h] via linear + gate. N linear projections of size D-&gt;H.
+        N * (D * H) = 32 * 64 * 32 = 65K ops per i.
+      - Load B_j for all j: pair_mid[b,j,k,:] is the entire pair tensor slice.
+        Actually B_j[k,h] depends on pair_mid[b,j,k,:].
+        For all j and k: that&#x27;s N * N * D = 64K elements = 256KB of data to load (but only once per batch).
+        Actually we can load from global memory each time, or cache in shared memory / L2.
+        
+      Hmm, this is getting complex. Maybe for simplicity and correctness, we should write 3 separate fused kernels. That should provide enough speedup over PyTorch.
+      
+Actually let me reconsider. With B=2, S=8, N=32, D=64, the model is very small. PyTorch on GPU is fast for small tensors but has kernel launch overhead. Writing 3 fused kernels should be sufficient.
+
+Let me plan the kernels:
+
+**Kernel 1: msa_attn_fused**
+For each (b, s), compute:
+  1. Load msa[b,s,n,:] for n=0..N-1 into shared memory
+  2. LayerNorm per row
+  3. Compute Q, K, V
+     - Each thread handles one n and computes q[n,:], k[n,:], v[n,:]
+     - Or use warp-level matrix multiply?
+     - D=64, so dot product of length 64. Each thread can do 64 multiply-adds.
+  4. Q @ K^T for each head
+     - q is (h, d), k is (h, d)
+     - scores[h, n1, n2] = dot(q[n1, h, :], k[n2, h, :]) / scale
+     - For each head h and each n1: compute dot with all n2.
+     - N=32, so for fixed n1 and h, we need 32 dot products of length d=16.
+     - 32 * 16 = 512 ops per (n1, h).
+     - num_heads=4, n1=0..31: 128 such computations per (b,s).
+  5. Softmax per (h, n1) across n2
+  6. Attn @ V per (h, n1)
+  7. Permute and reshape back to (N, D)
+  8. Apply output linear
+  9. Add residual and write to output
+
+Thread block design:
+- One block per (b, s)
+- Threads: 256 or 512
+- Shared memory: store X (N*D = 2K), QKV can reuse (N*D*3 = 6K), scores (4*32*32 = 4K), weights (small)
+- Total ~16KB shared memory, well within limits.
+
+Wait, each block should have:
+- msa input: 32*64 fp32 = 8KB
+- Q, K, V: 3 * 8KB = 24KB
+- attn weights: 4 * 32 * 32 fp32 = 16KB
+- output of attention: 8KB
+Total: ~56KB. Still fine.
+
+Actually we can be more memory-efficient:
+- Load msa into smem
+- LayerNorm in place
+- Compute Q and store in smem/registers
+- Compute K and store in smem
+- Compute scores using Q and K, store in smem
+- Compute softmax in place on scores
+- Compute V and store in smem
+- Multiply scores by V, accumulate into output buffer
+- We only need 2 of {Q,K,V} in smem at a time, plus scores.
+
+Thread organization:
+- Let&#x27;s use 128 threads per block (4 warps).
+- For matmul X @ W (N,D) @ (D,D): 
+  - Each thread can compute multiple output elements.
+  - D=64, so W is 64x64. 
+  - We can tile: 128 threads. Each thread computes one row of output? That would be 64 elements per thread = too many registers.
+  - Better: we tile D into groups. Since N=32, we can assign threads to (n, d_tile).
+  - E.g., 128 threads = 32 rows * 4 dims. Each thread computes 16 output dims for one row.
+  - Or 2 rows * 64 dims: 64 threads.
+  
+Let me think about a simpler approach: use a straightforward kernel where each block handles one (b,s), and threads cooperatively compute everything.
+
+Simplification: Since this is small, we can compute Q,K,V row by row sequentially without heavy tiling.
+
+Actually for correctness and speed, we can write the kernels using a clean approach.
+
+But wait - there&#x27;s an even cleaner approach: since all operations are just linear algebra, we could potentially write fewer lines by doing efficient fused kernels but not necessarily perfectly optimized at the instruction level. The main win is fusion.
+
+Let me start coding. I&#x27;ll write 3 kernels:
+
+1. `msa_attn_forward` - fused MSA attention
+2. `opm_forward` - fused outer product mean  
+3. `trimul_forward` - fused triangular multiplicative update
+
+Let me be more careful about the PyTorch reference to make sure I match numerics exactly.
+
+For MSA attention:
+- LayerNorm: standard PyTorch LayerNorm. eps=1e-5 by default. weight and bias are (D,).
+- Q, K, V: nn.Linear(D, D, bias=False). So y = x @ weight.T
+  Wait, PyTorch linear is y = x @ W^T if W is (out_features, in_features).
+  Actually `nn.Linear(msa_dim, msa_dim, bias=False)` has weight shape (msa_dim, msa_dim).
+  Forward: y = x @ weight.T.
+- View and permute: (B,S,N,h,d) -&gt; permute(0,1,3,2,4) -&gt; (B,S,h,N,d)
+- Q @ K.T: (h,N,d) @ (h,d,N) -&gt; (h,N,N)
+  In code: `q @ k.transpose(-1, -2)` where q,k are (B,S,h,N,d)
+  So: for each b,s,h: Q_mat is (N,d), K_mat is (N,d)
+  Q_mat @ K_mat.T -&gt; (N,N)
+- Divide by math.sqrt(d) where d=head_dim=16. scale = 1/sqrt(16) = 1/4 = 0.25
+- F.softmax(attn, dim=-1): standard softmax over last dim (N)
+  For numerical stability, subtract max before exp.
+- attn @ v: (h,N,N) @ (h,N,d) -&gt; (h,N,d)
+- permute(0,1,3,2,4): (B,S,h,N,d) -&gt; (B,S,N,h,d)
+- reshape: (B,S,N,D)
+- out = self.out(out): Linear with bias. weight (D,D), bias (D,).
+
+For OPM:
+- LayerNorm on msa
+- a = self.a(x): Linear with bias. weight (H, D), bias (H,).
+- b = self.b(x): Linear with bias.
+- outer = einsum(&quot;bsih,bsjk-&gt;bijhk&quot;, a, b)
+  For fixed b: outer[i,j,h1,h2] = sum_s a[s,i,h1] * b[s,j,h2]
+- outer = outer / max(S, 1) = / 8
+- self.out: Linear(H*H, pair_dim). weight (pair_dim, H*H), bias (pair_dim,).
+- return self.out(outer.reshape(B, N1, N2, H1*H2))
+
+For TriMulOut:
+- self.norm(pair): LayerNorm(pair_dim)
+- pa = self.pa(x): Linear(pair_dim-&gt;hidden) with bias
+- ga = self.ga(x): Linear with bias
+- pb = self.pb(x): Linear with bias  
+- gb = self.gb(x): Linear with bias
+- a = pa * sigmoid(ga)
+- b = pb * sigmoid(gb)
+- o = einsum(&quot;bikh,bjkh-&gt;bijh&quot;, a, b)
+  For fixed b: o[i,j,h] = sum_k a[i,k,h] * b[j,k,h]
+- o = self.out(self.norm_out(o)): 
+  - LayerNorm(hidden) then Linear(hidden-&gt;pair_dim) with bias
+- gate_out = torch.sigmoid(self.gate_out(pair)) * o
+  - self.gate_out is Linear(pair_dim-&gt;pair_dim) with bias
+  - Then sigmoid
+  - Element-wise multiply with o
+- return pair + gate_out*o
+
+Now, implementation plan:
+
+**Cuda kernel 1: MSA attention**
+
+Grid: (B, S)
+Block: 128 threads or 256 threads
+
+I&#x27;ll write a clean kernel:
+
+```cuda
+__global__ void msa_attn_forward(
+    const float* __restrict__ msa,
+    float* __restrict__ out_msa,
+    int B, int S, int N, int D, int H, int d,
+    const float* __restrict__ norm_gamma,
+    const float* __restrict__ norm_beta,
+    const float* __restrict__ q_weight,
+    const float* __restrict__ k_weight,
+    const float* __restrict__ v_weight,
+    const float* __restrict__ out_weight,
+    const float* __restrict__ out_bias
+)
+```
+
+Shared memory layout:
+- smem_msa: N * D floats
+- smem_qkv: 3 * H * N * d floats  (or compute sequentially)
+- smem_attn: H * N * N floats
+- smem_o: H * N * d floats
+
+Wait, H=4 heads, N=32, d=16.
+- smem_msa: 32*64*4 = 8KB
+- smem_q: 4*32*16*4 = 8KB
+- smem_k: 8KB  
+- smem_v: 8KB
+- smem_attn: 4*32*32*4 = 16KB
+- smem_out_attn: 4*32*16*4 = 8KB
+Total would be 56KB. That&#x27;s fine.
+
+But we can reduce by reusing:
+1. Load msa, compute LayerNorm in smem_msa
+2. Compute Q, store in smem_q
+3. Compute K, store in smem_k (reusing smem_q space if needed, but we need both Q and K for scores)
+   Actually we need Q and K simultaneously for scores. But we can compute scores as we compute K.
+4. Compute V, store in smem_v (can reuse smem_k after scores done? No, we need V for attn@V)
+
+Let me think... We need:
+- msa (for computing Q, K, V)
+- Q and K (for Q@K^T)
+- scores/softmax (for attn)
+- V (for attn@V)
+- output of attn@V (for out linear)
+
+So minimum: msa + Q + K + scores + V + out = 8 + 8 + 8 + 16 + 8 + 8 = 56KB
+Or we can keep some in registers.
+
+Actually, a cleaner approach: each warp handles one head.
+- 4 warps (128 threads), each warp handles one head.
+- Within a warp, we process one head&#x27;s Q, K, V, attention, etc.
+- This reduces shared memory needs because each warp can keep its Q,K,V in registers.
+
+For one head:
+- Q: N * d = 32 * 16 = 512 floats = 2KB
+  We can have each thread in the warp (32 threads) handle one row of Q (16 elements).
+  Each thread computes q[n, 0:16] by dot product of msa[n,:] with q_weight_head.
+  
+Actually q_weight is (D, D) = (64, 64). For head h, q_weight[h*d:(h+1)*d, :] is (d, D).
+So Q_head[n, :] = msa[n, :] @ q_weight[h*d:(h+1)*d, :].T
+= msa[n, :] @ q_weight[:, h*d:(h+1)*d]
+Wait, PyTorch linear: y = x @ W^T, where W is (out, in).
+So for head h: W_q[h*d:(h+1)*d, :] (d, D).
+Q_head[n, d_i] = sum_k msa[n,k] * W_q[h*d + d_i, k]
+
+Since D=64, d=16, each of 32 threads computes one row n, with d_i=0..15.
+Each thread: 16 multiply-adds over k=0..63.
+64*16 = 1024 ops per thread for Q. 3*1024 = 3072 ops for Q,K,V.
+That&#x27;s fine.
+
+But loading W_q for each head requires reading (d*D) = 16*64 = 1024 floats = 4KB per head.
+Total W_q = 16KB. W_k = 16KB. W_v = 16KB. All fit in L1/L2.
+
+With warp-per-head:
+- All 32 threads in warp h cooperate.
+- First, they load msa into shared memory cooperatively? Or each thread loads its own row.
+  Each thread n loads msa[n, 0:64]. 
+  We need a way to broadcast msa rows to all threads for W accesses. Actually each thread only needs its own msa row to compute its own Q,K,V rows.
+  So no inter-thread communication needed for Q,K,V!
+
+For Q@K^T:
+- Thread n computes q[n,:] (1 x d)
+- We need dot(q[n,:], k[m,:]) for all m.
+- The warp has all k[m,:] for m=0..31 distributed across threads.
+- We can use __shfl_sync to broadcast k[m,:] to all threads.
+  For m=0..31: broadcast k[m,:] (16 floats) to all threads.
+  Each thread n computes dot(q[n,:], k[m,:]) for this m, accumulates score[n,m].
+  Using warp shuffles: for m from 0 to 31:
+    Thread m sends its k[m, e] to all threads in warp for each e=0..15.
+    Each thread n computes partial dot.
+  Actually dot product of 2 vectors of length 16:
+  Each thread n: sum_e q[n,e] * k_shfl[e]
+  We can compute this element by element or in chunks.
+  16 elements per vector. We can have each thread compute the full dot locally since it has q[n,:] in registers.
+  To get k[m,:], we shuffle from thread m.
+  For e=0..15: k_e = __shfl_sync(0xFFFFFFFF, k[thread_m][e], m);
+  But actually thread m needs to pass all 16 elements. 
+  More efficient: each thread writes k to shared memory (per warp), then threads read.
+  Or: we compute K^T in shared memory.
+
+Wait, with 32 threads computing 32x32 dot products, each needing 16-dim vectors:
+For fixed n, m: dot product over d=16.
+32*32*16 = 16K multiply-adds.
+This is tiny. The overhead of shuffles vs shared memory might matter.
+
+Let me keep it simple with shared memory per warp:
+- Each warp has a small smem area: 32 * d floats for Q, 32 * d for K, 32 * N for scores.
+- Each thread n writes q[n,:] and k[n,:] to warp smem.
+- Then all threads read q[n,:] and k[m,:] from smem to compute score[n,m].
+- For softmax: we need max and sum per row n. Use warp reduce.
+
+Actually, using warp-level primitives for softmax reduction per row:
+- max over m: thread n computes max of score[n,m] across m=0..31.
+  We can use warp reduce: each thread has one row. 32 threads, each has 32 scores.
+  Each thread n computes its own max over its own 32 scores? Yes, that&#x27;s trivial in registers.
+  Similarly for sum.
+
+So actually, we can keep the entire N*N score matrix distributed across threads:
+- Thread n stores score[n, 0..31] in registers (32 floats).
+- Softmax on row n: thread n computes max, subtracts exp, computes sum, normalizes.
+- Then for attn @ V:
+  Thread n computes out[n, e] = sum_m score[n,m] * v[m, e] for e=0..15.
+  Again, needs v[m,e] from all m.
+  We can shuffle or use smem.
+
+Hmm, let me think about the simplest correct implementation first. We can optimize after.
+
+Since N=32, H=4, D=64, d=16, the entire model is tiny. We can actually have each thread block of 128 threads handle one (b,s), and keep everything in registers and shared memory straightforwardly.
+
+Let me write a simpler block-level kernel:
+
+```cuda
+__global__ void msa_attn_kernel(...) {
+    int b = blockIdx.x;
+    int s = blockIdx.y;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    
+    // Use 512 threads (16 warps) to process all heads
+    // Or 128 threads = 4 warps, one per head
+}
+```
+
+Actually wait, I realize that with warp-per-head, 4 warps = 128 threads is natural.
+But we need to be careful about shared memory.
+
+Each warp (32 threads) handles one head.
+For warp h:
+1. Each thread n computes q[n, 0:d], k[n, 0:d], v[n, 0:d] by dot product with weight.
+   Since d=16, each thread holds 16 floats in registers.
+2. Compute scores[n,m] for n,m in 0..31:
+   We need all k[:,:] accessible to all threads in warp.
+   Put k in warp smem: 32 * 16 floats.
+   Each thread n reads q[n,:] from registers, reads k[m,:] from smem, computes dot for m=0..31.
+   Since q and k are small, we can also keep k in registers and shuffle.
+
+Actually simplest for scores: use smem.
+Warp h has smem_q and smem_k areas.
+Each thread computes its q and k, writes to smem.
+Then __syncthreads() within warp (or use volatile compiler barrier).
+Then each thread reads k[m,:] for all m to compute scores.
+
+Softmax: each thread n has 32 scores. Computes max, subtracts, exp, sum, divides.
+We use __expf.
+
+Attn @ V: each thread n needs to compute sum_m score[n,m] * v[m,e] for e=0..d.
+v[m,e] needs to be accessible. Put v in warp smem.
+Each thread accumulates into 16 output registers.
+
+Then output linear: the result of attn@v for head h is (N, d). 
+The final output is (N, D) = (N, H*d).
+We need to apply out_weight (D, D) and out_bias (D,).
+
+Wait, the output of attention is H heads of (N,d). The reshape just concatenates heads.
+So head h occupies columns [h*d : (h+1)*d].
+
+For output linear: y = o @ out_weight.T + out_bias.
+o is (N, H*d). y is (N, D).
+We need all heads&#x27; results before doing output linear.
+
+So after all 4 warps finish their heads, we need to write to a shared buffer of size N * D.
+Then compute output linear.
+
+The output linear: (N, D) @ (D, D) + bias.
+With 128 threads (4 warps), we can have each thread handle parts.
+Each thread n in warp h: after writing head result to smem_out[n, h*d:(h+1)*d], __syncthreads().
+Then compute y[n, :] = o[n, :] @ W_out.T + b.
+128 threads, N=32, D=64:
+- We can have thread id linearized over N*D = 2048 elements.
+- 128 threads handle 16 elements each? No, we need matmul.
+- Better: each of 32 threads handles one row n, computing all 64 output dims.
+  Each row: 64 dot products of length 64 = 4096 ops.
+  32 threads * 4096 = 131K ops.
+  With 128 threads: we could have 4 groups of 32 threads, each group handles 8 rows.
+  
+Actually, block configuration: 128 threads = 4 warps.
+- Warps 0-3: compute 4 heads
+- After head results in smem (32*64 = 2048 floats):
+- All 128 threads participate in output linear and residual addition.
+
+For the output linear (N=32, D=64):
+We can assign threads by (n, d_group).
+D=64. If we have 128 threads: 32 rows * 4 dims per thread = 128.
+Each thread computes 4 output dimensions for one row n.
+Each output dim: dot product of 64 elements = 64 ops.
+So each thread: 4 * 64 = 256 ops. Total: 128 * 256 = 32K ops.
+Wait, that&#x27;s not enough. Actually output linear is (32,64) @ (64,64):
+32 * 64 * 64 = 131K ops.
+131K / 128 threads = ~1K ops per thread.
+If each thread handles one row (64 dims): 64 * 64 = 4K ops. 
+32 threads * 4K = 128K ops. But we have 128 threads, so 32 threads would be underutilized.
+Better: Each thread handles one (n,d) element. Total 32*64=2048 elements.
+128 threads handle 16 elements each: each element is dot product of 64 = 64 ops. Total 1024 ops/thread.
+
+This is a lot of work and nice parallelization.
+
+OK let me plan the kernel structure concretely:
+
+```cuda
+extern &quot;C&quot; __global__ void msa_attn_kernel(
+    const float* msa, float* out_msa,
+    int B, int S, int N, int D, int num_heads, int head_dim,
+    const float* norm_w, const float* norm_b,
+    const float* qw, const float* kw, const float* vw,
+    const float* ow, const float* ob)
+{
+    int b = blockIdx.x;
+    int s = blockIdx.y;
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    int h = warp_id; // head 0..3
+    
+    if (h &gt;= num_heads) return;
+    
+    // Each block needs shared memory:
+    // smem_msa: N * D floats (shared by all warps)
+    // smem_attn_out: N * D floats (accumulated attention output before linear)
+    
+    // Layout: use dynamic smem via extern or calculate offsets.
+    
+    const float* msa_ptr = msa + ((b * S + s) * N + lane_id) * D;
+    
+    // Step 1: Load msa into smem_msa (all 128 threads participate)
+    // Each thread loads D/4 = 16 elements? 
+    // Actually 128 threads, N*D = 2048 elements. Each loads 16 elements.
+    // We&#x27;ll map thread linear index to (n, d) position.
+    
+    // For simplicity: each thread loads one row if possible. But N=32, D=64.
+    // Let&#x27;s have threads load in a coalesced way.
+}
+```
+
+Wait, I need to be more careful about shared memory addressing and make sure banks don&#x27;t conflict.
+
+Let me think about a simpler approach. Since this is small, I can have each block load the entire msa slice into shared memory in a coalesced way.
+
+Actually, for each (b,s), the msa data is laid out as [N, D]. 
+128 threads. We need to load N*D = 2048 floats.
+Each float is 4 bytes. To load coalesced, threads should load contiguous elements.
+If thread tid loads elements [tid, tid+128, tid+256, ...], that&#x27;s not coalesced.
+Better: thread tid loads a contiguous chunk.
+If each thread loads 16 floats (64 bytes), that&#x27;s one cache line per thread. Coalesced if threads in a warp load contiguous cache lines. But warp has 32 threads, so 32 * 64 = 2048 bytes = 512 floats. That covers 8 rows of 64 floats.
+Actually: warp 0 (threads 0-31) loads rows 0-7, 8 floats per thread? 
+Or: 32 threads, each loads 4 floats. That&#x27;s 128 floats = one row.
+Actually for row 0 (64 floats): threads 0-15 load 4 floats each. Thread 0 loads elements 0,1,2,3. That&#x27;s 16 bytes, which is fine.
+
+To keep it very simple: just have each warp load its data and work somewhat independently, except for the final output linear.
+
+Wait, the LayerNorm is applied before Q,K,V. So all warps need the normalized msa.
+If we store normalized msa in shared memory, all warps read from it.
+
+Let me write out the full kernel plan:
+
+Shared memory:
+- `smem_msa[N][D]`: 32 x 64 = 2048 floats
+- `smem_attn[N][D]`: 32 x 64 = 2048 floats (attention output before linear projection)
+- `smem_scratch`: for softmax scores etc.
+
+Total: 16KB. Very manageable.
+
+Per block (128 threads = 4 warps):
+1. Load msa[b,s,n,d] into smem_msa (all 128 threads)
+   tid from 0..127. 
+   Each thread handles 2048/128 = 16 elements.
+   Elements are contiguous in memory: msa[b,s] is row-major [N, D].
+   Thread tid loads elements starting at offset tid * 16, 16 contiguous floats.
+   This is coalesced within each warp.
+
+2. LayerNorm (all 128 threads):
+   Compute mean and variance per row n.
+   Mean: sum of D elements. 128 threads can reduce.
+   Actually we&#x27;re computing mean and var for each row n. 
+   There are 32 rows. We can assign 4 threads per row for reduction.
+   Or: use warp-level reduction. Each warp handles 8 rows.
+   Warp 0: rows 0-7, warp 1: rows 8-15, etc.
+   Each thread in warp computes partial sum for its row (e.g., thread 0 in warp handles elements 0..7 of row 0, thread 1 handles 8..15, etc.)
+   Actually simpler: each warp handles one row. 32 threads per warp compute sum of 64 elements (2 per thread).
+   With 4 warps, we can process 4 rows at a time. 8 rounds.
+   
+   Wait, we have 4 warps * 32 threads = 128 threads.
+   If each warp handles one row: we process 4 rows at a time.
+   For row n: threads 0..31 in the warp. Thread i computes sum of elements [i*2, i*2+1] in that row.
+   Then warp shuffle reduce.
+   8 iterations for 32 rows.
+   This is quite efficient.
+
+3. After LayerNorm, smem_msa contains normalized values.
+
+4. Each warp computes Q, K, V for its head h:
+   Each thread in warp computes 1 or more (n, d_h) elements.
+   Q[n, d_h] = sum_d smem_msa[n,d] * qw[h*head_dim + d_h, d]
+   Wait, qw is (D, D) row-major if from PyTorch. Actually PyTorch stores linear weights as (out_features, in_features).
+   So qw[h*d + d_out, d_in] for d_out in 0..d, d_in in 0..D.
+   Q[n, d_out] = sum_d_in msa[n, d_in] * qw[h*d + d_out, d_in]
+   
+   For fixed n and d_out: dot product of length D=64.
+   Total elements to compute per head: N * d = 32 * 16 = 512.
+   32 threads in warp: each thread computes 16 elements.
+   e.g., thread t computes Q[n=t, d_out=0..15] or Q[n=(t/2), d_out=(t%2)*8 .. ] etc.
+   
+   If thread t computes Q[n=t, :] for n=0..31: each thread computes 16 dot products of length 64.
+   16 * 64 = 1024 ops per thread. That&#x27;s fine.
+   Same for K and V: 3 * 1024 = 3072 ops.
+   
+   But where to store Q, K, V?
+   We can keep Q and V in registers per thread (16 floats each).
+   K we need in shared memory for Q@K^T.
+   Actually for Q@K^T: thread n computes Q[n,:] and needs all K[m,:] for m=0..31.
+   So we write K to warp smem (32 * 16 floats).
+   
+5. Q @ K^T:
+   For head h, we compute scores[n,m] for n,m in 0..31.
+   Each thread n has Q[n,:] in registers (16 floats).
+   K is in warp smem (32 rows x 16 floats).
+   Thread n computes scores[n,m] = dot(Q[n,:], K[m,:]) / scale for m=0..31.
+   Store scores[n,0..31] in registers (32 floats).
+   
+   32 threads * 32 scores = 1024 scores per head.
+   Each score = 16 multiply-adds. Total 16K ops per head.
+   
+6. Softmax per row n:
+   Thread n finds max of scores[n,m] for m=0..31.
+   Subtracts max, computes exp, sum, divides.
+   Store softmax scores in registers.
+   
+7. Attn @ V:
+   V is in warp smem (32 rows x 16 floats) or we can load from registers.
+   Actually V[m,e] for m=0..31 needs to be accessible to all threads.
+   Put V in warp smem (or read from registers via shuffle).
+   Thread n computes out[n,e] = sum_m score[n,m] * V[m,e] for e=0..15.
+   Store out[n,e] in registers.
+   
+8. Write head result to smem_attn:
+   Each thread n writes out[n, e] for e=0..15 to smem_attn[n, h*16 + e].
+   
+   After all warps done: __syncthreads().
+   smem_attn contains the full (N, D) attention output.
+   
+9. Output linear and residual:
+   out_msa_new[b,s,n,d] = msa[b,s,n,d] + (smem_attn[n,:] @ ow.T + ob)
+   
+   All 128 threads participate.
+   Each thread handles multiple output elements.
+   Let&#x27;s have each thread handle 16 consecutive elements? Or compute by rows?
+   128 threads, 32*64 = 2048 output elements. 16 elements per thread.
+   For element (n,d_out): dot product of smem_attn[n, :] (length 64) with ow[d_out, :] (length 64) + ob[d_out].
+   
+   Wait, ow is (D, D). ow[d_out, d_in] for d_in=0..63.
+   y[n, d_out] = sum_d_in smem_attn[n, d_in] * ow[d_out, d_in] + ob[d_out]
+   
+   To load ow coalesced: threads in a warp reading the same row d_out would all read ow[d_out, :] (broadcast), so ow should be read into registers or cached. Since D=64, ow for one d_out is 64*4=256 bytes. 
+   
+   Strategy for output linear:
+   - Process by groups of rows.
+   - Or: thread tid is assigned to element (n, d_out) where n = tid / 2, d_out = (tid % 2) * 32 + something...
+   Actually 128 threads, 2048 elements. tid maps to element index eid = tid.
+   eid ranges 0..127. Thread handles elements eid, eid+128, eid+256, eid+384, eid+512, eid+640, eid+768, eid+896, eid+1024, eid+1152, eid+1280, eid+1408, eid+1536, eid+1664, eid+1792, eid+1920? 
+   That&#x27;s 16 elements per thread. But they&#x27;re strided by 128, not contiguous.
+   Better: thread tid handles elements starting at tid * 16 for 16 contiguous elements.
+   eid = tid * 16 + k where k=0..15.
+   n = eid / 64, d_out = eid % 64.
+   
+   For each of its 16 elements, thread computes dot product of 64.
+   16 * 64 = 1024 ops per thread. Total 128K ops.
+   
+   Loading ow: for element (n, d_out), need ow[d_out, 0:64].
+   If thread handles d_out=0..15, it reads ow[0:15, 0:64] = 16*64 = 1024 floats = 4KB.
+   That stays in L1 after first row.
+   
+   This seems reasonable. But actually, for coalesced access, threads in a warp should ideally access the same memory or adjacent memory. Here, thread tid=0 handles (0,0..15), tid=1 handles (0,16..31), etc. 
+   For warp 0 (tid 0-31): all handle row n=0, d_out=0..31 (tid 0-7), n=0 d_out=32..63 (tid 8-15), n=1 d_out=0..31 (tid 16-23), n=1 d_out=32..63 (tid 24-31).
+   
+   Wait, 16 elements per thread. tid0: (0,0..15), tid1: (0,16..31), tid2: (0,32..47), tid3: (0,48..63), tid4: (1,0..15), etc.
+   
+   Warp 0: tid 0-31.
+   - Tid 0-3 handle row 0, all 64 dims (16 each).
+   - Tid 4-7 handle row 1.
+   - ...
+   - Tid 28-31 handle row 7.
+   
+   For row 0: all threads in warp process different d_out. To compute element (0, d_out), each thread reads ow[d_out, :]. These are different rows of ow. But ow is stored row-major [D_out, D_in]. So thread0 reads ow[0,:], thread1 reads ow[1,:], etc. (after transpose considerations).
+   
+   Wait, ow is from PyTorch nn.Linear. Weight is [D_out, D_in]. In CUDA we access as ow[d_out * D_in + d_in].
+   For output linear: y[b,d_out] = sum_d_in x[d_in] * ow[d_out, d_in] + ob[d_out]
+   This is a gemv per row.
+   
+   If threads in warp compute different d_out for the same row n:
+   - Thread 0: reads ow[0, 0:63] (64 floats)
+   - Thread 1: reads ow[1, 0:63] (64 floats)
+   - These are adjacent rows, so coalesced access!
+   - Threads compute independently.
+   - Then thread 0 writes to out[n,0], thread1 to out[n,1], etc. Coalesced writes!
+   
+   So the mapping I described is actually great for coalescing:
+   Within a warp, threads handle the same n and adjacent d_out.
+   
+   Let me verify:
+   tid 0: starts at 0*16 = 0, n=0, d=0..15
+   tid 1: starts at 1*16 = 16, n=0, d=16..31
+   tid 2: starts at 2*16 = 32, n=0, d=32..47
+   tid 3: starts at 3*16 = 48, n=0, d=48..63
+   tid 4: starts at 4*16 = 64, n=1, d=0..15
+   ...
+   
+   Warp 0 (tid 0-31):
+   - n=0: tid 0-3
+   - n=1: tid 4-7
+   - n=2: tid 8-11
+   - n=3: tid 12-15
+   - n=4: tid 16-19
+   - n=5: tid 20-23
+   - n=6: tid 24-27
+   - n=7: tid 28-31
+   
+   For these 32 threads:
+   - Threads 0-3: all read x[0, :], but different ow rows (0..15, 16..31, 32..47, 48..63). 
+     Actually for n=0, they all read from smem_attn[0, :]. Broadcast.
+     They read ow[0:15], ow[16:31], ow[32:47], ow[48:63]. 
+     In terms of memory: ow is row-major [64,64]. Thread 0 reads ow[0:15 * 64], thread1 reads ow[16*64 : 31*64], etc.
+     Wait, that&#x27;s not coalesced. Coalesced means threads in warp access adjacent memory locations.
+     Thread 0 reads ow[0,0]..ow[0,63] for inner loop. Thread1 reads ow[1,0]..ow[1,63].
+     The start addresses differ by 64*4 = 256 bytes. Not perfectly coalesced, but still okay.
+     
+     Actually, for better coalescing, threads should strip-mine the dot product.
+     Instead of each thread reading one row of ow and computing full dot product,
+     we can have threads cooperate: each thread reads a portion of x and a portion of ow.
+     But given it&#x27;s only 64*64 = 4K ops per row, and 32 rows = 128K ops total, this is fine.
+     
+   Let&#x27;s just keep it simple. The kernel launch count reduction is the main win.
+
+OK, this is getting quite detailed. Let me write the CUDA code now.
+
+Actually, I just realized: maybe there&#x27;s a much simpler way. Since the dimensions are small, I could write the kernel using a simple per-block approach without too much warp-level optimization, and it will still be much faster than PyTorch due to fusion.
+
+Let me write the first version of the kernel with reasonable correctness, compile, test, then optimize.
+
+But wait - PyTorch matmul with such small tensors might use cublas, which is very fast. And softmax might be fused by nvFuser or aten. Let&#x27;s think about whether a naive custom kernel can actually beat PyTorch.
+
+With B=2, S=8, PyTorch does for MSA attention:
+1. LayerNorm: 1 kernel
+2. 3 linears (Q,K,V): 3 kernels
+3. reshape + permute: maybe fused or view-only
+4. Q@K.T: 1 bmm kernel (16 batches of 4 heads of (32,16)@(16,32))
+   Actually cublas for batch=64 of 32x16 @ 16x32 -&gt; this is tiny but cublas handles it.
+5. scale div: 1 kernel
+6. softmax: 1 kernel
+7. attn @ V: 1 bmm kernel
+8. permute + reshape: views
+9. output linear: 1 kernel
+10. add residual: 1 kernel
+
+That&#x27;s about 10 kernels for attention. Each kernel launch might take 3-5 microseconds on H100. Total 30-50 microseconds just in overhead.
+A custom kernel that does all this in one launch per (b,s) or per block should save a lot of overhead.
+
+Similarly for OPM and TriMul.
+
+So even a fairly simple kernel should win.
+
+Let me write a simpler kernel structure:
+
+For MSA attention, one block per (b, s):
+- 256 threads
+- Shared memory: msa[N][D], qkv[3][N][D] OR q[N][D], k[N][D], v[N][D], scores[H][N][N]
+Given N=32, D=64, H=4:
+- msa: 8KB
+- q: 8KB, k: 8KB, v: 8KB
+- scores: 4*32*32*4 = 16KB
+- out_attn: 8KB
+Total: ~56KB
+
+Thread organization:
+- Load msa: 256 threads load 2048/256 = 8 elements each. Coalesced.
+- LayerNorm: each thread handles one element (or reduction)
+  Actually have some threads compute mean/var, broadcast.
+  
+Actually for LayerNorm:
+- Mean/var per row. We can have 64 threads per row. But we only have 256 threads for 32 rows = 8 threads per row.
+- Each thread computes partial sum of 8 elements, warp reduce.
+- Or use 32 threads = one warp per row. We have 32 rows and 256 threads = 8 warps.
+- So 8 warps process 32 rows: 4 rounds. Each warp handles one row at a time.
+- This is clean: warp r in round i handles row i*8 + r.
+- Within warp, 32 threads compute mean of 64 elements: thread i sums elements [i*2, i*2+1].
+- Warp shuffle reduce.
+
+OK, I&#x27;ll structure MSA attention with 256 threads (8 warps), using warps for row-based parallelism:
+- Warp h (0-7): 
+  - Round 0: handles rows 0-7
+  - Round 1: handles rows 8-15
+  - Round 2: handles rows 16-23
+  - Round 3: handles rows 24-31
+  Each warp does LayerNorm on its 8 rows?
+  Wait, 8 warps * 4 rounds = 32 rows total. Each warp processes 4 rows.
+
+Actually that&#x27;s complicated. Let me just use a simpler reduction scheme.
+
+I&#x27;ll use 128 threads (4 warps). 
+- For LayerNorm: 
+  - Threads 0..127. Map to (row, group) = (tid % 32, tid / 32).
+  - Each row gets 4 threads. Each thread sums 16 elements.
+  - Warp-level reduction by row...
+  Actually 4 threads per row is awkward for warp shuffle (need to synchronize across warps).
+
+Let me just do: 64 threads handle one row at a time.
+Total iterations: ceil(32/ (128/64)) = ceil(32/2) = 16 iterations.
+In each iter, 2 rows processed (64 threads each).
+
+Actually for small D=64, we can just have each thread handle one row&#x27;s LayerNorm sequentially:
+128 threads, 32 rows. Each thread handles ceil(32/128) = 1 row... wait, 128 &gt; 32.
+So some threads idle for LayerNorm.
+
+Let&#x27;s assign: thread tid handles row n = tid if tid &lt; 32. Others idle.
+Each thread tid&lt;32 computes mean and var for row tid by iterating over D=64.
+Then writes normalized values to shared memory.
+__syncthreads().
+
+This is simple and only uses 32 threads, but the rest idle. Total work is small anyway.
+
+OK, I&#x27;ll write a simple but correct kernel, then optimize.
+
+**Let me start coding.**
+
+I&#x27;ll write inline CUDA with load_inline. The Python module will define the class and compile the CUDA.
+
+Given the complexity, let me write 3 reasonably optimized kernels but keeping them readable.
+
+For Kernel 1 (MSA attention):
+
+```cuda
+__global__ void msa_attn_forward(
+    const float* __restrict__ msa,
+    float* __restrict__ out_msa,
+    int B, int S, int N, int D, int H, int d,
+    const float* __restrict__ norm_w,
+    const float* __restrict__ norm_b,
+    const float* __restrict__ qw,
+    const float* __restrict__ kw,
+    const float* __restrict__ vw,
+    const float* __restrict__ ow,
+    const float* __restrict__ ob)
+{
+    int b = blockIdx.x;
+    int s = blockIdx.y;
+    int tid = threadIdx.x;
+    
+    // Shared memory
+    // smem[0 : N*D] = msa
+    // smem[N*D : 2*N*D] = qkv buffer / attn output
+    // smem[2*N*D : 2*N*D + H*N*N] = attention scores (if needed)
+    
+    // However, to keep it simple, we&#x27;ll store intermediate attention results
+    // in registers and shared memory distributed per warp/head.
+    
+    // Actually let me use a simpler approach: one block per (b,s,h) for QKV and attention,
+    // then a reduction-like kernel or second phase for output linear.
+    // BUT that increases kernel launches. Let&#x27;s do one block per (b,s).
+}
+```
+
+Hmm, one block per (b,s,h) might actually be cleaner and gives us more parallelism:
+- Blocks: B * S * H = 2 * 8 * 4 = 64 blocks.
+- Each block has 32 threads (one warp).
+- Block (b,s,h) computes:
+  1. Load msa[b,s,:,:] into shared memory (all warps within block cooperate... wait, there&#x27;s only one warp per block).
+  2. Compute q, k, v for head h.
+  3. Compute attention for head h.
+  4. Write result to a global scratch buffer of shape (B, S, H, N, d).
+Then we need a second kernel to combine heads and do output linear + residual.
+
+This might be easier to write correctly. Two kernels for MSA attention:
+1. `msa_attn_heads`: per (b,s,h) block, computes one head&#x27;s attention.
+   - Each block (one warp = 32 threads):
+     a. Load msa row for its N index... actually all threads need all msa.
+     b. Load msa into registers or smem. smem: N*D = 8KB.
+     c. LayerNorm per row (need to compute). But all blocks for same (b,s) would redundantly compute LayerNorm!
+     d. To avoid redundant LayerNorm, we can precompute it in a separate kernel, OR accept redundancy (64 blocks * 32 rows of LayerNorm). The LayerNorm compute is small: 64 * 32 * 64 = 131K ops. Negligible.
+     
+Actually, the best approach for correctness and speed: accept that I need to carefully implement one block per (b,s) and do it right.
+
+OK I think I should use the warp-per-head approach within one block per (b,s), and write it carefully.
+
+Let me draft the kernel with 128 threads (4 warps):
+
+```cuda
+__global__ void msa_attn_kernel(
+    const float* __restrict__ msa,
+    float* __restrict__ out_msa,
+    int B, int S, int N, int D, int num_heads, int head_dim,
+    const float* __restrict__ norm_w,
+    const float* __restrict__ norm_b,
+    const float* __restrict__ qw,
+    const float* __restrict__ kw,
+    const float* __restrict__ vw,
+    const float* __restrict__ ow,
+    const float* __restrict__ ob)
+{
+    extern __shared__ float smem[];
+    // Layout:
+    // [0, N*D) : smem_msa
+    // [N*D, 2*N*D) : smem_attn (attention output before linear)
+    
+    float* smem_msa = smem;
+    float* smem_attn = smem + N * D;
+    
+    int b = blockIdx.x;
+    int s = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int num_warps = blockDim.x / 32;
+    
+    // Step 1: Load msa into shared memory (all threads)
+    const float* msa_ptr = msa + ((b * S + s) * N) * D;
+    for (int i = tid; i &lt; N * D; i += blockDim.x) {
+        smem_msa[i] = msa_ptr[i];
+    }
+    __syncthreads();
+    
+    // Step 2: LayerNorm per row
+    // Each warp handles ceil(N / num_warps) rows
+    for (int n = warp_id; n &lt; N; n += num_warps) {
+        // Mean
+        float sum = 0.0f;
+        #pragma unroll
+        for (int d = lane; d &lt; D; d += 32) {
+            sum += smem_msa[n * D + d];
+        }
+        // Warp reduce sum
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        }
+        float mean = sum / D;
+        
+        // Var
+        float var_sum = 0.0f;
+        #pragma unroll
+        for (int d = lane; d &lt; D; d += 32) {
+            float diff = smem_msa[n * D + d] - mean;
+            var_sum += diff * diff;
+        }
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            var_sum += __shfl_down_sync(0xFFFFFFFF, var_sum, offset);
+        }
+        float inv_std = rsqrtf(var_sum / D + 1e-5f);
+        
+        // Normalize and write back
+        #pragma unroll
+        for (int d = lane; d &lt; D; d += 32) {
+            int idx = n * D + d;
+            smem_msa[idx] = (smem_msa[idx] - mean) * inv_std * norm_w[d] + norm_b[d];
+        }
+    }
+    __syncthreads();
+    
+    // Step 3-7: Each warp computes one head&#x27;s attention
+    // Q, K, V are stored in registers per lane
+    // K is also stored in smem for cross-thread access
+    // We need per-warp shared memory for K and V (32 * head_dim each)
+    // Allocate per-warp smem dynamically or use static partitioning
+    
+    // For simplicity, declare K and V in larger smem
+    // smem_k: [2*N*D, 2*N*D + num_warps*N*head_dim)
+    // smem_v: [2*N*D + num_warps*N*head_dim, ...)
+    
+    float* smem_k = smem + 2 * N * D + warp_id * N * head_dim;
+    float* smem_v = smem + 2 * N * D + num_warps * N * head_dim + warp_id * N * head_dim;
+    
+    // Wait, we need enough shared memory. Let&#x27;s calculate:
+    // smem_msa: N*D = 2048
+    // smem_attn: N*D = 2048
+    // smem_k: 4 * 32 * 16 = 2048
+    // smem_v: 4 * 32 * 16 = 2048
+    // Total: 8192 floats = 32KB.
+    // We need to declare this in the launch or use dynamic.
+    
+    // Actually, we can compute K and V and store them directly in smem_k and smem_v
+    // while keeping Q in registers.
+    
+    // For head h:
+    int h = warp_id;
+    if (h &lt; num_heads) {
+        // Compute Q[n,:], K[n,:], V[n,:] for this lane&#x27;s n
+        // Each lane handles one n (0..31)
+        int n = lane;
+        float q_vec[16];
+        float v_vec[16];
+        
+        // Compute Q
+        for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+            float sum = 0.0f;
+            const float* w_row = qw + (h * head_dim + d_out) * D;
+            for (int d_in = 0; d_in &lt; D; d_in++) {
+                sum += smem_msa[n * D + d_in] * w_row[d_in];
+            }
+            q_vec[d_out] = sum;
+        }
+        
+        // Compute K and store to smem_k
+        for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+            float sum = 0.0f;
+            const float* w_row = kw + (h * head_dim + d_out) * D;
+            for (int d_in = 0; d_in &lt; D; d_in++) {
+                sum += smem_msa[n * D + d_in] * w_row[d_in];
+            }
+            smem_k[n * head_dim + d_out] = sum;
+        }
+        
+        // Compute V and store to smem_v
+        for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+            float sum = 0.0f;
+            const float* w_row = vw + (h * head_dim + d_out) * D;
+            for (int d_in = 0; d_in &lt; D; d_in++) {
+                sum += smem_msa[n * D + d_in] * w_row[d_in];
+            }
+            v_vec[d_out] = sum;
+            smem_v[n * head_dim + d_out] = sum;
+        }
+        
+        __syncwarp();
+        
+        // Compute attention scores
+        float scores[32];
+        float scale = 1.0f / sqrtf((float)head_dim);
+        for (int m = 0; m &lt; N; m++) {
+            float dot = 0.0f;
+            for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+                dot += q_vec[d_out] * smem_k[m * head_dim + d_out];
+            }
+            scores[m] = dot * scale;
+        }
+        
+        // Softmax
+        float max_score = scores[0];
+        for (int m = 1; m &lt; N; m++) {
+            max_score = fmaxf(max_score, scores[m]);
+        }
+        float exp_sum = 0.0f;
+        for (int m = 0; m &lt; N; m++) {
+            scores[m] = expf(scores[m] - max_score);
+            exp_sum += scores[m];
+        }
+        float inv_sum = 1.0f / exp_sum;
+        for (int m = 0; m &lt; N; m++) {
+            scores[m] *= inv_sum;
+        }
+        
+        // Attn @ V
+        float o_vec[16];
+        for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+            o_vec[d_out] = 0.0f;
+        }
+        for (int m = 0; m &lt; N; m++) {
+            float s = scores[m];
+            for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+                o_vec[d_out] += s * smem_v[m * head_dim + d_out];
+            }
+        }
+        
+        // Write to smem_attn
+        for (int d_out = 0; d_out &lt; head_dim; d_out++) {
+            smem_attn[n * D + h * head_dim + d_out] = o_vec[d_out];
+        }
+    }
+    __syncthreads();
+    
+    // Step 8: Output linear and residual
+    // Each thread handles multiple output elements
+    for (int i = tid; i &lt; N * D; i += blockDim.x) {
+        int n = i / D;
+        int d_out = i % D;
+        float sum = ob[d_out];
+        const float* w_row = ow + d_out * D;
+        for (int d_in = 0; d_in &lt; D; d_in++) {
+            sum += smem_attn[n * D + d_in] * w_row[d_in];
+        }
+        out_msa[((b * S + s) * N + n) * D + d_out] = msa_ptr[i] + sum;
+    }
+}
+```
+
+Wait, there are some issues:
+1. I used `__syncwarp()` for warp synchronization. But I need to make sure only threads in the warp call it. With `if (h &lt; num_heads)`, threads with warp_id &gt;= num_heads skip it. If num_heads=4 and num_warps=4 (128 threads), this is fine. But if I use 256 threads, warps 4-7 would skip it and deadlock.
+   Fix: use 128 threads (4 warps).
+
+2. Shared memory for smem_k and smem_v: I need to declare it properly. In my code, I defined pointers based on smem base, but I need to make sure the kernel launch requests enough shared memory.
+   For simplicity, I can define pointers relative to a larger smem array.
+
+3. The LayerNorm loop: `for (int n = warp_id; n &lt; N; n += num_warps)`. With 4 warps and N=32, each warp handles 8 rows. Within a warp, the reduction with __shfl_down only works across the warp. Thread 0 handles row 0, thread 1 handles row 1, etc. The __shfl_down will mix values from different rows!
+   Fix: Each thread in warp handles one row, but __shfl_down reduces across all lanes. If lane n handles row n, then __shfl_down will get values from other rows, which is WRONG.
+   
+   Actually, __shfl_down gets values from other lanes in the SAME warp. So if lane 0 computes sum for row 0, lane 1 computes sum for row 1, then when doing __shfl_down(mask, sum, 16), lane 0 gets lane 16&#x27;s sum (which is for row 16). That&#x27;s exactly what we want! We want to sum all lanes&#x27; sums to get total sum across all rows... wait no.
+   
+   For a single row n, only lane n is computing the sum. Other lanes are computing sums for OTHER rows. So __shfl_down across the warp would sum lane 0 (row 0) + lane 16 (row 16). That&#x27;s summing DIFFERENT rows, not the same row.
+   
+   I need all threads in the warp to work on the SAME row. So for row 0: threads 0-31 all compute partial sums of row 0. Then __shfl_down gives total sum of row 0.
+   
+   Fix: LayerNorm should be done differently. 
+   Option A: Each thread handles one row. Compute mean by iterating over all D elements. No shuffle needed.
+   D=64, so each thread does 64 loads and adds. Easy.
+   Option B: Have the warp process one row together.
+   
+   Since D=64 is small, Option A is fine. Each of 32 threads handles one row. 32 threads work, rest idle.
+   
+   But with 4 warps, we can have 128 threads. 
+   Simpler: 64 threads handle one row (but we only have 64 elements). Actually for D=64, we can have 64 threads per row. But 32 rows * 64 threads = 2048 threads, way too many.
+   
+   Let&#x27;s do: thread tid handle rows tid, tid+32, tid+64, etc. but only up to N=32.
+   So threads 0..31 each handle one row. Threads 32..127 idle for LayerNorm.
+   
+   For row n (lane = n):
+   ```
+   float sum = 0;
+   for (int d = 0; d &lt; D; d++) sum += smem_msa[n*D + d];
+   mean = sum / D;
+   float var_sum = 0;
+   for (int d = 0; d &lt; D; d++) { float diff = smem_msa[n*D+d] - mean; var_sum += diff*diff; }
+   inv_std = rsqrtf(var_sum / D + 1e-5f);
+   for (int d = 0; d &lt; D; d++) smem_msa[n*D+d] = (smem_msa[n*D+d] - mean) * inv_std * norm_w[d] + norm_b[d];
+   ```
+   Each thread does 3*64 = 192 ops. 32 threads = 6K ops. Negligible.
+   
+   Let me fix the LayerNorm.
+
+4. MSA attention output: I write to smem_attn using warp-per-head, where lane n writes to row n. This is correct.
+
+5. The msa_ptr loading and later residual addition: I store msa_ptr at the start, but then the pointer is relative to (b,s). When adding residual, I use msa_ptr[i] directly. But msa_ptr was set to `msa + ((b * S + s) * N) * D`. So msa_ptr[i] is the original msa value. Good.
+
+6. PyTorch linear weights: `nn.Linear` weights are (out_features, in_features). In CUDA, qw[d_out * in_features + d_in]. My code uses `qw + (h * head_dim + d_out) * D + d_in`. That&#x27;s correct.
+
+7. For the output linear: `ow + d_out * D + d_in`. That&#x27;s correct.
+
+8. Quantization: PyTorch linear with bias=False doesn&#x27;t have bias. But MSA attention&#x27;s `self.out` has bias=True (default). So we add ob.
+
+Let me fix LayerNorm and resubmit the kernel concept.
+
+Actually wait, I said threads 32-127 idle for LayerNorm. That&#x27;s fine but wastes 75% of threads.
+We can optimize by having more threads participate: e.g., thread tid handles row tid % 32, and within a row, each thread handles a subset of elements for mean/var.
+But with D=64 and 128 threads, we&#x27;d have 4 threads per row. Each computes partial sum of 16 elements. Then need to reduce across 4 threads in different warps... which is harder.
+
+Given the tiny compute of LayerNorm, I&#x27;ll just use 32 threads and __syncthreads after.
+
+Let me rewrite:
+
+```cuda
+__global__ void msa_attn_kernel(...) {
+    extern __shared__ float smem[];
+    float* smem_msa = smem;
+    float* smem_attn = smem + N * D;
+    float* smem_k = smem + 2 * N * D; // size: num_warps * N * head_dim
+    float* smem_v = smem + 2 * N * D + num_warps * N * head_dim; // same size
+    
+    int b = blockIdx.x;
+    int s = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int num_warps = blockDim.x / 32;
+    
+    const float* msa_ptr = msa + ((b * S + s) * N) * D;
+    
+    // Load msa
+    for (int i = tid; i &lt; N * D; i += blockDim.x) {
+        smem_msa[i] = msa_ptr[i];
+    }
+    __syncthreads();
+    
+    // LayerNorm: 32 threads handle 32 rows
+    if (tid &lt; 32) {
+        int n = tid;
+        float sum = 0.0f;
+        for (int d = 0; d &lt; D; d++) sum += smem_msa[n * D + d];
+        float mean = sum / D;
+        float var_sum = 0.0f;
+        for (int d = 0; d &lt; D; d++) {
+            float diff = smem_msa[n * D + d] - mean;
+            var_sum += diff * diff;
+        }
+        float inv_std = rsqrtf(var_sum / D + 1e-5f);
+        for (int d = 0; d &lt; D; d++) {
+            smem_msa[n * D + d] = (smem_msa[n * D + d] - mean) * inv_std * norm_w[d] + norm_b[d];
+        }
+    }
+    __syncthreads();
+    
+    // Per-head attention
+    int h = warp_id;
+    if (h &lt; num_heads) {
+        int n = lane;
+        float q_vec[16];
+        float scores[32];
+        float o_vec[16];
+        float scale = 1.0f / sqrtf((float)head_dim);
+        
+        float* my_k = smem_k + warp_id * N * head_dim;
+        float* my_v = smem_v + warp_id * N * head_dim;
+        
+        // Q
+        for (int dh = 0; dh &lt; head_dim; dh++) {
+            float s = 0.0f;
+            const float* w = qw + (h * head_dim + dh) * D;
+            for (int d = 0; d &lt; D; d++) {
+                s += smem_msa[n * D + d] * w[d];
+            }
+            q_vec[dh] = s;
+        }
+        // K
+        for (int dh = 0; dh &lt; head_dim; dh++) {
+            float s = 0.0f;
+            const float* w = kw + (h * head_dim + dh) * D;
+            for (int d = 0; d &lt; D; d++) {
+                s += smem_msa[n * D + d] * w[d];
+            }
+            my_k[n * head_dim + dh] = s;
+        }
+        // V
+        for (int dh = 0; dh &lt; head_dim; dh++) {
+            float s = 0.0f;
+            const float* w = vw + (h * head_dim + dh) * D;
+            for (int d = 0; d &lt; D; d++) {
+                s += smem_msa[n * D + d] * w[d];
+            }
+            my_v[n * head_dim + dh] = s;
+        }
+        __syncwarp();
+        
+        // Scores
+        for (int m = 0; m &lt; N; m++) {
+            float d = 0.0f;
+            for (int dh = 0; dh &lt; head_dim; dh++) {
+                d += q_vec[dh] * my_k[m * head_dim + dh];
+            }
+            scores[m] = d * scale;
+        }
+        
+        // Softmax
+        float max_s = scores[0];
+        for (int m = 1; m &lt; N; m++) max_s = fmaxf(max_s, scores[m]);
+        float exp_sum = 0.0f;
+        for (int m = 0; m &lt; N; m++) {
+            scores[m] = expf(scores[m] - max_s);
+            exp_sum += scores[m];
+        }
+        float inv_es = 1.0f / exp_sum;
+        for (int m = 0; m &lt; N; m++) scores[m] *= inv_es;
+        
+        // Attn @ V
+        for (int dh = 0; dh &lt; head_dim; dh++) o_vec[dh] = 0.0f;
+        for (int m = 0; m &lt; N; m++) {
+            float s = scores[m];
+            for (int dh = 0; dh &lt; head_dim; dh++) {
+                o_vec[dh] += s * my_v[m * head_dim + dh];
+            }
+        }
+        
+        // Write to smem_attn
+        for (int dh = 0; dh &lt; head_dim; dh++) {
+            smem_attn[n * D + h * head_dim + dh] = o_vec[dh];
+        }
+    }
+    __syncthreads();
+    
+    // Output linear + residual
+    for (int i = tid; i &lt; N * D; i += blockDim.x) {
+        int n = i / D;
+        int d_out = i % D;
+        float s = ob[d_out];
+        const float* w = ow + d_out * D;
+        for (int d = 0; d &lt; D; d++) {
+            s += smem_attn[n * D + d] * w[d];
+        }
+        out_msa[((b * S + s) * N + n) * D + d_out] = msa_ptr[i] + s;
+    }
+}
+```
+
+Wait, for the output linear thread loop:
+`i` ranges from tid to N*D with step blockDim.x.
+If blockDim.x = 128 and N*D = 2048, each thread handles 16 elements.
+`n = i / D` (64) and `d_out = i % D`.
+For tid=0: i=0, n=0, d=0; i=128, n=2, d=0; i=256, n=4, d=0...
+This strided access is not coalesced for writes. 
+To make it coalesced: have threads in a warp handle adjacent d_out for the same n.
+Better mapping:
+For each output position (n, d_out): total 2048.
+Block of 128 threads.
+Thread tid assigned to positions starting at tid * 16, of length 16.
+This gives contiguous positions per thread.
+tid 0: (0, 0..15)
+tid 1: (0, 16..31)
+tid 2: (0, 32..47)
+tid 3: (0, 48..63)
+tid 4: (1, 0..15)
+...
+tid 127: (31, 48..63)
+
+Within a warp (32 threads):
+tid 0-3: n=0, d=0..15, 16..31, 32..47, 48..63
+tid 4-7: n=1, ...
+...
+tid 28-31: n=7, ...
+
+These threads write to adjacent memory? Thread 0 writes to [0*64 + 0], thread 1 writes to [0*64 + 16]. Not perfectly adjacent but within the same cache line. OK.
+
+Actually for writes to be coalesced, threads in a warp should write to adjacent addresses.
+If all threads handle the same n but different d_out: thread 0 writes address base+0, thread1 writes base+1, etc. That&#x27;s perfect coalescing.
+With my mapping, threads handle different n and different d_out.
+tid0: n=0,d=0..15 -&gt; writes 16 floats starting at addr 0.
+tid1: n=0,d=16..31 -&gt; writes 16 floats starting at addr 16.
+tid2: n=0,d=32..47 -&gt; writes starting at addr 32.
+tid3: n=0,d=48..63 -&gt; writes starting at addr 48.
+tid4: n=1,d=0..15 -&gt; writes starting at addr 64.
+These are all adjacent! tid0 writes [0,15], tid1 writes [16,31], tid2 writes [32,47], tid3 writes [48,63], tid4 writes [64,79].
+So writes are perfectly coalesced within the warp. Great.
+
+For reads during the dot product: each thread reads w[d_out, :] which is row d_out of ow. Adjacent threads read different rows. Memory access is strided by D=64 floats = 256 bytes. That&#x27;s not perfectly coalesced but within L1 cache it should be fine.
+And each thread reads smem_attn[n, :] which is row n. Adjacent threads (tid0-3) read n=0 repeatedly. That&#x27;s broadcast. Fine.
+
+This looks good.
+
+Shared memory size calculation:
+- smem_msa: N*D = 2048 floats
+- smem_attn: N*D = 2048 floats
+- smem_k: num_warps * N * head_dim = 4 * 32 * 16 = 2048 floats
+- smem_v: 4 * 32 * 16 = 2048 floats
+Total: 8192 floats = 32768 bytes = 32KB.
+
+Launch config:
+- Grid: (B, S) = (2, 8)
+- Block: 128 threads
+- Shared memory: 32KB
+
+Now, Kernel 2: OPM
+
+```cuda
+__global__ void opm_kernel(
+    const float* __restrict__ msa,
+    float* __restrict__ pair,
+    int B, int S, int N, int D_msa, int H, int D_pair,
+    const float* __restrict__ norm_w,
+    const float* __restrict__ norm_b,
+    const float* __restrict__ aw,
+    const float* __restrict__ ab,
+    const float* __restrict__ bw,
+    const float* __restrict__ bb,
+    const float* __restrict__ ow,
+    const float* __restrict__ ob)
+```
+
+OPM steps:
+1. For each batch b:
+   a. Compute a[s,n,h] and b[s,n,h] for all s,n,h.
+      a = LayerNorm(msa) @ aw^T + ab
+      b = LayerNorm(msa) @ bw^T + bb
+   b. Compute outer[i,j,h1,h2] = sum_s a[s,i,h1] * b[s,j,h2] / S
+   c. Apply ow: pair_update[b,i,j,:] = outer[i,j,:] @ ow^T + ob
+   d. Add to pair[b,i,j,:]
+
+This is more compute intensive. We can have multiple blocks per batch.
+
+Grid design options:
+- One block per (b, i, j): 2 * 32 * 32 = 2048 blocks.
+  Each block computes one (b, i, j).
+  Within block:
+  - Load a[:, i, :] and b[:, j, :] into shared memory.
+    S=8, H=32. a_slice: 8*32 = 256 floats. b_slice: 256 floats. Total 512 floats = 2KB.
+  - Compute outer[h1, h2] = sum_s a[s,i,h1] * b[s,j,h2] / S
+    H*H = 1024 elements. Each requires S=8 mul-adds.
+    8K ops per block. Total: 2048 * 8K = 16M ops.
+    
+    Then apply linear: 1024 * 64 = 65K ops per block? Wait.
+    Outer is flattened to H*H=1024 elements.
+    Linear: (1024,) @ (D_pair, 1024)^T + bias -&gt; (64,) vector.
+    1024 * 64 = 65K ops.
+    
+    Total per block: ~73K ops.
+    2048 blocks: ~150M ops.
+    (Actually wait, I calculated 76M ops earlier. Let me recheck.
+    For B=2: N*N=1024 positions. Each outer product is S*H*H = 8*32*32 = 8K ops. 1024 * 8K = 8.4M per batch, 16.8M total.
+    Linear: 1024 * 1024 * 64 = 67M per batch, 134M total.
+    Wait, N=32, H=32. N*N = 1024.
+    Outer per position: S*H*H = 8*1024 = 8192 ops. Wait, H*H = 1024. S*1024 = 8192. Yes.
+    Total outer: 1024 * 8192 = 8.4M.
+    Linear per position: 1024 * 64 = 65K ops. Total linear: 1024 * 65K = 67M.
+    Total: ~75M ops for B=2.
+    
+    2048 blocks * 73K = 150M. Something&#x27;s off.
+    Oh, if one block per (b,i,j), then for B=2, N=32: 2*32*32 = 2048 blocks.
+    Each block computes outer (H,H) matrix and linear.
+    Outer: H*H*S = 1024*8 = 8192 ops.
+    Linear: H*H * D_pair = 1024 * 64 = 65,536 ops.
+    Total per block: 73,728 ops.
+    2048 blocks: 151M ops. But earlier I said 75M. 
+    Oh! The discrepancy: for B=2, N=32, there are B*N*N = 2048 positions.
+    But N*N = 1024 per batch. So 2048 total.
+    Outer: 2048 * 8192 = 16.7M.
+    Linear: 2048 * 65536 = 134M.
+    Total: 151M ops. I was wrong earlier! That&#x27;s fine.
+    )
+    
+    151M ops / 67 TFlops = 2.25 microseconds. Very fast!
+    
+    But 2048 blocks is a lot for H100 with many SMs. H100 has ~132 SMs? Actually H100 has 132 SMs but can run many blocks concurrently.
+    2048 blocks / 132 SMs = ~15 blocks per SM. At 2048 threads per SM max, each SM can handle multiple blocks.
+    
+    Memory: read msa: B*S*N*D = 2*8*32*64 = 32K floats = 128KB.
+    Read pair: B*N*N*D_pair = 2*32*32*64 = 131K floats = 524KB.
+    Write pair: 524KB.
+    Total: ~1.2MB. At 3.35TB/s: 0.36 microseconds.
+    
+    So OPM is compute bound. 151M ops, 1.2MB = 125 FLOP/byte. 
+    At 20 FLOP/byte for compute bound, yes, comfortably compute bound.
+    
+    For good performance, we want blocks to have enough ops to hide latency.
+    73K ops per block is decent but small. 
+    Alternatively: one block per (b, i), computing for all j=0..31.
+    Block (b, i): computes all j=0..31.
+    Within block:
+    - Load a[:, i, :] (S*H = 256 floats)
+    - Load b[:, :, :] (S*N*H = 8192 floats) for all j
+    - For j=0..31: compute outer_j and linear_j
+    Total ops per block: 31 * 73K = 2.3M ops. Much better for latency hiding.
+    But b data is 8K * 4 = 32KB. Shared memory for b: 32KB per block.
+    That&#x27;s well within limits.
+    
+    Actually b[:, j, :] for all j: S*N*H = 8*32*32 = 8192 floats = 32KB.
+    a[:, i, :] for one i: S*H = 256 floats = 1KB.
+    Total: 33KB. Fits in shared memory (though we might want to use 64KB per block).
+    
+    With 2048 blocks (b,i,j) -&gt; 64 blocks (b,i). Each block does 31* more work.
+    64 blocks / 132 SMs: less than 1 block per SM. But each block has 2.3M ops.
+    Actually we could use more threads per block.
+    
+    Another option: one block per batch b. 
+    Block b: computes all (i,j) pairs.
+    For i=0..31, j=0..31.
+    We can tile: each thread block handles a tile of (i_tile, j_tile).
+    Or one big kernel with many thread blocks.
+    
+    Let&#x27;s do: block per (b, i_tile, j_tile) with tile sizes.
+    Say tile_i = 4, tile_j = 4.
+    Grid: B * (N/4) * (N/4) = 2 * 8 * 8 = 128 blocks.
+    Each block computes a 4x4 tile of (i,j).
+    Ops per block: 16 * 73K = 1.17M ops.
+    Need a[:, i_tile:4, :] and b[:, j_tile:4, :].
+    a data: 4 * S * H = 1024 floats = 4KB.
+    b data: 4 * S * H = 4KB. (Wait, S*N*H for 4 j&#x27;s is 4*8*32 = 1024 floats? No, j is the second dimension in a[s,j,h]. For 4 js, we need 4*S*H = 4*8*32 = 1024 floats.)
+    
+    Wait, a and b are (S, N, H). For tile of 4 i values and 4 j values:
+    a_slice: 4 * S * H = 4*8*32 = 1024 floats
+    b_slice: 4 * S * H = 1024 floats
+    Total: 8KB. Easy.
+    
+    Then for each (i,j) in the 4x4 tile, compute outer (H,H) = 1024 elements, each sum over S=8.
+    And linear for each (i,j).
+    Total work: 16 * (8K + 65K) = 1.17M ops.
+    
+    Threads: 256 threads per block.
+    For each (i,j) in tile:
+    - Compute outer[h1,h2] = sum_s a[s,i,h1]*b[s,j,h2]/S
+      We have 256 threads, H*H=1024 elements. Each thread computes 4 elements.
+      For element (h1,h2): sum over S=8.
+      Threads can be assigned to (h1, h2) as: tid = h1*32 + h2, but H=32.
+      Actually 256 threads, 1024 elements. Each thread computes 4 elements.
+      Threads assigned to (h1/2, h2) or similar.
+      H1=32, H2=32. 256 threads = 8 * 32.
+      Thread tid: h1 = tid / 32 * 4 + (tid % 32) / 8... messy.
+      Simpler: for int idx = tid; idx &lt; H*H; idx += 256.
+      h1 = idx / H, h2 = idx % H.
+      Each thread loops over s=0..7.
+      This is simple and should be fine though not perfectly coalesced.
+      
+    - Then linear: 1024 -&gt; 64.
+      256 threads, 64 outputs per (i,j). 16 (i,j) pairs.
+      Actually we&#x27;d do linear per (i,j) sequentially.
+      For one (i,j): 64 outputs. 256 threads can handle 4 (i,j) simultaneously if we have them.
+      But it might be easier to just do everything sequentially per (i,j).
+      
+    Hmm, this is getting complicated. Maybe block per (b,i,j) is fine.
+    2048 blocks, each with 128 threads, 73K ops. 
+    On H100, a block with 128 threads and 73K ops should take ~1-2 microseconds.
+    2048 * 1.5us = 3ms? No, they run in parallel.
+    With 132 SMs, ~15 blocks per SM. If each SM can handle 2048 threads / 128 = 16 blocks. So ~15 blocks per SM is fine.
+    Occupancy: 15 blocks * 128 threads = 1920 threads / 1536 max per SM = 125%. Close to full.
+    Actually H100 max threads per SM is 2048 (on some) or 1536 (on H100 PCIe). Let&#x27;s say 1536.
+    Then 15 * 128 = 1920 &gt; 1536, so maybe 12 blocks per SM.
+    Total concurrent blocks: 132 * 12 = 1584 blocks.
+    2048 blocks total, so 2 waves.
+    Time: 2048 / 1584 * block_time.
+    If block_time is 1us, total ~1.3us.
+    
+    This is likely fast enough. Let me do the simpler block-per-(b,i,j) design.
+
+```cuda
+__global__ void opm_kernel(
+    const float* __restrict__ msa,
+    float* __restrict__ pair,
+    int B, int S, int N, int D_msa, int H, int D_pair,
+    const float* __restrict__ norm_w,
+    const float* __restrict__ norm_b,
+    const float* __restrict__ aw,
+    const float* __restrict__ ab,
+    const float* __restrict__ bw,
+    const float* __restrict__ bb,
+    const float* __restrict__ ow,
+    const float* __restrict__ ob)
+{
+    extern __shared__ float smem[];
+    // smem_a: S * H floats
+    // smem_b: S * H floats
+    // smem_outer: H * H floats
+    
+    float* smem_a = smem;
+    float* smem_b = smem + S * H;
+    float* smem_outer = smem + 2 * S * H;
+    
+    int b = blockIdx.x;
+    int i = blockIdx.y;
+    int j = blockIdx.z;
+    int tid = threadIdx.x;
+    
+    // Step 1: Compute a[:, i, :] and b[:, j, :]
+    // For each s in 0..S-1:
+    //   Load msa[b,s,i,:]
+    //   LayerNorm
+    //   Compute a[s,i,h] = dot(msa_norm, aw[h,:]) + ab[h]
+    //   Compute b[s,j,h] = dot(msa_norm, bw[h,:]) + bb[h]
+    
+    // MSA data layout: [B, S, N, D_msa]
+    // For (b,s,n): offset = ((b*S + s)*N + n) * D_msa
+    // But we need all s for fixed (b,i). And all s for fixed (b,j).
+    
+    // We&#x27;ll have each block compute a and b for its i and j.
+    // Number of s values: S=8.
+    // Number of h values: H=32.
+    // Total a elements: 8*32 = 256. Total b: 256.
+    
+    // Load and process each s
+    for (int s = 0; s &lt; S; s++) {
+        // Load msa[b, s, i, :] and msa[b, s, j, :] into registers
+        // For i:
+        const float* msa_i = msa + (((b * S + s) * N + i) * D_msa);
+        const float* msa_j = msa + (((b * S + s) * N + j) * D_msa);
+        
+        // LayerNorm on msa_i
+        // Compute mean, var over D_msa=64
+        float sum_i = 0.0f;
+        float sum_j = 0.0f;
+        #pragma unroll
+        for (int d = tid; d &lt; D_msa; d += blockDim.x) {
+            sum_i += msa_i[d];
+            sum_j += msa_j[d];
+        }
+        // Block reduce sum
+        // ... need __syncthreads and reduction
+        // Actually we can do warp-shuffle reduce then shared memory.
+        
+        // Wait, if blockDim.x is 128, we have 4 warps.
+        // Each warp computes partial sum. Then reduce.
+        // This is getting complex for a simple kernel.
+        
+        // Alternative: each thread handles one s value.
+        // 128 threads, 8 s values. 16 threads per s.
+        // For s, each of 16 threads computes partial mean/var of 64/16 = 4 elements.
+        // Then reduce across 16 threads...
+        // But 16 threads is half a warp, awkward for shuffle.
+    }
+}
+```
+
+Block per (b, i, j) with 128 threads and needing to load S values per block is complicated because each block processes fixed (i,j) and all s.
+For fixed (i,j), we need msa[b, all_s, i, :] and msa[b, all_s, j, :].
+Total msa load: 2 * S * D_msa = 2 * 8 * 64 = 1024 floats = 4KB.
+LayerNorm: 2 rows * 64 elements each = simple.
+Then compute a and b: 2 * H * D_msa = 2 * 32 * 64 = 4K ops.
+
+For one block, perhaps 64 threads is enough.
+But then we won&#x27;t saturate the GPU with 2048 blocks / some low occupancy.
+
+OK, this is getting too complicated. Maybe I should write OPM with one block per batch b:
+- Block b: computes all (i,j).
+- With N=32, H=32, S=8.
+- Total output: N*N*D_pair = 32*32*64 = 65536 floats = 256KB.
+- We need to compute outer for all (i,j): N*N*H*H = 1M elements.
+- We can have the block process (i,j) sequentially or tiled.
+
+Wait, I just thought of another approach. Since PyTorch is already quite optimized for the compute-heavy parts, and the main overhead is the number of kernels, maybe I can write the kernels using more straightforward but heavily fused approaches.
+
+For OPM:
+- One block per (b, i). Block computes all j=0..N-1.
+- Grid: (B, N) = (2, 32) = 64 blocks.
+- Block: 256 threads.
+- Each block:
+  1. Load a[:, i, :] for all s. Compute via LayerNorm + linear.
+     S*H = 8*32 = 256 elements.
+     Need msa[b, :, i, :] -&gt; S*D_msa = 512 elements.
+     Compute a. Write to smem_a[S][H].
+  2. Load b[:, :, :] for all s,j.
+     S*N*H = 8*32*32 = 8192 elements.
+     Need msa[b, :, :, :] -&gt; S*N*D_msa = 8*32*64 = 16384 elements = 64KB.
+     Can we load all of this? For one batch b, S*N*D_msa = 16K floats = 64KB.
+     That&#x27;s fine for shared memory.
+  3. For each j=0..31: compute outer_j[h1,h2] and linear.
+     Outer: H*H elements, sum over S=8.
+     Linear: H*H -&gt; 64.
+     Total per j: 1024*8 + 1024*64 = 73K ops.
+     32 j&#x27;s: 2.3M ops per block.
+  4. Write result to pair.
+
+64 blocks * 2.3M ops = 147M ops total.
+With 64 blocks, on H100 we run ~32 concurrently (2 per SM).
+Each block takes ~2.3M / (some FLOPs per cycle). At 67 TFlops, theoretically 34 microseconds total? No.
+Wait, each block has 2.3M ops, and we run 64 blocks total.
+If we run 32 blocks at a time, total time ~2 * block_time.
+Block_time for 2.3M ops at ~1 TFlops per SM? H100 has ~0.5 TFlops per SM in FP32 (67/132).
+2.3M / 0.5T = 4.6 microseconds per block.
+2 waves = 9.2 microseconds.
+This seems reasonable.
+
+For shared memory:
+- msa_norm: S*N*D_msa = 16384 floats = 64KB
+- a: S*H = 256 floats = 1KB
+- b: S*N*H = 8192 floats = 32KB
+- outer: H*H = 1024 floats = 4KB
+Total: 101KB. Within 227KB limit.
+
+This seems good! Let me refine.
+
+Wait, but in OPM, the a and b need to be computed from LayerNorm(msa). For `a`, we need msa[:, i, :]. For `b`, we need msa[:, j, :]` for all j.
+If we load all msa[b, :, :, :] into shared memory, we can compute LayerNorm for all rows.
+
+Plan for OPM block per (b, i):
+1. All threads load msa for batch b: S*N*D_msa elements.
+   Threads load in coalesced chunks.
+2. LayerNorm for all S*N rows.
+   S*N = 8*32 = 256 rows.
+   We have 256 threads? If blockDim.x = 256.
+   Then each thread handles one row. Perfect!
+   Wait, we might need more threads for the matmuls later.
+   Let&#x27;s use 256 threads = 8 warps.
+   
+   For LayerNorm: threads 0..255 each handle one (s,n) row. Compute mean/var over D_msa=64.
+   Write normalized msa to smem.
+   
+3. Compute a[s, h] for this i:
+   Each of 32 threads computes one h for all s? Or each of 8 threads computes a subset.
+   a[s, h] = dot(msa_norm[s,i,:], aw[h,:]) + ab[h]
+   For fixed (s,i), we need H outputs. 
+   If 32 threads available: each thread computes a[s, h] for a subset of h.
+   But we have 256 threads. We can process all 8 s values simultaneously.
+   - Threads in groups of 32 compute a for one s.
+   - 8 groups for 8 s values.
+   - Each thread in group computes one h: dot product of 64 elements.
+   Total a compute: 8*32*64 = 16K ops. Trivial.
+   
+4. Compute b[s, j, h] for all j and h:
+   b[s,j,h] = dot(msa_norm[s,j,:], bw[h,:]) + bb[h]
+   For fixed (s,j), H outputs.
+   S*N = 256 (s,j) pairs. H=32 outputs each.
+   Total b elements: S*N*H = 8192.
+   Total b compute: 8192 * 64 = 524K ops.
+   
+   With 256 threads:
+   Each thread computes 32 elements.
+   Element index e = tid. For e in [0, 255], compute b values e, e+256, e+512, e+768, e+1024, e+1280, e+1536, e+1792, e+2048, e+2304, e+2560, e+2816, e+3072, e+3327.
+   Wait, 8192 / 256 = 32 elements per thread.
+   
+   Mapping: element e corresponds to (s, j, h).
+   e = ((s * N) + j) * H + h.
+   Thread tid computes for e = tid, tid+256, ..., up to 8192.
+   For each e: extract (s,j,h), load msa_norm[s,j,:], compute dot with bw[h,:], add bb[h].
+   
+   This is straightforward. The dot product of length 64 per element.
+   We can also do matmul: (S*N, D_msa) @ (D_msa, H) -&gt; (S*N, H).
+   256 threads cooperatively.
+   
+   Actually a cleaner way:
+   - We have msa_norm in smem. Layout: [S][N][D_msa].
+   - We want b of shape [S][N][H].
+   - This is just a batched matmul.
+   - With 256 threads: for each output position (s,j,h), one thread computes dot product.
+   - Map tid to (sj, h) where sj = tid / 32, h_offset = tid % 32.
+     Wait, if 32 threads handle one (s,j) to compute all H outputs cooperatively:
+     Warp t handles (s=t/32, j=t%32)? No, 32 warps for 256 (s,j) pairs doesn&#x27;t work.
+     
+   Simpler: just reuse the same pattern as before.
+   #pragma unroll
+   for (int e = tid; e &lt; S * N * H; e += blockDim.x) {
+       int s = e / (N * H);
+       int rem = e % (N * H);
+       int j = rem / H;
+       int h = rem % H;
+       float sum = bb[h];
+       for (int d = 0; d &lt; D_msa; d++) {
+           sum += smem_msa_norm[s*N*D_msa + j*D_msa + d] * bw[h*D_msa + d];
+       }
+       smem_b[s*N*H + j*H + h] = sum;
+   }
+   __syncthreads();
+   
+   This is simple and correct. With H*D_msa = 32*64 = 2K per h. 
+   bw is 2K floats. Reads from bw[h,:] by threads with same h but different (s,j): broadcast/constant.
+   Reads from smem: different for each thread.
+   
+   bw might fit in L1. 32 rows * 64 = 2K floats = 8KB. Fine.
+   
+5. Compute outer products for all j:
+   For j=0..N-1:
+     outer[h1, h2] = sum_s a[s, h1] * b[s, j, h2] / S
+     With 256 threads and H*H = 1024 elements:
+     for (int idx = tid; idx &lt; H*H; idx += 256) { ... }
+     Each thread computes 4 elements.
+     For one (h1, h2): loop s=0..7.
+     After outer, apply linear.
+     
+     Linear: outer_flat[H*H] -&gt; out[D_pair=64].
+     for (int d_out = tid; d_out &lt; D_pair; d_out += 256) {
+         sum = ob[d_out];
+         for (int h = 0; h &lt; H*H; h++) sum += outer_flat[h] * ow[d_out * (H*H) + h];
+         pair[b, i, j, d_out] += sum;
+     }
+     
+     Wait, ow is (D_pair, H*H). ow[d_out, h] = ow[d_out * (H*H) + h].
+     
+     Each j iteration: 1024*8 + 1024*64 = 73K ops.
+     Participated by 256 threads: each thread ~286 ops. Small.
+     But sequential over 32 j&#x27;s: 32 * 286 = 9K ops per thread. Total 2.3M per block.
+     
+     The memory issue: each j iteration we need b[:, j, :]. Since b is in shared memory, access is fast.
+     The outer array is small (1024 floats).
+     
+6. Write to pair: pair is [B, N, N, D_pair].
+   pair[b, i, j, d_out] = pair[b, i, j, d_out] + out[d_out]
+
+This seems reasonable! The large block size (256 threads) means 64 blocks total. Each SM can run multiple blocks if shared memory allows.
+101KB shared memory per block. H100 has ~228KB per SM. So each SM can run 2 blocks. Total 264 concurrent blocks. We have 64 blocks. So all 64 blocks run simultaneously! Excellent.
+Time: each block 2.3M ops. 64 blocks on 132 SMs: about 0.5 blocks per SM. Each SM has ~0.5 TFlops. 2.3M ops / 0.5T = 4.6 microseconds. Total ~5 microseconds.
+
+Now Kernel 3: TriMulOut
+
+For TriMulOut, we can similarly do block per (b, i, j) or block per (b, i).
+Grid: if block per (b, i, j): B*N*N = 2*32*32 = 2048 blocks.
+Each block:
+1. Load pair[b, i, :, :] and pair[b, j, :, :]? 
+   Wait, TriMul needs:
+   - pair[b, i, k, :] for all k (to compute a)
+   - pair[b, j, k, :] for all k (to compute b)  
+   - pair[b, i, j, :] for gate.
+   
+   a[b, i, k, h] = pa(pair[b, i, k, :]) * sigmoid(ga(pair[b, i, k, :]))
+   Here i is the first index, k is the second.
+   
+   For fixed (b, i, j):
+   o[b, i, j, h] = sum_k a[b, i, k, h] * b[b, j, k, h]
+   
+   a_i depends only on i. b_j depends only on j.
+   For one block (b,i,j), we need:
+   - N rows of pair for i: pair[b, i, 0:N, :] -&gt; N * D_pair = 32*64 = 2048 floats = 8KB
+   - N rows of pair for j: pair[b, j, 0:N, :] -&gt; 8KB
+   - pair[b, i, j, :] -&gt; 64 floats (for gate)
+   
+   Total pair load: ~16KB.
+   
+   Compute a and b:
+   - a[k, h] for k=0..31, h=0..31: 32*32 = 1024 elements.
+     Compute pa(ga): 2 linears of (64-&gt;32). Each: 32*64 = 2K ops.
+     Total: 4K ops for a, 4K ops for b. Plus sigmoid.
+   - o[h] = sum_k a[k,h] * b[k,h] for h=0..31: 32*32 = 1K ops.
+   - norm_out + out linear: LayerNorm(32) + Linear(32-&gt;64): ~2K ops.
+   - gate: Linear(64-&gt;64) + sigmoid on pair[b,i,j,:]: 4K ops.
+   - Multiply and add residual: small.
+   
+   Total per block: ~15K ops.
+   2048 blocks: 31M ops.
+   Memory read: 2048 * 16KB = 32MB. Write: 2048 * 64*4 = 0.5MB.
+   Total memory: ~32MB. At 3.35TB/s: 9.5 microseconds.
+   Compute: 31M / 67T = 0.46 microseconds.
+   Clearly memory bound.
+   
+   With block per (b,i,j), shared memory: 16KB for pair + 2KB for a + 2KB for b + scratch.
+   Total ~24KB. Fine.
+   
+   BUT 2048 blocks of 128 threads = 262K threads. 
+   2048 blocks / 132 SMs = 15.5 blocks per SM. 
+   15.5 * 128 = 1984 threads per SM. Close to max (2048). Good occupancy.
+   
+   However, each block only does ~15K ops and reads 16KB.
+   15K ops / 16KB = ~1 FLOP/byte. Very memory bound.
+   The main thing is to maximize memory bandwidth utilization.
+   Since pair is read from global memory, and we&#x27;re doing many random-ish accesses (per i,j we read different slices), L2 cache might help a lot.
+   
+   Actually, pair layout is [B, N, N, D_pair].
+   For fixed b, pair[b, i, k, :] and pair[b, j, k, :].
+   pair[b, i, 0:N, :] is N*D_pair = 2048 floats = 8KB.
+   pair[b, j, 0:N, :] is another 8KB.
+   These are strided in memory by N*D_pair = 2048 floats.
+   For thread block (b,i,j), the reads are:
+   - pair[b, i, 0, :] at offset (b*N*N + i*N + 0)*D_pair
+   - pair[b, i, 1, :] at offset + D_pair
+   - ...
+   - pair[b, j, 0, :] at offset (b*N*N + j*N + 0)*D_pair
+   
+   These accesses are strided but contiguous within each row.
+   
+   Coalescing: if block has 128 threads, and we load pair[b,i,k,:] for one k:
+   - 128 threads, D_pair=64. Each thread loads 0.5 floats? No.
+   Actually we can have each warp load one k row.
+   Warp 0: loads pair[b, i, 0, 0..63] and pair[b, j, 0, 0..63].
+   Warp 1: loads pair[b, i, 1, 0..63] and pair[b, j, 1, 0..63].
+   4 warps handle k=0..3.
+   Continue...
+   
+   Wait, for a and b, we need all k=0..31. 
+   We can load all pair data cooperatively.
+   
+   With 128 threads and N=32, D_pair=64:
+   Total data to load: 2 * N * D_pair = 4096 floats.
+   128 threads load 32 floats each. Very straightforward.
+   
+   Let&#x27;s structure the TriMul kernel with block per (b, i, j):
+
+Actually, I just realized that for TriMulOut, the pair is updated as `pair = pair + output`. So we need to read the original pair, compute output, then write back `pair + output`. Since the output depends on pair, we need to read pair before writing.
+
+Also: the `gate_out` uses the ORIGINAL pair (after norm). Wait:
+```python
+x = self.norm(pair)
+a = self.pa(x) * torch.sigmoid(self.ga(x))
+b = self.pb(x) * torch.sigmoid(self.gb(x))
+o = torch.einsum(&quot;bikh,bjkh-&gt;bijh&quot;, a, b)
+o = self.out(self.norm_out(o))
+return torch.sigmoid(self.gate_out(pair)) * o
+```
+Note: `gate_out(pair)` uses `pair` directly, NOT `self.norm(pair)`. The code uses `pair`, not `x`.
+
+So for TriMul:
+1. x = LayerNorm(pair)
+2. From x (normed pair), compute a, b
+3. o = einsum(a, b)
+4. o = LayerNorm(o) -&gt; Linear -&gt; out
+5. gate = sigmoid(Linear(pair) + bias)
+6. result = gate * o
+7. pair = pair + result
+
+Now, `pair` in gate is the original pair, not the normed one.
+
+For block (b, i, j):
+- Load pair[b, i, k, :] for all k = 0..N-1
+- Load pair[b, j, k, :] for all k = 0..N-1
+- Load pair[b, i, j, :] for gate
+- LayerNorm each row of pair[b, i, k, :] and pair[b, j, k, :]
+- Compute a[k, h] = pa(x_i[k]) * sigmoid(ga(x_i[k]))
+- Compute b[k, h] = pb(x_j[k]) * sigmoid(gb(x_j[k]))
+- o[h] = sum_k a[k,h] * b[k,h]
+- out_linear(norm_out(o)) -&gt; out_vec[64]
+- gate_vec = sigmoid(gate_linear(pair[b,i,j,:]) + bias)
+- result = gate_vec * out_vec
+- pair[b,i,j,:] += result
+
+Wait, there&#x27;s also `self.norm_out(o)` before `self.out(o)`.
+And `self.out` is `nn.Linear(hidden, pair_dim)`.
+
+So steps for o:
+- o is (hidden,). Apply LayerNorm: `norm_out_w` and `norm_out_b`.
+- Then Linear: `out_w` (pair_dim, hidden), `out_b` (pair_dim,).
+
+For one block (b, i, j):
+- Reads: pair_i_k (N * D_pair), pair_j_k (N * D_pair), pair_ij (D_pair)
+- Computes: 
+  - 2*N LayerNorms
+  - 4*N linear projections (64-&gt;32): pa, ga, pb, gb
+  - 2*N sigmoid + elementwise mul
+  - N*H dot products for einsum
+  - 1 LayerNorm on H
+  - 1 Linear H-&gt;64
+  - 1 Linear 64-&gt;64 + sigmoid for gate
+  - elementwise mul + add
+- Total ops: ~20K
+- Memory: read ~17KB, write ~256B
+
+2048 blocks * 20K ops = 40M ops. 40M / 67T = 0.6 microseconds compute.
+Memory: 2048 * 17KB = 34MB read. 34MB / 3.35TB/s = 10 microseconds.
+Clearly memory bound.
+
+To optimize memory, we should maximize cache hits. 
+When block (b,i,j) reads pair[b,i,0:N,:], and block (b,i,j+1) also reads pair[b,i,0:N,:], these are repeated reads. L2 cache should capture this if blocks run close in time.
+
+Similarly for pair[b,j,0:N,:].
+
+Alternatively, block per (b, i) computing all j=0..31:
+- Block (b,i): 
+  - Load pair[b,i,0:N,:] once.
+  - For each j=0..31:
+    - Load pair[b,j,0:N,:]
+    - Compute all steps
+    - Write result
+    
+- Shared memory for pair_i: N*D_pair = 2KB.
+- For j&#x27;s data: N*D_pair = 2KB.
+- Total small. But each block now does 32 * 20K = 640K ops.
+- 64 blocks total (B*N = 2*32 = 64).
+- Each SM runs 1 block. 64 blocks / 132 SMs = 0.5 blocks per SM.
+- Time: 640K ops / 0.5T per SM = 1.3 microseconds + memory.
+- Memory: each block reads pair_i (2KB) + pair_j for 32 js (64KB) + pair_ij for 32 js (2KB) = 68KB.
+  64 blocks * 68KB = 4.4MB. 4.4MB / 3.35TB/s = 1.3 microseconds.
+  
+Actually wait, if block (b,i) handles all j:
+Memory per block:
+- pair_i: read once, 2KB
+- For j=0..31:
+  - pair_j: N*D_pair = 2KB
+  - pair_ij: D_pair = 256 bytes
+  Total for 32 js: 64KB + 8KB = 72KB. Plus pair_i = 2KB. 74KB.
+  But pair_j for different j are different memory regions.
+  Total reads: 74KB per block.
+  
+  64 blocks * 74KB = 4.7MB.
+  But note: pair_j is read multiple times across different i blocks.
+  pair[b,j,0:N,:] is read by block (b,0), (b,1), ..., (b,31). So 32 times.
+  Also pair[b,i,j,:] is read once per block.
+  
+  Total memory bandwidth: 
+  pair data read: for each (b,i,j), we need pair[b,i,0:N,:] and pair[b,j,0:N,:].
+  In block-per-(b,i): for fixed (b,i), we read pair[b,i,:,:] once and pair[b,j,:,:] for all j.
+  Total: N*D_pair + N * N*D_pair = 2K + 64K = 66K per block.
+  64 blocks: 4.2MB.
+  Plus gate reads: N * D_pair = 2K per block. 64 blocks = 128KB. Very small.
+  
+  Actually wait, in TriMulOut, gate uses pair[b,i,j,:] directly, which is 64 floats = 256 bytes.
+  For block (b,i) with 32 j&#x27;s: 32 * 256 = 8KB.
+  Total per block: 66K + 8K = 74K.
+  64 blocks: 4.7MB.
+  
+  But in PyTorch, the reference also reads all this memory, just in more kernels. So our custom kernel should have similar total memory traffic.
+  The win is fusion (fewer launches) and potentially better L1/L2 cache reuse within a block.
+  
+  With block per (b,i), we cache pair[b,i,:,:] in smem or registers across all j computations. That&#x27;s good.
+  
+  Let&#x27;s design block per (b,i).
+  Grid: (B, N) = (2, 32). blockDim.x = 256 threads.
+  
+  Per block (b,i):
+  1. Load pair[b, i, k, :] for k=0..31, d=0..63 into registers/smem.
+     32*64 = 2048 floats = 8KB.
+  2. LayerNorm each of the 32 rows.
+     256 threads, 32 rows. 8 threads per row.
+     Actually 32 warps? No, 256 threads = 8 warps.
+     Each warp handles 4 rows. 8 warps * 4 = 32 rows.
+     Within warp: 32 threads compute mean/var for one row. 8 iterations for 8 rows? 
+     Wait, 8 warps, each handles 4 rows = 32 rows.
+     For one row: 32 threads compute partial sums. Warp shuffle reduce. 
+     Then normalize. 4 rows per warp sequentially.
+     This is clean.
+     
+     Actually simpler with the thread-per-row approach (32 threads handle 32 rows, rest idle).
+     Since there are 8 warps, we can do 4 rounds: in round r, warp 0 handles row r, warp 1 handles row r+4? No.
+     
+     Let&#x27;s just use 32 threads for LayerNorm and the rest wait.
+     __syncthreads() after.
+     
+     Or: each of 32 threads handles one row sequentially. 224 threads idle. 
+     Compute is tiny though.
+     
+  3. Compute a[k,h] = pa(x_i[k]) * sigmoid(ga(x_i[k])) for all k=0..31, h=0..31.
+     32*32 = 1024 elements.
+     Each element needs 2 linears (64-&gt;32) -&gt; actually pa and ga are separate linears.
+     a[k,h] = (sum_d x[k,d]*pa_w[h,d] + pa_b[h]) * sigmoid(sum_d x[k,d]*ga_w[h,d] + ga_b[h])
+     
+     We can compute pa and ga first:
+     pa[k,h] = x[k,:] @ pa_w^T + pa_b
+     ga[k,h] = x[k,:] @ ga_w^T + ga_b
+     a[k,h] = pa[k,h] * sigmoid(ga[k,h])
+     
+     pa: (N, D_pair) @ (D_pair, hidden) -&gt; (N, hidden) = 32*64*32 = 65K ops.
+     ga: same = 65K ops.
+     sigmoid + mul: 1K ops.
+     Total for a: ~131K ops.
+     
+     With 256 threads:
+     Each thread computes 4 elements.
+     Total 131K / 256 = 512 ops per thread.
+     
+     Similarly, for each j we need b_j.
+     
+  4. For j=0..31:
+     a. Load pair[b, j, k, :] for k=0..31. Compute LayerNorm, then b[k,h].
+        b[k,h] = pb(x_j[k]) * sigmoid(gb(x_j[k]))
+        Same compute as a: 131K ops.
+     b. Compute o[h] = sum_k a[k,h] * b[k,h] for h=0..31.
+        32*32 = 1K ops.
+     c. LayerNorm(o) then out_linear: ~2K ops.
+     d. gate from pair[b,i,j,:]: Linear 64-&gt;64 + sigmoid: 4K ops.
+     e. output = gate * out + pair[b,i,j,:] (residual)
+     f. Write back.
+     
+     Per j: ~140K ops.
+     32 js: ~4.5M ops.
+     Plus a compute: ~0.13M ops.
+     Total per block: ~4.6M ops.
+     
+     64 blocks: 295M ops.
+     Wait, 64 * 4.6M = 294M ops. 
+     Memory: 64 * 74KB = 4.7MB.
+     294M / 4.7MB = 62 FLOP/byte. Compute bound!
+     At 67 TFLOPS: 4.4 microseconds.
+     Memory at 3.35 TB/s for 4.7MB: 1.4 microseconds.
+     So compute bound, total ~5 microseconds.
+     
+     This is great!
+
+But the issue is that for each j, we need to compute b_j[k,h], and b_j depends on j. We compute b_j fresh for each j.
+
+However, if 64 blocks run concurrently, and each block takes 5 microseconds, total 5 microseconds. Excellent.
+
+For a and b_j computations:
+a[k,h] for k=0..31, h=0..31: 1024 elements.
+b[k,h] for k=0..31, h=0..31: 1024 elements per j.
+
+We can compute these as batched matmuls or just loops.
+With N=32, D=64, H=32:
+- pa: x[N,D] @ pa_w[H,D].T -&gt; x @ W.T where W is (H,D).
+  Or equivalently: pa[k,h] = sum_d x[k,d] * pa_w[h,d].
+  This is straightforward.
+  
+In the kernel, we can store x_i in shared memory.
+For a:
+```
+for (int idx = tid; idx &lt; N * H; idx += blockDim.x) {
+    int k = idx / H;
+    int h = idx % H;
+    float pa = pa_b[h];
+    float ga = ga_b[h];
+    for (int d = 0; d &lt; D_pair; d++) {
+        pa += smem_x_i[k * D_pair + d] * pa_w[h * D_pair + d];
+        ga += smem_x_i[k * D_pair + d] * ga_w[h * D_pair + d];
+    }
+    smem_a[k * H + h] = pa * sigmoid(ga);
+}
+```
+
+For b_j, we load pair[b,j,k,:] and compute similarly.
+
+But loading pair_j for all k from global memory each time:
+pair[b, j, k, :] is at offset ((b * N + j) * N + k) * D_pair.
+For fixed (b,j), as k varies, addresses are contiguous.
+We can load pair_j into shared memory first, then compute LayerNorm and b.
+
+Plan for block (b,i):
+1. Load pair_i: for k=0..31, d=0..63.
+   Use all 256 threads.
+   pair_i_ptr = pair + ((b * N + i) * N) * D_pair.
+   Each thread loads (32*64)/256 = 8 floats.
+   
+2. LayerNorm pair_i in shared memory.
+   Use 32 threads (one per row), __syncthreads.
+   
+3. Compute a[k,h] for all k,h.
+   256 threads, each computes some (k,h).
+   
+4. For j=0..31:
+   a. Load pair_j into shared memory (reuse a buffer).
+      pair_j_ptr = pair + ((b * N + j) * N) * D_pair.
+      Load 32*64 = 2048 floats.
+   b. LayerNorm pair_j.
+   c. Compute b[k,h].
+   d. Compute o[h] = sum_k a[k,h] * b[k,h].
+      Use threads: for h = tid; h &lt; H; h += blockDim.x (256 &gt; 32, so only 32 threads used).
+      Or map tid to h. 32 values, 256 threads: each h computed by 8 threads doing partial sums.
+      Better: have 32 threads compute o[h] for h=0..31.
+      ```
+      if (tid &lt; 32) {
+          int h = tid;
+          float sum = 0;
+          for (int k = 0; k &lt; N; k++) {
+              sum += smem_a[k*H + h] * smem_b[k*H + h];
+          }
+          smem_o[h] = sum;
+      }
+      ```
+      Then __syncthreads().
+   e. LayerNorm o + out linear.
+      LayerNorm: mean, var of 32 elements. Use 32 threads.
+      Linear: 32-&gt;64. Use 64 threads (one per output).
+   f. Gate from pair_ij.
+      pair_ij is at pair + ((b*N + i)*N + j)*D_pair.
+      Load 64 floats. Compute gate linear 64-&gt;64 + sigmoid.
+      Use 64 threads.
+   g. Multiply gate * out, add to pair_ij, write back.
+      64 threads.
+
+Wait, the problem with this sequential j approach is that many operations use only 32 or 64 threads, leaving most threads idle. But synchronization is within the block so it&#x27;s fine. The latency of sequential operations might be okay since each is small.
+
+However, 31 iterations (j=0..30, or j=0..31) with __syncthreads() each time and many underutilized warps might be slow. The instructions are lightweight though.
+
+Alternative: process multiple j values simultaneously using more threads.
+Since a is fixed for this block (depends only on i), and b depends on j, we can process multiple j&#x27;s in parallel.
+
+With 256 threads, and each j needing ~140K ops but many threads underutilized:
+Actually, the underutilization is the main problem. For einsum: 32 threads. For linear: 64 threads. For gate: 64 threads. Total effective parallelism is low.
+
+But we have 256 threads. Can we process 8 j values simultaneously?
+Divide 256 threads into 8 groups of 32 threads. Each group handles one j.
+Group g handles j = j_base + g.
+Each group:
+1. Loads pair_j (needs 2048 floats). But all 8 groups need different pair_j.
+   Total load: 8 * 2KB = 16KB. Bandwidth limited but okay.
+2. LayerNorm pair_j: 32 threads handle 32 rows sequentially or cooperatively.
+3. Compute b_j: 32 threads handle 1024 elements. Each thread 32 elements.
+4. Compute einsum: 32 threads for 32 h values. Each thread handles one h.
+5. Compute out linear: 32 threads for 64 outputs. Each thread 2 outputs.
+6. Gate: 32 threads for 64 outputs. Each thread 2 outputs.
+7. Write back.
+
+Effective parallelism: 8 j values * 32 threads = 256 threads. Perfect!
+
+For 32 j values: 4 rounds, each handling 8 j values.
+Grid: block (b, i) has 256 threads.
+Inside block:
+```cuda
+// Precompute a (only depends on i)
+load_pair_i();
+layernorm_pair_i();
+compute_a(); // all 256 threads
+
+// Process j in groups
+for (int j_base = 0; j_base &lt; N; j_base += 8) {
+    int g = tid / 32; // group 0..7
+    int j = j_base + g;
+    int lane = tid % 32;
+    
+    if (j &lt; N) {
+        // Load pair_j, LayerNorm, compute b
+        // Using lane for thread-level parallelism
+    }
+    __syncthreads();
+}
+```
+
+Wait, if groups use __syncthreads(), all threads must reach it. With j_base + g might exceed N for the last iteration. Actually N=32, j_base in {0, 8, 16, 24} and g in 0..7, so j is always &lt; 32. Good.
+
+For each group:
+- Load pair[b, j, k, :] for k=0..31, d=0..63.
+  Group g loads into a section of shared memory.
+  smem_j_base[g] + k*D_pair + d.
+  Total: 8 * 2KB = 16KB.
+- LayerNorm: lane handles row k = lane.
+  Each of 32 threads computes mean/var for one row.
+  __syncwarp() within group? But groups are interleaved in warps.
+  
+  Actually, tid = g * 32 + lane.
+  Warp 0: g=0, lanes 0..31.
+  Warp 1: g=1, lanes 0..31.
+  ...
+  Warp 7: g=7, lanes 0..31.
+  
+  So each warp IS one group! Perfect.
+  Within a warp, lane k handles row k.
+  No need for __syncwarp() after LayerNorm since it&#x27;s within registers and warp execution is synchronous.
+  
+  For b computation:
+  Each lane computes b[k, :] for its k? Or computes parts of b for all k?
+  lane k has pair_j[k, :] in registers or smem.
+  We can compute b[k, h] for all h using lane k.
+  32 outputs of length H=32. Each thread does 32 dot products of length 64.
+  32 * 64 = 2K ops per thread. Total 64K ops per group.
+  8 groups: 512K ops. Good.
+  
+  Let&#x27;s work through b computation per group (one warp):
+  lane k computes:
+  ```
+  for (int h = 0; h &lt; H; h++) {
+      float pb = pb_b[h];
+      float gb = gb_b[h];
+      for (int d = 0; d &lt; D_pair; d++) {
+          pb += x_j[k,d] * pb_w[h*D_pair + d];
+          gb += x_j[k,d] * gb_w[h*D_pair + d];
+      }
+      b[k,h] = pb * sigmoid(gb);
+  }
+  ```
+  We need b accessible to all lanes in the warp for the einsum.
+  b is (N, H) = 32*32 = 1024 floats.
+  Each lane writes its row k: b[k, 0..31] (32 floats).
+  Since all lanes execute together, after the loop, all b values are computed.
+  We can store b in shared memory or registers.
+  For einsum: o[h] = sum_k a[k,h] * b[k,h].
+  Each lane can compute one h.
+  lane h: sum over k of a[k,h] * b[k,h].
+  
+  But a is in shared memory (computed earlier). b can be in shared memory.
+  
+  Actually, since we have 8 groups (warps), each warp writes b to a region in shared memory.
+  Then all warps compute the einsum.
+  
+  Wait, but a was computed earlier and is in shared memory. a is common to all j groups.
+  b is different per j.
+  
+  Einsum: o_j[h] = sum_k a[k,h] * b_j[k,h].
+  For each j, we need to compute 32 values of o.
+  
+  Within warp g (processing j):
+  After computing b_j, the warp can compute o_j[h] for h=0..31:
+  `lane h` computes `sum_k a[k,h] * b_j[k,h]`.
+  a[k,h] reads from shared memory. b_j[k,h] from shared memory.
+  __syncwarp() might be needed to ensure all b writes are visible.
+  Actually within a warp, threads execute together. Writes by lane k to shared memory should be visible to lane h after __syncwarp() or just implicit at instruction boundaries for same-warp access to shared memory? 
+  Let&#x27;s use __syncwarp() to be safe.
+  
+  After o_j is computed (32 values, each warp has its own o_j in registers or smem):
+  Apply LayerNorm + out linear to get out_j (64 values).
+  Then compute gate from pair_ij.
+  Then write back.
+
+Shared memory for TriMul block per (b,i):
+- smem_x_i: N * D_pair = 2KB
+- smem_a: N * H = 1KB
+- smem_j_groups: 8 * N * D_pair = 16KB
+- smem_b_groups: 8 * N * H = 8KB
+- smem_o: 8 * H = 256 floats = 1KB
+- workspace: maybe small
+Total: ~30KB.
+
+This is very manageable.
+
+OK, this is quite complex to get right. Let me think if there&#x27;s a simpler approach for TriMul that still performs well.
+
+Given that:
+1. We have limited time to develop and debug
+2. The main win is kernel fusion
+3. A simpler block-per-(b,i,j) might be fast enough
+
+Let me calculate block-per-(b,i,j) more carefully.
+Block (b,i,j) with 128 threads. Or even 64 threads.
+Total blocks: 2048.
+
+For block (b,i,j):
+- Load pair_i_k for k=0..31: 2KB
+- Load pair_j_k for k=0..31: 2KB
+- Load pair_ij: 256 bytes
+- Compute:
+  - 64 LayerNorms (32 for i, 32 for j): trivial
+  - a: 32*32*64*2 = 131K ops
+  - b: 131K ops
+  - einsum: 1K ops
+  - norm_out + linear: 2K ops
+  - gate: 4K ops
+  - mul + add: small
+- Total: ~270K ops per block? Wait, 131K*2 = 262K for a and b.
+  That seems high. Let me recalculate.
+  
+  a[k,h]: for each k (32), h (32): dot product of x_i[k,:] with pa_w[h,:]. That&#x27;s 32*32*64 = 65K mul-adds.
+  Similarly ga: 65K. Total 130K for computing pa and ga.
+  sigmoid: 1K. mul: 1K.
+  Total a: ~132K ops.
+  
+  b: same ~132K ops.
+  
+  Total per block: 270K ops.
+  2048 blocks: 552M ops.
+  552M / 67T = 8.2 microseconds.
+  
+  Memory: 
+  Read: 2048 * (2KB + 2KB + 256B) = 2048 * 4.25KB = ~8.5MB.
+  Write: 2048 * 256B = 0.5MB.
+  Read pair twice (i and j): but j data is read by N different i blocks.
+  Total read from HBM: ~8.5MB. At 3.35TB/s: 2.5 microseconds.
+  
+  So compute bound, ~8 microseconds total.
+  
+  But 2048 blocks of 270K ops each.
+  On 132 SMs: ~15.5 blocks per SM.
+  Each block has 128 threads = 4 warps.
+  15.5 * 4 = 62 warps per SM. 
+  H100 can handle 64 warps per SM? Max threads 2048 / 32 = 64 warps. So occupancy is ~97%. Good.
+  
+  Shared memory per block: pair_i (2KB), pair_j (2KB), a (1KB), b (1KB), o (256B), misc.
+  Total ~8KB.
+  Shared memory limit per SM: 227KB / 8KB = 28 blocks. But thread limit is 64 warps / 4 warps = 16 blocks. So thread-limited, not smem-limited.
+  
+  Each block does 270K ops. With half the SM&#x27;s compute (since 2 blocks per SM), 0.5 * 0.5T = 0.25T FLOPS per block concurrently.
+  270K / 0.25T = 1.08 microseconds per block.
+  With 16 blocks per SM in the first wave, and total 15.5 blocks per SM: essentially one wave.
+  Total time: ~1.1 microseconds.
+  
+  Wait, that can&#x27;t be right. 270K ops at 500 GFLOPS is 0.54ms? No!
+  270K ops = 2.7e5 FLOPs. 500 GFLOPS = 5e11 FLOPs/s.
+  2.7e5 / 5e11 = 0.54 microseconds. Yes.
+  
+  Total: 2048 blocks / (132 SMs * 16 blocks/SM) = 0.97 waves.
+  Time: ~0.54 microseconds. Plus some overhead.
+  
+  This is very fast!
+  
+  The memory time: 8.5MB total read. With 3.35TB/s: 2.5 microseconds.
+  But much of the memory is cached. pair[b,i,:,:] is read by 32 blocks (same i, different j). 
+  L2 cache size on H100 is 50MB. Our total pair data is 2 * 32 * 32 * 64 * 4 = 524KB.
+  The ENTIRE pair tensor fits in L2 cache!
+  So repeated reads of the same slices will hit L2.
+  
+  With full L2 caching, effective bandwidth is much higher.
+  Even if they all miss L1 and hit L2 at ~10TB/s: 8.5MB / 10TB/s = 0.85 microseconds.
+  Plus compute 0.54 microseconds. Total maybe 1.4 microseconds.
+  
+  This seems like block-per-(b,i,j) with 128 threads is actually a great design.
+  Much simpler than block-per-(b,i), and potentially just as fast due to L2 cache.
+  
+  In fact, the reference PyTorch also benefits from L2 cache. But our custom kernel fuses everything into one kernel, avoiding ~15 kernel launches. The main win is fusion.
+
+Let me go with the simpler block-per-(b,i,j) approach for TriMul.
+
+OK, now I have a plan:
+1. `msa_attn_kernel`: 1 block per (b,s), 128 threads, 32KB smem
+2. `opm_kernel`: 1 block per (b,i,j)... 
+   Wait, I think for OPM I should also use block per (b,i,j) for simplicity, similar to TriMul.
+   
+   For OPM block (b,i,j):
+   - Load msa[b,:,i,:] and msa[b,:,j,:]: 2 * S * D_msa = 2 * 8 * 64 = 1KB
+   - LayerNorm: 16 rows, trivial.
+   - Compute a[:,i,:] and b[:,j,:]: 
+     a: S * H * D_msa = 8*32*64 = 16K ops.
+     b: 16K ops.
+   - outer: sum_s a[s,:] * b[s,:].T -&gt; H*H elements, each sum over S=8.
+     1024 * 8 = 8K ops.
+   - linear: 1024 * 64 = 65K ops.
+   - Total: ~105K ops.
+   
+   2048 blocks: 215M ops. 
+   Memory: read msa 2048 * 1KB = 2MB. Plus write pair 0.5MB.
+   Total 2.5MB. At L2 speeds: ~0.25 microseconds.
+   Compute: 215M / 67T = 3.2 microseconds.
+   So compute bound, ~3-4 microseconds.
+   
+   Wait, msa is also small and fits in L2: B*S*N*D = 2*8*32*64 = 32K floats = 128KB.
+   Almost entirely L1/L2 resident.
+   
+   So OPM with block-per-(b,i,j) is also compute bound and fast.
+
+3. `trimul_kernel`: 1 block per (b,i,j), 128 threads.
+
+Let me write all 3 kernels now.
+
+Shared memory for OPM block:
+- smem_msa_i: S * D_msa = 512 floats
+- smem_msa_j: S * D_msa = 512 floats
+- smem_a: S * H = 256 floats
+- smem_b: S * H = 256 floats
+- smem_outer: H * H = 1024 floats
+Total: ~12KB.
+
+For OPM block (b,i,j):
+```cuda
+__global__ void opm_kernel(
+    const float* msa, float* pair,
+    int B, int S, int N, int D_msa, int H, int D_pair,
+    const float* norm_w, const float* norm_b,
+    const float* aw, const float* ab,
+    const float* bw, const float* bb,
+    const float* ow, const float* ob)
+{
+    // Each block handles (b, i, j)
+    int b = blockIdx.x;
+    int i = blockIdx.y;
+    int j = blockIdx.z;
+    int tid = threadIdx.x;
+    
+    extern __shared__ float smem[];
+    float* smem_i = smem;
+    float* smem_j = smem + S * D_msa;
+    float* smem_a = smem + 2 * S * D_msa;
+    float* smem_b = smem + 2 * S * D_msa + S * H;
+    float* smem_outer = smem + 2 * S * D_msa + 2 * S * H;
+    
+    // Load msa[b, :, i, :] and msa[b, :, j, :]
+    for (int idx = tid; idx &lt; S * D_msa; idx += blockDim.x) {
+        int s = idx / D_msa;
+        int d = idx % D_msa;
+        smem_i[idx] = msa[(((b * S + s) * N + i) * D_msa) + d];
+        smem_j[idx] = msa[(((b * S + s) * N + j) * D_msa) + d];
+    }
+    __syncthreads();
+    
+    // LayerNorm for S*2 rows
+    // S=8, so 16 rows total. 
+    // Use 16 threads if blockDim.x &gt;= 16, or all threads in a loop.
+    for (int row = tid; row &lt; 2 * S; row += blockDim.x) {
+        float* row_ptr = (row &lt; S) ? smem_i + row * D_msa : smem_j + (row - S) * D_msa;
+        float sum = 0.0f;
+        for (int d = 0; d &lt; D_msa; d++) sum += row_ptr[d];
+        float mean = sum / D_msa;
+        float var = 0.0f;
+        for (int d = 0; d &lt; D_msa; d++) {
+            float diff = row_ptr[d] - mean;
+            var += diff * diff;
+        }
+        float inv_std = rsqrtf(var / D_msa + 1e-5f);
+        for (int d = 0; d &lt; D_msa; d++) {
+            row_ptr[d] = (row_ptr[d] - mean) * inv_std * norm_w[d] + norm_b[d];
+        }
+    }
+    __syncthreads();
+    
+    // Compute a and b
+    for (int idx = tid; idx &lt; S * H; idx += blockDim.x) {
+        int s = idx / H;
+        int h = idx % H;
+        float a_val = ab[h];
+        float b_val = bb[h];
+        for (int d = 0; d &lt; D_msa; d++) {
+            a_val += smem_i[s * D_msa + d] * aw[h * D_msa + d];
+            b_val += smem_j[s * D_msa + d] * bw[h * D_msa + d];
+        }
+        smem_a[s * H + h] = a_val;
+        smem_b[s * H + h] = b_val;
+    }
+    __syncthreads();
+    
+    // Compute outer product and sum over s
+    for (int idx = tid; idx &lt; H * H; idx += blockDim.x) {
+        int h1 = idx / H;
+        int h2 = idx % H;
+        float sum = 0.0f;
+        for (int s = 0; s &lt; S; s++) {
+            sum += smem_a[s * H + h1] * smem_b[s * H + h2];
+        }
+        smem_outer[idx] = sum / (float)S;
+    }
+    __syncthreads();
+    
+    // Linear projection and residual add to pair
+    float* pair_ptr = pair + (((b * N + i) * N + j) * D_pair);
+    for (int d_out = tid; d_out &lt; D_pair; d_out += blockDim.x) {
+        float sum = ob[d_out];
+        for (int h = 0; h &lt; H * H; h++) {
+            sum += smem_outer[h] * ow[d_out * (H * H) + h];
+        }
+        pair_ptr[d_out] += sum;
+    }
+}
+```
+
+Wait, there&#x27;s an issue: `ow` is from `nn.Linear(hidden*hidden, pair_dim)`.
+Weight shape: (pair_dim, hidden*hidden). 
+Access: `ow[d_out * (H*H) + h]`. This is correct for row-major.
+
+For TriMul kernel:
+
+```cuda
+__global__ void trimul_kernel(
+    const float* pair, float* out_pair,
+    int B, int N, int D_pair, int H,
+    const float* norm_w, const float* norm_b,
+    const float* pa_w, const float* pa_b,
+    const float* ga_w, const float* ga_b,
+    const float* pb_w, const float* pb_b,
+    const float* gb_w, const float* gb_b,
+    const float* norm_out_w, const float* norm_out_b,
+    const float* out_w, const float* out_b,
+    const float* gate_w, const float* gate_b)
+{
+    // Block per (b, i, j)
+    int b = blockIdx.x;
+    int i = blockIdx.y;
+    int j = blockIdx.z;
+    int tid = threadIdx.x;
+    
+    extern __shared__ float smem[];
+    // smem layout:
+    // x_i: N * D_pair
+    // x_j: N * D_pair
+    // a: N * H
+    // b: N * H
+    // o: H
+    // out: D_pair
+    
+    float* smem_xi = smem;
+    float* smem_xj = smem + N * D_pair;
+    float* smem_a = smem + 2 * N * D_pair;
+    float* smem_b = smem + 2 * N * D_pair + N * H;
+    float* smem_o = smem + 2 * N * D_pair + 2 * N * H;
+    float* smem_out = smem + 2 * N * D_pair + 2 * N * H + H;
+    
+    // Load pair[b, i, k, :] for all k and pair[b, j, k, :] for all k
+    const float* pair_i_base = pair + ((b * N + i) * N) * D_pair;
+    const float* pair_j_base = pair + ((b * N + j) * N) * D_pair;
+    
+    for (int idx = tid; idx &lt; N * D_pair; idx += blockDim.x) {
+        smem_xi[idx] = pair_i_base[idx];
+        smem_xj[idx] = pair_j_base[idx];
+    }
+    __syncthreads();
+    
+    // LayerNorm on xi and xj rows
+    for (int row = tid; row &lt; 2 * N; row += blockDim.x) {
+        float* row_ptr = (row &lt; N) ? smem_xi + row * D_pair : smem_xj + (row - N) * D_pair;
+        float sum = 0.0f;
+        for (int d = 0; d &lt; D_pair; d++) sum += row_ptr[d];
+        float mean = sum / D_pair;
+        float var = 0.0f;
+        for (int d = 0; d &lt; D_pair; d++) {
+            float diff = row_ptr[d] - mean;
+            var += diff * diff;
+        }
+        float inv_std = rsqrtf(var / D_pair + 1e-5f);
+        for (int d = 0; d &lt; D_pair; d++) {
+            row_ptr[d] = (row_ptr[d] - mean) * inv_std * norm_w[d] + norm_b[d];
+        }
+    }
+    __syncthreads();
+    
+    // Compute a[k,h] = pa(x_i[k]) * sigmoid(ga(x_i[k]))
+    for (int idx = tid; idx &lt; N * H; idx += blockDim.x) {
+        int k = idx / H;
+        int h = idx % H;
+        float pa = pa_b[h];
+        float ga = ga_b[h];
+        for (int d = 0; d &lt; D_pair; d++) {
+            pa += smem_xi[k * D_pair + d] * pa_w[h * D_pair + d];
+            ga += smem_xi[k * D_pair + d] * ga_w[h * D_pair + d];
+        }
+        smem_a[idx] = pa * (1.0f / (1.0f + expf(-ga)));
+    }
+    __syncthreads();
+    
+    // Compute b[k,h] = pb(x_j[k]) * sigmoid(gb(x_j[k]))
+    for (int idx = tid; idx &lt; N * H; idx += blockDim.x) {
+        int k = idx / H;
+        int h = idx % H;
+        float pb = pb_b[h];
+        float gb = gb_b[h];
+        for (int d = 0; d &lt; D_pair; d++) {
+            pb += smem_xj[k * D_pair + d] * pb_w[h * D_pair + d];
+            gb += smem_xj[k * D_pair + d] * gb_w[h * D_pair + d];
+        }
+        smem_b[idx] = pb * (1.0f / (1.0f + expf(-gb)));
+    }
+    __syncthreads();
+    
+    // Compute o[h] = sum_k a[k,h] * b[k,h]
+    if (tid &lt; H) {
+        int h = tid;
+        float sum = 0.0f;
+        for (int k = 0; k &lt; N; k++) {
+            sum += smem_a[k * H + h] * smem_b[k * H + h];
+        }
+        smem_o[h] = sum;
+    }
+    __syncthreads();
+    
+    // LayerNorm on o
+    if (tid &lt; H) {
+        float sum = 0.0f;
+        for (int h = 0; h &lt; H; h++) sum += smem_o[h];
+        float mean = sum / H;
+        float var = 0.0f;
+        for (int h = 0; h &lt; H; h++) {
+            float diff = smem_o[h] - mean;
+            var += diff * diff;
+        }
+        float inv_std = rsqrtf(var / H + 1e-5f);
+        for (int h = 0; h &lt; H; h++) {
+            smem_o[h] = (smem_o[h] - mean) * inv_std * norm_out_w[h] + norm_out_b[h];
+        }
+    }
+    __syncthreads();
+    
+    // Output linear: H -&gt; D_pair
+    if (tid &lt; D_pair) {
+        int d = tid;
+        float val = out_b[d];
+        for (int h = 0; h &lt; H; h++) {
+            val += smem_o[h] * out_w[d * H + h];
+        }
+        smem_out[d] = val;
+    }
+    __syncthreads();
+    
+    // Gate from original pair[b,i,j,:]
+    const float* pair_ij = pair + (((b * N + i) * N + j) * D_pair);
+    if (tid &lt; D_pair) {
+        int d = tid;
+        float gate = gate_b[d];
+        for (int h = 0; h &lt; D_pair; h++) {
+            gate += pair_ij[h] * gate_w[d * D_pair + h];
+        }
+        gate = 1.0f / (1.0f + expf(-gate));
+        out_pair[(((b * N + i) * N + j) * D_pair) + d] = pair_ij[d] + gate * smem_out[d];
+    }
+}
+```
+
+Wait, TriMul issues:
+1. The LayerNorm on `o`: I&#x27;m using only H threads (32), but H=32 so that&#x27;s one warp. Other threads idle. Fine.
+2. The norm should compute mean and var across all H elements. With 32 threads, warp 0 can do this. But I have `if (tid &lt; H)` and then each thread reads all elements. This is redundant but okay for H=32.
+   Actually only tid=0 should compute mean and var, then broadcast? Or all threads can compute the same thing and write to smem_o.
+   But with `if (tid &lt; H)`, threads 0..31 all enter. They all compute the same thing and write to smem_o. That&#x27;s fine.
+   __syncthreads() is needed after because other threads might read smem_o later.
+   
+3. The output linear uses `if (tid &lt; D_pair)`. D_pair=64. If blockDim.x=128, then 64 threads enter. Fine.
+   But wait, smem_out is shared among all threads. threads 0..63 write to smem_out.
+   Then __syncthreads(). Then gate compute reads smem_out and pair_ij and writes to out_pair.
+   This is fine.
+
+4. However, Pair update: should be `out_pair[b,i,j,:] = pair[b,i,j,:] + gate * smem_out`
+   In the code: `out_pair[...] = pair_ij[d] + gate * smem_out[d]`
+   But `out_pair` points to the original `pair` tensor since we&#x27;re updating in-place.
+   Wait, the PyTorch code does: `pair_repr = pair_repr + self.tri_mul(pair_repr)`.
+   So we can write back to the same pair tensor (in-place addition).
+   But note: pair_ij is the ORIGINAL pair value (before trimul).
+   In my code, `pair_ij` reads from `pair` at the same address we plan to write `out_pair`.
+   If we read from `pair` and write to `out_pair` (which is the same pointer), and since all threads in the grid access disjoint (b,i,j) positions, there&#x27;s no race condition.
+   `pair_ij[d]` is read before `out_pair[...]` is written. Good.
+
+Wait, but for OPM, the pair is updated first:
+`pair_repr = pair_repr + self.opm(msa_repr)`
+And then `pair_repr = pair_repr + self.tri_mul(pair_repr)`.
+
+So in the kernel sequence:
+1. MSA attention -&gt; writes to msa buffer
+2. OPM -&gt; reads pair_orig, adds opm_out, writes to pair buffer &lt;- wait, can be in-place
+3. TriMul -&gt; reads updated pair, adds trimul_out, writes back.
+
+So we need OPM to read the current pair and add to it. Yes, my OPM kernel does `pair_ptr[d_out] += sum;`. That reads the current pair value and adds to it. Perfect.
+
+For TriMul, it also reads `pair_ij[d]` and adds the computed output. Good.
+
+Now, one subtlety: In TriMul, `pair_i_base` and `pair_j_base` read from `pair` which might have been updated by OPM in the previous kernel. That&#x27;s correct.
+
+Also in TriMul: `x = self.norm(pair)`. This is LayerNorm on the UPDATED pair (after OPM). My kernel reads pair_i_base and pair_j_base from `pair` (which was just updated by OPM). Good.
+
+But wait: the gate uses `self.gate_out(pair)`. That uses the original `pair` (the one passed to TriMul), not some intermediate. My kernel reads `pair_ij` for the gate, which is correct.
+
+OK, let me finalize the kernels and write the complete Python file.
+
+One more thing: I need to pass all the weights and biases to the kernels.
+In ModelNew.__init__, I need to extract weights and biases from the PyTorch modules and create CUDA tensors.
+
+For MSARowSelfAttention:
+- norm: weight, bias (msa_dim,)
+- q: weight (msa_dim, msa_dim)
+- k: weight (msa_dim, msa_dim)
+- v: weight (msa_dim, msa_dim)
+- out: weight (msa_dim, msa_dim), bias (msa_dim,)
+
+For OuterProductMeanSmall:
+- norm: weight, bias (msa_dim,)
+- a: weight (hidden, msa_dim), bias (hidden,)
+- b: weight (hidden, msa_dim), bias (hidden,)
+- out: weight (pair_dim, hidden*hidden), bias (pair_dim,)
+
+For TriMulOut:
+- norm: weight, bias (pair_dim,)
+- pa: weight (hidden, pair_dim), bias (hidden,)
+- ga: weight (hidden, pair_dim), bias (hidden,)
+- pb: weight (hidden, pair_dim), bias (hidden,)
+- gb: weight (hidden, pair_dim), bias (hidden,)
+- norm_out: weight (hidden,), bias (hidden,)
+- out: weight (pair_dim, hidden), bias (pair_dim,)
+- gate_out: weight (pair_dim, pair_dim), bias (pair_dim,)
+
+Wait, nn.Linear default has bias=True. The reference:
+- `self.out = nn.Linear(msa_dim, msa_dim)` -&gt; has bias.
+- `self.a = nn.Linear(msa_dim, hidden)` -&gt; has bias.
+- `self.b = nn.Linear(msa_dim, hidden)` -&gt; has bias.
+- `self.out = nn.Linear(hidden * hidden, pair_dim)` -&gt; has bias.
+- `self.pa = nn.Linear(pair_dim, hidden)` -&gt; has bias.
+- `self.ga = nn.Linear(pair_dim, hidden)` -&gt; has bias.
+- `self.pb = nn.Linear(pair_dim, hidden)` -&gt; has bias.
+- `self.gb = nn.Linear(pair_dim, hidden)` -&gt; has bias.
+- `self.out = nn.Linear(hidden, pair_dim)` -&gt; has bias.
+- `self.gate_out = nn.Linear(pair_dim, pair_dim)` -&gt; has bias.
+
+All linears except q,k,v have bias.
+
+Now, CUDA kernel constants/params:
+Msa attention kernel needs: B, S, N, D, H, d, plus all weight/bias pointers.
+OPM kernel needs: B, S, N, D_msa, H, D_pair, plus pointers.
+TriMul kernel needs: B, N, D_pair, H, plus pointers.
+
+Let me now write the kernel code.
+
+For MSA attention, I need to handle __shared__ memory properly. I&#x27;ll use dynamic shared memory.
+
+Actually, let me reconsider the MSA attention shared memory:
+```
+extern __shared__ float smem[];
+float* smem_msa = smem;
+float* smem_attn = smem + N * D;  // for B=2,S=8,N=32,D=64: 2048 floats
+float* smem_k = smem + 2 * N * D; // warp_id * N * head_dim each
+float* smem_v = smem + 2 * N * D + num_warps * N * head_dim;
+```
+
+Size: 2*N*D + 2*num_warps*N*head_dim = 2*2048 + 2*4*32*16 = 4096 + 4096 = 8192 floats = 32768 bytes.
+
+I&#x27;ll use `cudaFuncSetAttribute`... no, I can just pass the shared memory size in the kernel launch. With `load_inline`, I call the function with normal Python arguments, but for shared memory size I might need to use `torch.cuda.Str`... actually `cpp_extension` auto-generated bindings don&#x27;t expose shared memory size configuration directly.
+
+Wait, we need to set shared memory size per kernel launch. In PyTorch C++ extensions, we typically use `kernel&lt;&lt;&lt;grid, block, shared_size&gt;&gt;&gt;(args)`. But with `load_inline`, the host wrapper function is usually written in cpp_sources and calls the kernel with the specific configuration.
+
+Actually, the instructions say: &quot;Do not write your own PYBIND11_MODULE. load_inline auto-generates one from the functions=[...] argument.&quot;
+
+So we need to define host wrapper functions in `cpp_sources` that configure and launch the kernels. The auto-generated pybind11 bindings will expose these host functions.
+
+Let me structure the code:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void msa_attn_kernel(...) { ... }
+
+__global__ void opm_kernel(...) { ... }
+
+__global__ void trimul_kernel(...) { ... }
+
+torch::Tensor msa_attn_forward(
+    torch::Tensor msa,
+    torch::Tensor norm_w, torch::Tensor norm_b,
+    torch::Tensor qw, torch::Tensor kw, torch::Tensor vw,
+    torch::Tensor ow, torch::Tensor ob)
+{
+    int B = msa.size(0);
+    int S = msa.size(1);
+    int N = msa.size(2);
+    int D = msa.size(3);
+    int num_heads = 4;
+    int head_dim = D / num_heads;
+    
+    auto out = torch::empty_like(msa);
+    
+    dim3 grid(B, S);
+    dim3 block(128);
+    size_t smem = 8192 * sizeof(float); // 32KB
+    
+    msa_attn_kernel&lt;&lt;&lt;grid, block, smem&gt;&gt;&gt;(
+        msa.data_ptr&lt;float&gt;(), out.data_ptr&lt;float&gt;(),
+        B, S, N, D, num_heads, head_dim,
+        norm_w.data_ptr&lt;float&gt;(), norm_b.data_ptr&lt;float&gt;(),
+        qw.data_ptr&lt;float&gt;(), kw.data_ptr&lt;float&gt;(), vw.data_ptr&lt;float&gt;(),
+        ow.data_ptr&lt;float&gt;(), ob.data_ptr&lt;float&gt;()
+    );
+    return out;
+}
+
+// Similarly for opm and trimul
+&#x27;&#x27;&#x27;
+
+# Then load_inline
+module = load_inline(
+    name=&#x27;evoformer_fused&#x27;,
+    cpp_sources=cpp_sources,
+    functions=[&#x27;msa_attn_forward&#x27;, &#x27;opm_forward&#x27;, &#x27;trimul_forward&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, msa_dim, pair_dim, num_heads, tri_hidden):
+        super().__init__()
+        # Initialize same modules to get weights
+        self.msa_attn = MSARowSelfAttention(msa_dim, num_heads)
+        self.opm = OuterProductMeanSmall(msa_dim, pair_dim)
+        self.tri_mul = TriMulOut(pair_dim, tri_hidden)
+        
+        # Extract weights as CUDA tensors (and make contiguous)
+        # ...
+    
+    def forward(self, msa_repr, pair_repr):
+        msa_new = msa_repr + module.msa_attn_forward(
+            msa_repr,
+            self.msa_attn_norm_w,
+            ...
+        )
+        pair_new = pair_repr + module.opm_forward(
+            msa_new, pair_repr,
+            ...
+        )
+        pair_new = pair_new + module.trimul_forward(
+            pair_new,
+            ...
+        )
+        return msa_new, pair_new
+```
+
+Wait, actually I should instantiate the reference modules in `__init__` so I can copy their weights. Or I can create them directly since the test harness will call get_init_inputs() to get the constructor args.
+
+For `ModelNew`, I should match `Model`&#x27;s constructor: `ModelNew(msa_dim, pair_dim, num_heads, tri_hidden)`.
+
+Inside `__init__`, I can create:
+```python
+self.msa_attn_ref = MSARowSelfAttention(msa_dim, num_heads)
+self.opm_ref = OuterProductMeanSmall(msa_dim, pair_dim, hidden=32)
+self.tri_mul_ref = TriMulOut(pair_dim, tri_hidden)
+```
+
+Wait, `OuterProductMeanSmall.__init__` has `hidden=32` default. But in the test harness, `Model(msa_dim, pair_dim, num_heads, tri_hidden)` passes `tri_hidden` to TriMulOut, but not `hidden` to OPM. OPM always uses hidden=32.
+
+Actually, looking at the reference:
+```python
+self.opm = OuterProductMeanSmall(msa_dim, pair_dim)
+```
+So OPM hidden is always 32.
+
+Then I extract all weights.
+
+One important thing: I need to make sure the weights are contiguous and on CUDA. Since the module parameters will be on CUDA when the model is moved to GPU in the test harness.
+
+Let me handle this carefully. The ModelNew instance is created, and then moved to CUDA (probably). So the weights will be CUDA tensors.
+
+Actually, in the test harness, the model might be created on CPU and inputs on CPU, but for GPU evaluation, they move both to GPU. To be safe, I should handle .to(device) in forward or just rely on the tensors being in the right place.
+
+Since the reference model is nn.Module, its parameters are registered. For ModelNew, if we create submodules and don&#x27;t register them as submodules, their parameters won&#x27;t be in `model.parameters()`. That&#x27;s fine for inference, but for the test harness, they might move the model to GPU using `model.to(device)`, which recursively moves registered parameters.
+
+So in ModelNew, I should either:
+1. Register the submodules: `self.msa_attn = MSARowSelfAttention(...)` etc.
+2. Or just keep the weight tensors and ensure they move properly.
+
+Option 1 is easier. I&#x27;ll create the same submodules, register them, and then extract weight pointers when needed.
+
+Wait, but if I call `self.msa_attn = MSARowSelfAttention(...)`, then `self.msa_attn` will be used during forward only for weight extraction. The actual computation is done by CUDA kernels.
+
+But there&#x27;s a subtlety: the test harness might create `ModelNew` and then `model.cuda()`. If I create submodules, their weights will also be moved to CUDA. Good.
+
+However, I need to make sure the submodules are the exact same architecture so the weights match the reference when loaded from a checkpoint. For custom inference where weights are randomly initialized, it doesn&#x27;t matter. But for correctness checking, the test harness probably creates both `Model` and `ModelNew` with random weights and compares outputs.
+
+Wait, looking at the task: &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel.&quot; The test harness will instantiate `ModelNew` and compare outputs with `Model` using the same random initialization or something.
+
+Actually, usually these benchmark systems instantiate `Model` and `ModelNew` separately, initialize with same weights, and feed same inputs. Or they might just check that ModelNew produces the same output as the reference Model for some fixed weights.
+
+In any case, I need to make sure ModelNew contains the same parameters so that if they copy weights from reference, they match.
+
+If I create submodules with the same names and structure, weight loading should work. Let me check: `Model` has:
+- `self.msa_attn`
+  - `self.msa_attn.norm`
+  - `self.msa_attn.q`
+  - `self.msa_attn.k`
+  - `self.msa_attn.v`
+  - `self.msa_attn.out`
+- `self.opm`
+  - `self.opm.norm`
+  - `self.opm.a`
+  - `self.opm.b`
+  - `self.opm.out`
+- `self.tri_mul`
+  - `self.tri_mul.norm`
+  - `self.tri_mul.pa`
+  - `self.tri_mul.pb`
+  - `self.tri_mul.ga`
+  - `self.tri_mul.gb`
+  - `self.tri_mul.norm_out`
+  - `self.tri_mul.out`
+  - `self.tri_mul.gate_out`
+
+So if I create submodules with these exact structures, weight matching should work.
+
+But for the CUDA kernels, I need weight pointers. I can just access them in forward().
+
+Actually, since I&#x27;m going to call CUDA kernels, I can just extract the `.weight` and `.bias` tensors on the fly in `forward()` and pass them to the C++ functions. Or I can store them as attributes for convenience.
+
+One issue: for `nn.Linear`, the weight is transposed in the sense of `matmul` vs `gemm`. PyTorch `nn.Linear` computes `y = x @ W^T + b`, where W is stored as [out_features, in_features]. In my kernels, I access `W[row * in_features + col]`. And my dot product is `sum_in x[in] * W[out, in]`. So I&#x27;m computing `x @ W^T`. This matches PyTorch. Good.
+
+Another subtlety: `torch.empty_like(msa)` for MSA attention output. 
+For OPM, the output is added to pair in-place. But the kernel also reads pair for the residual. So we can just write in-place to pair.
+For TriMul, same.
+
+Now let me write the complete Python module.
+
+Actually, wait. In the TriMul kernel, for `norm_out`, it&#x27;s `nn.LayerNorm(hidden)`. I need its weight and bias.
+Also, for `o = self.out(self.norm_out(o))`, first apply LayerNorm then Linear.
+
+And `gate_out = torch.sigmoid(self.gate_out(pair)) * o`. Wait, the reference returns `torch.sigmoid(self.gate_out(pair)) * o`. And `o = self.out(self.norm_out(o))`.
+
+So the sequence is:
+1. Apply norm_out to o
+2. Apply out linear to get o_linear
+3. Apply gate_out linear + sigmoid to pair_ij
+4. Multiply
+5. Add residual
+
+In my TriMul kernel, I have:
+- smem_o gets the einsum result
+- LayerNorm on smem_o (&quot;norm_out&quot;)
+- Linear to get smem_out (&quot;out&quot;)
+- Gate from pair_ij (&quot;gate_out&quot;)
+- pair_ij + gate * smem_out -&gt; write back
+
+Yes, this matches.
+
+Let me now carefully review my kernels.
+
+**MSA Attention Kernel Details:**
+
+1. Shared memory: `extern __shared__ float smem[];`
+   - smem_msa: N * D elements
+   - smem_attn: N * D elements
+   - smem_k: num_warps * N * head_dim
+   - smem_v: num_warps * N * head_dim
+   
+   Size: (2 * N * D + 2 * num_warps * N * head_dim) * sizeof(float)
+
+2. Block: 128 threads = 4 warps.
+   Grid: (B, S)
+
+3. Loading msa: all threads load from `msa_ptr`.
+   `msa_ptr` points to `msa + ((b * S + s) * N) * D`.
+   Thread `tid` loads elements `tid, tid+128, tid+256, ...` up to `N*D`.
+   Thread 0 loads elements 0, 128, 256, ... 
+   These are contiguous in memory: element 0 is at offset 0, element 128 is at offset 128*4 = 512 bytes.
+   Within a warp, threads load adjacent elements in each iteration? 
+   Iter 0: thread 0 loads offset 0, thread 1 loads offset 1, ..., thread 31 loads offset 31. Coalesced.
+   Iter 1: thread 0 loads offset 128, thread 1 loads offset 129, etc. Coalesced.
+   Good.
+
+4. LayerNorm: `if (tid &lt; 32) { int n = tid; ... }`
+   Thread n computes mean, var of row n.
+   `__syncthreads()` after.
+   
+5. Q,K,V computation:
+   `int h = warp_id;` with warp_id = tid / 32.
+   `int n = lane;` with lane = tid % 32.
+   
+   For each head h (0..3):
+   Thread n computes q_vec[head_dim], k_vec stored in smem_k, v_vec stored in smem_v.
+   
+   The dot products:
+   ```cuda
+   for (int dh = 0; dh &lt; head_dim; dh++) {
+       float s = 0.0f;
+       const float* w = qw + (h * head_dim + dh) * D;
+       for (int d = 0; d &lt; D; d++) {
+           s += smem_msa[n * D + d] * w[d];
+       }
+       q_vec[dh] = s;
+   }
+   ```
+   
+   Q: stored in registers as q_vec[16]. Good.
+   K: written to `smem_k[warp_id * N * head_dim + n * head_dim + dh]`.
+   V: written to `smem_v[warp_id * N * head_dim + n * head_dim + dh]`.
+   
+   Then `__syncwarp()`.
+   
+6. Scores:
+   ```cuda
+   for (int m = 0; m &lt; N; m++) {
+       float dot = 0.0f;
+       for (int dh = 0; dh &lt; head_dim; dh++) {
+           dot += q_vec[dh] * smem_k[warp_id * N * head_dim + m * head_dim + dh];
+       }
+       scores[m] = dot * scale;
+   }
+   ```
+   Each thread n computes row n of the attention matrix.
+   
+7. Softmax:
+   ```cuda
+   float max_score = scores[0];
+   for (int m = 1; m &lt; N; m++) max_score = fmaxf(max_score, scores[m]);
+   float exp_sum = 0.0f;
+   for (int m = 0; m &lt; N; m++) {
+       scores[m] = expf(scores[m] - max_score);
+       exp_sum += scores[m];
+   }
+   float inv_es = 1.0f / exp_sum;
+   for (int m = 0; m &lt; N; m++) scores[m] *= inv_es;
+   ```
+   Standard softmax. No numerical issue since we subtract max.
+   
+8. Attn @ V:
+   ```cuda
+   for (int dh = 0; dh &lt; head_dim; dh++) o_vec[dh] = 0.0f;
+   for (int m = 0; m &lt; N; m++) {
+       float s = scores[m];
+       for (int dh = 0; dh &lt; head_dim; dh++) {
+           o_vec[dh] += s * smem_v[warp_id * N * head_dim + m * head_dim + dh];
+       }
+   }
+   ```
+   
+9. Write to smem_attn:
+   ```cuda
+   for (int dh = 0; dh &lt; head_dim; dh++) {
+       smem_attn[n * D + h * head_dim + dh] = o_vec[dh];
+   }
+   ```
+   
+   Wait, `smem_attn` is shared among all warps. All 4 warps write to it.
+   Warp 0 writes columns 0..15 for all rows.
+   Warp 1 writes columns 16..31 for all rows.
+   ...
+   Each warp writes 32 rows * 16 cols = 512 elements.
+   No bank conflicts if columns of different heads map to different banks.
+   Actually, each thread writes `smem_attn[n * D + h * head_dim + dh]`.
+   Thread n in warp h accesses offset `n*D + h*head_dim + dh`.
+   For warp 0 (h=0): offsets `n*64 + 0..15`.
+   For warp 1 (h=1): offsets `n*64 + 16..31`.
+   These are all different addresses. No conflicts.
+   
+   `__syncthreads()` after all warps write.
+
+10. Output linear + residual:
+    ```cuda
+    for (int i = tid; i &lt; N * D; i += blockDim.x) {
+        int n = i / D;
+        int d_out = i % D;
+        float s = ob[d_out];
+        const float* w = ow + d_out * D;
+        for (int d = 0; d &lt; D; d++) {
+            s += smem_attn[n * D + d] * w[d];
+        }
+        out_msa[...] = msa_ptr[i] + s;
+    }
+    ```
+    
+    Wait: `ow + d_out * D` is row d_out of ow. That&#x27;s `ow[d_out, :]`.
+    Dot product with `smem_attn[n, :]`.
+    This computes `y = x @ W^T + b` where x is row n of attn output.
+    Correct.
+
+One potential issue: `msa_ptr[i]` reads the original msa. `i = n*D + d_out`.
+In the first load loop, threads loaded in stride pattern. `msa_ptr[i]` for i from tid to N*D stepping by blockDim.x: these reads might not be perfectly coalesced, but with small data and L1, fine.
+Actually, thread 0 reads i=0, 128, 256...
+Thread 1 reads i=1, 129, 257...
+These are scattered. But with 8KB total and L1, it doesn&#x27;t matter much.
+
+Actually, for the residual addition, we can skip reloading msa_ptr and use the values already in smem_msa! smem_msa contains the original msa (before LayerNorm overwrote it? Wait, smem_msa was overwritten by LayerNorm!).
+
+Ah! In step 2, I normalize `smem_msa` in place. So the original msa values are lost.
+To add residual, I need the original values. Options:
+1. Reload from global memory. That&#x27;s what I wrote (`msa_ptr[i]`). Fine.
+2. Keep original in separate shared memory. Not necessary for small data.
+
+Wait, `msa_ptr[i]` access: `i = tid + k*blockDim.x`.
+For tid=0: i=0, 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920.
+For tid=1: i=1, 129, 257, ...
+These addresses are not adjacent for threads in a warp. They are strided by 128 floats = 512 bytes.
+A warp has threads 0..31. Thread t accesses t + k*128.
+These are separated by 512 bytes per thread. That&#x27;s not coalesced.
+But the total data is 8KB. With L1 cache, it probably doesn&#x27;t matter.
+
+For better coalescing in the residual write, I can iterate differently.
+But honestly, for 16 iterations of 128 threads writing 8KB total, the impact is minimal.
+
+Actually I want to avoid the `msa_ptr[i]` reload. Since I loaded msa into smem_msa and then overwrote it, maybe I should compute LayerNorm into a different buffer, or just keep the original in a separate part of smem.
+
+Option: Don&#x27;t overwrite smem_msa. Compute LayerNorm into smem_msa_norm or compute on the fly.
+Wait, the Q,K,V matmuls read smem_msa. So we need the normalized values there.
+But if we store normalized values in `smem_msa`, original is lost.
+
+Let&#x27;s add another shared memory region for the original msa:
+- smem_orig: N*D
+- smem_norm: N*D
+- smem_attn: N*D
+- smem_k, smem_v
+
+Total: 3*2048 + 2*2048 = 10240 floats = 40KB. Still fine.
+Wait, smem_k and smem_v are 2048 each. So 5 * 2048 = 10240 floats.
+
+But we could also just reload from global memory. 8KB reload is trivial. I&#x27;ll keep it simple and reload.
+
+Actually, we can be smarter: in the output loop, instead of `msa_ptr[i]`, we can do the output loop differently to be coalesced:
+```cuda
+int n_start = tid / (D / 16) ...
+```
+No, let&#x27;s just leave it. 8KB of non-coalesced access is ~0.1 microseconds at worst.
+
+**OPM Kernel details:**
+
+Grid: (B, N, N)
+Block: 128 threads
+
+Wait, for OPM, one block per (b, i, j) is 2048 blocks. With 128 threads each = 256K threads.
+Grid: `dim3(B, N, N)` where `blockIdx.x = b`, `blockIdx.y = i`, `blockIdx.z = j`.
+In CUDA, max grid dimensions are large, so `dim3(2, 32, 32)` is fine.
+
+Block: 128 threads.
+
+Shared memory:
+- smem_i: S * D_msa = 8 * 64 = 512 floats
+- smem_j: 512 floats
+- smem_a: S * H = 8 * 32 = 256 floats
+- smem_b: 256 floats
+- smem_outer: H * H = 1024 floats
+Total: 2560 floats = 10KB.
+
+Loading msa:
+```cuda
+for (int idx = tid; idx &lt; S * D_msa; idx += blockDim.x) {
+    int s = idx / D_msa;
+    int d = idx % D_msa;
+    smem_i[idx] = msa[(((b * S + s) * N + i) * D_msa) + d];
+    smem_j[idx] = msa[(((b * S + s) * N + j) * D_msa) + d];
+}
+```
+Wait, for S*D_msa=512 elements and 128 threads: each thread loads 4 elements.
+idx = tid: thread 0 loads s=0,d=0 and s=0,d=1? 
+No: thread 0: idx=0 -&gt; s=0, d=0. Thread 1: idx=1 -&gt; s=0, d=1.
+So within warp, threads load adjacent elements. Coalesced. Good.
+
+LayerNorm:
+```cuda
+for (int row = tid; row &lt; 2 * S; row += blockDim.x) {
+    ...
+}
+```
+2*S = 16 rows. 128 threads. Each thread handles one row. 112 threads idle? Wait, row goes 0..15, then 16..127 are skipped because row &lt; 16. Then 16+128=144 &gt; 16, so only first 16 threads enter.
+Threads 16..127 do nothing. That&#x27;s wasteful but for small compute it&#x27;s fine.
+
+Computing a and b:
+```cuda
+for (int idx = tid; idx &lt; S * H; idx += blockDim.x) {
+    int s = idx / H;
+    int h = idx % H;
+    ...
+}
+```
+S*H = 256. 128 threads: each handles 2 elements.
+idx=0: s=0,h=0. idx=1: s=0,h=1. Good.
+
+Outer product:
+```cuda
+for (int idx = tid; idx &lt; H * H; idx += blockDim.x) {
+    int h1 = idx / H;
+    int h2 = idx % H;
+    ...
+}
+```
+H*H = 1024. 128 threads: 8 elements each. Good.
+
+Linear + residual:
+```cuda
+float* pair_ptr = pair + (((b * N + i) * N + j) * D_pair);
+for (int d_out = tid; d_out &lt; D_pair; d_out += blockDim.x) {
+    ...
+    pair_ptr[d_out] += sum;
+}
+```
+64 output dims. 128 threads: 64 threads active (d_out=0,1,2,...,63). Others idle.
+Writes are coalesced: threads 0..63 write contiguous addresses.
+Reads from smem_outer: all threads read all of smem_outer. Broadcast. Good.
+
+One issue: does `pair_ptr[d_out] += sum` read and write atomically? No race conditions because each block handles a unique (b,i,j).
+
+**TriMul Kernel details:**
+
+Similar to OPM but more complex.
+
+Grid: (B, N, N)
+Block: 128 threads
+
+Shared memory:
+- smem_xi: N * D_pair = 32 * 64 = 2048 floats
+- smem_xj: 2048 floats
+- smem_a: N * H = 32 * 32 = 1024 floats
+- smem_b: 1024 floats
+- smem_o: H = 32 floats
+- smem_out: D_pair = 64 floats
+Total: 6208 floats = ~25KB.
+
+Wait, for gate computation, I need pair_ij. I&#x27;ll read it directly from global memory.
+
+Loading pair:
+```cuda
+const float* pair_i_base = pair + ((b * N + i) * N) * D_pair;
+const float* pair_j_base = pair + ((b * N + j) * N) * D_pair;
+for (int idx = tid; idx &lt; N * D_pair; idx += blockDim.x) {
+    smem_xi[idx] = pair_i_base[idx];
+    smem_xj[idx] = pair_j_base[idx];
+}
+```
+N*D_pair=2048. 128 threads: 16 elements each.
+Coalesced: thread 0 loads 0,1,2.. (actually idx=tid=0: element 0. idx=128: element 128. 
+Thread 0: 0, 128, 256, ...
+Thread 1: 1, 129, 257, ...
+These are strided by 128 floats = 512 bytes. Not perfectly coalesced.
+But each warp loads 32 elements that are 512 bytes apart. That&#x27;s bad for coalescing.
+With L2 cache and reading 4KB per block, it&#x27;s okay but not great.
+
+To improve: have each thread load a contiguous chunk.
+Thread tid loads elements [tid*16, tid*16+15] if 128 threads * 16 = 2048.
+This is coalesced: thread 0 loads [0..15], thread1 loads [16..31], etc.
+Within warp: threads load adjacent 16-element blocks. Each block is 64 bytes, so 4 cache lines per thread? Actually 16 floats = 64 bytes, one cache line. Threads 0..31 load cache lines 0..31. Perfect coalescing!
+
+Let me change the loading loops to use chunk-based loading:
+```cuda
+int load_per_thread = (N * D_pair + blockDim.x - 1) / blockDim.x; // 16
+int start = tid * load_per_thread;
+int end = min(start + load_per_thread, N * D_pair);
+for (int idx = start; idx &lt; end; idx++) {
+    smem_xi[idx] = pair_i_base[idx];
+    smem_xj[idx] = pair_j_base[idx];
+}
+```
+Wait, `start` values are 0, 16, 32, ... for threads 0, 1, 2, ...
+Within warp: thread 0 loads 0..15, thread 1 loads 16..31, etc. Coalesced.
+Better!
+
+Let me apply this pattern to all kernels for loading and storing.
+
+**Revised loading pattern for all kernels:**
+
+```cuda
+int total = N * D;
+int per_thread = (total + blockDim.x - 1) / blockDim.x;
+int start = tid * per_thread;
+int end = min(start + per_thread, total);
+for (int i = start; i &lt; end; i++) {
+    smem[i] = global_ptr[i];
+}
+```
+
+This gives contiguous chunks per thread, and adjacent threads in a warp load adjacent memory. More coalesced than strided access.
+
+For the output of MSA attention, I&#x27;ll use the same pattern:
+```cuda
+for (int i = start; i &lt; end; i++) {
+    int n = i / D;
+    int d_out = i % D;
+    float s = ob[d_out];
+    const float* w = ow + d_out * D;
+    for (int d = 0; d &lt; D; d++) {
+        s += smem_attn[n * D + d] * w[d];
+    }
+    out_msa[((b * S + s) * N * D + i] = msa_ptr[i] + s;
+}
+```
+Wait, `msa_ptr[i]` here: I need to load the original msa. The loading pattern should also be chunk-based for coalescing.
+Actually, for the output linear + residual, I can compute `i = start..end-1`, which gives contiguous chunk.
+For each `i`, compute `n = i / D`, `d_out = i % D`.
+Then I need `msa_ptr[i]` (the original value) and `smem_attn[n*D + d]` for d=0..D-1.
+`smem_attn[n*D + d]` for different d: these are contiguous in shared memory, so fast.
+`msa_ptr[i]`: the global read is contiguous within each thread&#x27;s chunk. Coalesced.
+Writes to `out_msa`: contiguous. Coalesced.
+
+This is much better!
+
+Let me rewrite all kernels with this chunk pattern.
+
+Also, for MSA attention&#x27;s msa loading:
+```cuda
+int total = N * D;
+int per_thread = (total + blockDim.x - 1) / blockDim.x;
+int start = tid * per_thread;
+int end = min(start + per_thread, total);
+for (int i = start; i &lt; end; i++) {
+    smem_msa[i] = msa_ptr[i];
+}
+```
+And similarly for all other loads and stores.
+
+One more thing: `msa_ptr` should be computed as `msa + ((b * S + s) * N) * D` or `msa + (b * S + s) * N * D`. Both same.
+
+Let me now write the complete code.
+
+Actually wait, in OPM, the msa loading:
+```cuda
+for (int idx = start; idx &lt; end; idx++) {
+    int s = idx / D_msa;
+    int d = idx % D_msa;
+    smem_i[idx] = msa[(((b * S + s) * N + i) * D_msa) + d];
+}
+```
+This computes the global address. Since `idx` is contiguous within a thread, but different threads have different `start` values (multiples of 16), are these global accesses coalesced?
+Thread 0: idx=0..15. Addresses: (((b*S+0)*N+i)*D)+0 .. +15. Contiguous.
+Thread 1: idx=16..31. Addresses: (((b*S+1)*N+i)*D)+0 .. +15. Contiguous.
+Thread 0&#x27;s last address and thread 1&#x27;s first address might not be adjacent if D_msa doesn&#x27;t align. But D_msa=64, which is a multiple of 16. So thread0 ends at offset 15, thread1 starts at offset 16 (relative to its own base).
+Are the bases adjacent? Thread0&#x27;s base: `((b*S+0)*N+i)*D`. Thread1&#x27;s base: `((b*S+1)*N+i)*D`.
+These differ by `N*D = 32*64 = 2048`. Not adjacent.
+But within each thread (which executes one instruction at a time), the reads are contiguous, so they use the L1 cache well.
+Across threads in a warp: thread0 reads addresses A..A+15, thread1 reads addresses B..B+15 where B = A + N*D.
+Since N*D = 2048 floats, that&#x27;s a large stride. Not coalesced across the warp.
+
+But with chunk loading, a warp reads 32 chunks of 16 floats each = 512 floats.
+These chunks are strided by 2048 floats in memory.
+This is still not ideal. But given the tiny data size (512 floats = 2KB per warp), and L2 cache, it might be okay.
+
+To improve: we could transpose the access pattern.
+Actually, msa layout is [B, S, N, D_msa]. For fixed (b,i), the elements `msa[b, :, i, :]` are at:
+`offset = (b*S* N + s*N + i) * D_msa + d`
+For s=0..7, d=0..63.
+Total size: S*D_msa = 512 elements.
+If we just load them linearly: `offset = ((b * S + s) * N + i) * D_msa + d`.
+For sequential s and d: consecutive elements in memory are for the same (b,s,i) but different d.
+Across s: separated by N*D_msa.
+
+With 128 threads and 512 elements: 4 elements per thread.
+If thread tid loads `tid*4 + k` for k=0..3:
+Thread 0: elements 0,1,2,3 (s=0,d=0..3)
+Thread 1: elements 4,5,6,7 (s=0,d=4..7)
+...
+Thread 15: elements 60..63 (s=0,d=60..63)
+Thread 16: elements 64..67 (s=1,d=0..3)
+...
+Thread 127: elements 508..511 (s=7,d=60..63)
+
+Within warp 0 (threads 0..31): reads elements 0..127.
+These are all in s=0..1, d=0..63. Contiguous except for the gap between s=0,d=63 and s=1,d=0.
+Gap size: `N*D_msa - D_msa = 31*64 = 1984 floats`. Large gap.
+So half the warp reads s=0, other half reads s=1. Still, each half&#x27;s reads are contiguous.
+
+With L1 cache line of 128 bytes = 32 floats:
+Thread 0 loads 4 floats: one cache line serves 8 threads.
+The reads are coalesced within each group of 8 threads, but since the memory is contiguous across threads 0..15 (s=0), it should be fine. 
+Across thread 15 and 16: there&#x27;s a 1984-float gap. The memory controller might not coalesce across this gap.
+
+To make it truly coalesced, we could change the thread-to-element mapping.
+But with 2KB and cache, it&#x27;s probably fast enough. Let&#x27;s not over-optimize.
+
+Let me proceed with the code.
+
+One more important detail: `load_inline`.
+In `cpp_sources`, I need to write host wrapper functions that call the kernels and accept torch::Tensor.
+
+Here&#x27;s the pattern:
+
+```cpp
+torch::Tensor msa_attn_forward(torch::Tensor msa, torch::Tensor norm_w, ...) {
+    auto out = torch::empty_like(msa);
+    int B = msa.size(0), S = msa.size(1), N = msa.size(2), D = msa.size(3);
+    dim3 grid(B, S);
+    dim3 block(128);
+    size_t smem_size = ...;
+    msa_attn_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(
+        msa.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        ...
+    );
+    return out;
+}
+```
+
+For OPM, the kernel adds to pair in-place. So:
+
+```cpp
+void opm_forward(torch::Tensor msa, torch::Tensor pair, ...) {
+    int B = msa.size(0), S = msa.size(1), N = msa.size(2);
+    int D_msa = msa.size(3);
+    int D_pair = pair.size(3);
+    int H = 32;
+    dim3 grid(B, N, N);
+    dim3 block(128);
+    opm_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(
+        msa.data_ptr&lt;float&gt;(), pair.data_ptr&lt;float&gt;(),
+        B, S, N, D_msa, H, D_pair,
+        ...
+    );
+}
+```
+
+For TriMul, similar in-place addition:
+
+```cpp
+void trimul_forward(torch::Tensor pair, ...) {
+    int B = pair.size(0), N = pair.size(1), D_pair = pair.size(3);
+    int H = tri_hidden; // but tri_hidden is passed from Python
+    dim3 grid(B, N, N);
+    dim3 block(128);
+    trimul_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(
+        pair.data_ptr&lt;float&gt;(), pair.data_ptr&lt;float&gt;(),
+        B, N, D_pair, H,
+        ...
+    );
+}
+```
+
+Wait, trimul output writes to the same tensor `pair`. So both `pair_in` and `pair_out` are the same pointer.
+
+Actually, for TriMul, I read pair for:
+- x_i and x_j (the entire rows i and j)
+- pair_ij for gate
+Then I write to pair_ij. The write is in-place.
+
+Since all blocks write to disjoint (i,j) positions, and they read other positions (i,k) and (j,k), there&#x27;s no race condition.
+
+Now, regarding the `hidden` parameter for OPM and `tri_hidden` for TriMul:
+- OPM always uses hidden=32 in the reference.
+- TriMul uses the constructor argument `tri_hidden`.
+
+In ModelNew.__init__, I receive `tri_hidden`. I need to pass it to the C++ functions.
+
+For OPM, hidden is always 32. I can hardcode it in the kernel or pass it as a parameter. To be safe, I&#x27;ll pass H=32 as a parameter. Actually, I can just pass `msa_dim` and derive hidden=32, or pass the weight tensors and get their sizes.
+
+If I pass weight tensors, I can infer dimensions from them:
+- `aw.size(0)` = hidden
+But it&#x27;s easier to just pass integers.
+
+Wait, I need to pass tri_hidden to the trimul_forward function. I can either:
+1. Include it in the pybind function signature.
+2. Or infer from the gate_w tensor size: gate_w is (pair_dim, pair_dim). Not helpful for H.
+   But pa_w is (hidden, pair_dim). So `pa_w.size(0)` gives H.
+
+I&#x27;ll just pass the tensors and derive sizes in C++.
+
+Now, compiling and testing.
+
+Let me write the full code now. I&#x27;ll be careful to handle all shapes.
+
+One more subtlety: In `opm_forward`, the `ow` weight is from `nn.Linear(hidden*hidden, pair_dim)`.
+In PyTorch: `ow` shape is `(pair_dim, hidden*hidden)`.
+In my kernel: `ow[d_out * (H*H) + h]`. This assumes row-major with `H*H` columns.
+Since PyTorch stores linear weights as [out_features, in_features], `ow[out, in]` is correct.
+So `ow[d_out, h]` where h is the flattened outer index.
+Access: `ow[d_out * (H*H) + h]`. Correct.
+
+Similarly for all other linear weights.
+
+OK, now let me draft the code. I&#x27;ll include all three kernels and host wrappers.
+
+Wait, I just realized something important. The test harness might check that ModelNew has the same state_dict keys as Model, or it might just instantiate both and randomize weights. 
+
+If it randomizes weights using `model.apply(init_weights)`, then the submodule parameters need to be registered. So I should keep the submodules as actual nn.Module children.
+
+But if I create `self.msa_attn = MSARowSelfAttention(...)` and then in forward call the custom kernel instead of `self.msa_attn(x)`, the weights exist and are registered.
+
+Actually, looking at how the test harness typically works:
+1. It instantiates `Model` and `ModelNew` with `get_init_inputs()`.
+2. It might copy weights from Model to ModelNew, or initialize both the same way.
+3. It calls forward on both.
+
+If it copies state_dict: `model_new.load_state_dict(model.state_dict())`, then ModelNew needs the same parameter names.
+
+So ModelNew should have:
+- `self.msa_attn`
+- `self.opm`
+- `self.tri_mul`
+
+Each with the exact same internal structure.
+
+Yes, I&#x27;ll create the submodules. Then in forward, I call the custom kernels with the submodule weights.
+
+Now let me write the Python module:
+
+```python
+import torch
+import torch.nn as nn
+import math
+from torch.utils.cpp_extension import load_inline
+
+# Need to define MSARowSelfAttention etc. for ModelNew to instantiate them
+class MSARowSelfAttention(nn.Module):
+    ...
+
+class OuterProductMeanSmall(nn.Module):
+    ...
+
+class TriMulOut(nn.Module):
+    ...
+
+# C++ and CUDA code
+cuda_src = r&#x27;&#x27;&#x27;
+... CUDA kernels ...
+&#x27;&#x27;&#x27;
+
+cpp_src = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor msa_attn_cuda(...) { ... }
+void opm_cuda(...) { ... }
+void trimul_cuda(...) { ... }
+&#x27;&#x27;&#x27;
+
+# But wait, cpp_sources in load_inline should include both C++ host code and CUDA kernels.
+# Let me put everything in one string.
+```
+
+Actually, `load_inline` takes `cpp_sources` (host C++) and `cuda_sources` (device CUDA). The CUDA is compiled with nvcc, and C++ with the host compiler.
+
+But it&#x27;s often easier to put everything in `cpp_sources` if we use the `.cu` extension or if torch handles it. Let me check: `load_inline` has separate `cpp_sources` and `cuda_sources` arguments.
+
+From PyTorch docs:
+```python
+load_inline(name, cpp_sources, cuda_sources=None, ...)
+```
+
+I&#x27;ll put host wrappers in `cpp_sources` and kernels in `cuda_sources`.
+
+Wait, but `cuda_sources` is compiled as `.cu` files, so it can contain both device code and host code that calls kernels. Let me just put everything in `cuda_sources` to avoid any linker issues.
+
+Actually, the simplest approach is to put everything in one `cpp_sources` string and set `with_cuda=True` or `is_python_module=True`. But `load_inline` might not like compiling CUDA code in `cpp_sources`.
+
+Looking at the standard pattern:
+```python
+cuda_module = load_inline(
+    name=&quot;fused_ops&quot;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&quot;...&quot;]
+)
+```
+
+Let me use this pattern.
+
+OK, I&#x27;ll write a single cuda_source string containing all the device kernels and host wrappers.
+
+Wait, `load_inline` auto-generates pybind11 bindings from the `functions` list. The host functions should be accessible.
+
+Let me write the code more carefully.
+
+cuda_source = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void msa_attn_kernel(...) { ... }
+
+torch::Tensor msa_attn_cuda(torch::Tensor msa, ...) {
+   ...
+   msa_attn_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(...);
+   return out;
+}
+
+__global__ void opm_kernel(...) { ... }
+
+void opm_cuda(torch::Tensor msa, torch::Tensor pair, ...) {
+   ...
+   opm_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(...);
+}
+
+__global__ void trimul_kernel(...) { ... }
+
+void trimul_cuda(torch::Tensor pair, ...) {
+   ...
+   trimul_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(...);
+}
+&#x27;&#x27;&#x27;
+
+cpp_source = &#x27;&#x27;  # empty or just includes
+
+module = load_inline(
+    name=&#x27;evoformer_fused&#x27;,
+    cpp_sources=&#x27;&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;msa_attn_cuda&#x27;, &#x27;opm_cuda&#x27;, &#x27;trimul_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+    verbose=False,
+)
+```
+
+Actually, I think the standard is to put host code in `cpp_sources` and device code can be in either. But since the host code needs to call CUDA kernels, it should be compiled with nvcc, which means putting it in `cuda_sources`.
+
+Let me just put everything in `cuda_sources`. That should work.
+
+One more thing: `torch.half` / `torch.bfloat16` - but the problem says fp32 precision. So all tensors are float32.
+
+Let me write the complete code now. I&#x27;ll compile and test.
+
+Wait, before coding everything, I want to make sure about the torch extension function signatures. They should accept torch::Tensor and return torch::Tensor (or void).
+
+Also, I need to make sure tensors are contiguous and on CUDA. I&#x27;ll use `.contiguous()` in forward() if necessary, but the test harness probably gives contiguous tensors.
+
+Let me write the code. Be very careful with all the index calculations.
+
+Actually, one more thought: in MSA attention, the Q,K,V projections use bias=False. But in my kernel, I didn&#x27;t add any bias for Q,K,V. Correct.
+
+For output projection, I use `ob` (out bias). Correct.
+
+For OPM, a and b use bias (`ab`, `bb`). Correct.
+For OPM out, I use `ow` and `ob` (out weight and bias). Correct.
+
+For TriMul:
+- pa, ga, pb, gb all use bias. Correct.
+- norm_out uses weight and bias. Correct.
+- out uses weight and bias. Correct.
+- gate_out uses weight and bias. Correct.
+
+Wait, in TriMul, `self.ga = nn.Linear(pair_dim, hidden)`. So yes, bias.
+Then `a = self.pa(x) * torch.sigmoid(self.ga(x))`.
+So a[k,h] = (x[k,:] @ pa_w.T + pa_b[h]) * sigmoid(x[k,:] @ ga_w.T + ga_b[h]).
+In my kernel:
+```cuda
+float pa = pa_b[h];
+float ga = ga_b[h];
+for (int d = 0; d &lt; D_pair; d++) {
+    pa += smem_xi[k * D_pair + d] * pa_w[h * D_pair + d];
+    ga += smem_xi[k * D_pair + d] * ga_w[h * D_pair + d];
+}
+smem_a[idx] = pa * (1.0f / (1.0f + expf(-ga)));
+```
+Correct.
+
+For norm_out: `self.norm_out = nn.LayerNorm(hidden)`. 
+Weight and bias are (hidden,).
+In my kernel:
+```cuda
+if (tid &lt; H) {
+    float sum = 0.0f;
+    for (int h = 0; h &lt; H; h++) sum += smem_o[h];
+    float mean = sum / H;
+    float var = 0.0f;
+    for (int h = 0; h &lt; H; h++) {
+        float diff = smem_o[h] - mean;
+        var += diff * diff;
+    }
+    float inv_std = rsqrtf(var / H + 1e-5f);
+    for (int h = 0; h &lt; H; h++) {
+        smem_o[h] = (smem_o[h] - mean) * inv_std * norm_out_w[h] + norm_out_b[h];
+    }
+}
+```
+This computes mean and var redundantly for all 32 threads, but it&#x27;s fine. However, I should be careful: with `if (tid &lt; H)`, only threads 0..31 enter. But all 32 threads within warp 0 enter. They all compute and write to smem_o. Since they all write the same values, it&#x27;s fine. But it wastes compute.
+
+To optimize: let one thread compute mean and var and broadcast. But for 32 elements, it&#x27;s negligible.
+
+Actually, `if (tid &lt; H)` with H=32 means exactly the first warp enters. Threads 0..31. Since they execute in lockstep within the warp, it&#x27;s fine.
+
+Let me now write the full kernel code.
+
+Another thing: in the MSA attention output linear, I&#x27;m using `ow + d_out * D`. But the weight shape is (D, D). `ow[d_out, :]` means `ow + d_out * D`. Since D=msa_dim=64, this is correct.
+
+But wait: `self.out = nn.Linear(msa_dim, msa_dim)`. Weight shape is (64, 64). Yes.
+
+For OPM out: `self.out = nn.Linear(hidden * hidden, pair_dim)`. Weight shape is (64, 1024). Access: `ow[d_out * (H*H) + h]`. Since H*H=1024, `ow + d_out * 1024 + h`. Correct.
+
+For TriMul out: `self.out = nn.Linear(hidden, pair_dim)`. Weight shape is (64, 32). Access: `out_w[d_out * H + h]`. Correct.
+
+For TriMul gate_out: `self.gate_out = nn.Linear(pair_dim, pair_dim)`. Weight shape is (64, 64). Access: `gate_w[d_out * D_pair + h]`. Correct.
+
+OK, I think I have everything. Let me assemble the code.
+
+Actually, I need to also handle the case where the input tensors might not be contiguous. I&#x27;ll add `.contiguous()` in forward() to be safe. This has a small cost but ensures correctness.
+
+Wait, there&#x27;s a potential issue with in-place operations in OPM and TriMul.
+OPM does `pair += opm_result`.
+TriMul does `pair += trimul_result`.
+If I launch OPM kernel first (which reads and writes pair), then TriMul kernel (which reads from pair including the OPM update, and writes back), this is correct.
+
+But for OPM kernel, I read `pair_ptr[d_out]` and add to it. This is atomic-free because each block handles a unique (b,i,j).
+For TriMul kernel, I read `pair_ij` (original value before trimul) and compute `new = pair_ij + gate * out`. Then write back. This is also race-free because each block handles unique (b,i,j).
+But note: TriMul reads `pair_i_base` and `pair_j_base` which are other positions in the same pair tensor. These are not modified by TriMul blocks (since each block only writes its own (i,j)). So no race.
+
+Similarly, OPM reads msa which is not modified during OPM.
+
+All good.
+
+Let me write the complete code now. I&#x27;ll use triple quotes and be very careful.
+
+Actually, I realize I need to be careful about `load_inline` compilation time. The first compile might take a while. But we have 8 turns, so it&#x27;s fine.
+
+Let me create the final code.
+</div></details><div class="block assistant"><span class="role-tag">assistant</span>I&#x27;ll start by writing the complete fused CUDA kernel implementation. The key insight is that PyTorch&#x27;s reference implementation launches ~20 separate kernels for this small model, and most of the time is kernel-launch overhead. By fusing each major stage into a single CUDA kernel, we can dramatically reduce latency.
+
+Let me write the code and compile it:
+</div><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport math\nfrom torch.utils.cpp_extension import load_inline\n\n\nclass MSARowSelfAttention(nn.Module):\n    def __init__(self, msa_dim, num_heads):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = msa_dim // num_heads\n        self.norm = nn.LayerNorm(msa_dim)\n        self.q = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.k = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.v = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.out = nn.Linear(msa_dim, msa_dim)\n\n    def forward(self, msa):\n        B, S, N, D = msa.shape\n        h, d = self.num_heads, self.head_dim\n        x = self.norm(msa)\n        q = self.q(x).view(B, S, N, h, d).permute(0, 1, 3, 2, 4)\n        k = self.k(x).view(B, S, N, h, d).permute(0, 1, 3, 2, 4)\n        v = self.v(x).view(B, S, N, h, d).permute(0, 1, 3, 2, 4)\n        attn = (q @ k.transpose(-1, -2)) / math.sqrt(d)\n        attn = F.softmax(attn, dim=-1)\n        out = (attn @ v).permute(0, 1, 3, 2, 4).reshape(B, S, N, D)\n        return self.out(out)\n\n\nclass OuterProductMeanSmall(nn.Module):\n    def __init__(self, msa_dim, pair_dim, hidden=32):\n        super().__init__()\n        self.norm = nn.LayerNorm(msa_dim)\n        self.a = nn.Linear(msa_dim, hidden)\n        self.b = nn.Linear(msa_dim, hidden)\n        self.out = nn.Linear(hidden * hidden, pair_dim)\n\n    def forward(self, msa):\n        x = self.norm(msa)\n        a = self.a(x)\n        b = self.b(x)\n        outer = torch.einsum(\&quot;bsih,bsjk-&gt;bijhk\&quot;, a, b)\n        S = msa.shape[1]\n        outer = outer / max(S, 1)\n        B, N1, N2, H1, H2 = outer.shape\n        return self.out(outer.reshape(B, N1, N2, H1 * H2))\n\n\nclass TriMulOut(nn.Module):\n    def __init__(self, pair_dim, hidden):\n        super().__init__()\n        self.norm = nn.LayerNorm(pair_dim)\n        self.pa = nn.Linear(pair_dim, hidden)\n        self.pb = nn.Linear(pair_dim, hidden)\n        self.ga = nn.Linear(pair_dim, hidden)\n        self.gb = nn.Linear(pair_dim, hidden)\n        self.norm_out = nn.LayerNorm(hidden)\n        self.out = nn.Linear(hidden, pair_dim)\n        self.gate_out = nn.Linear(pair_dim, pair_dim)\n\n    def forward(self, pair):\n        x = self.norm(pair)\n        a = self.pa(x) * torch.sigmoid(self.ga(x))\n        b = self.pb(x) * torch.sigmoid(self.gb(x))\n        o = torch.einsum(\&quot;bikh,bjkh-&gt;bijh\&quot;, a, b)\n        o = self.out(self.norm_out(o))\n        return torch.sigmoid(self.gate_out(pair)) * o\n\n\ncuda_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n// ---------------------------------------------------------------------------\n// Kernel 1: Fused MSA Row Self-Attention\n// ---------------------------------------------------------------------------\n__global__ void msa_attn_kernel(\n    const float* __restrict__ msa,\n    float* __restrict__ out_msa,\n    int B, int S, int N, int D, int num_heads, int head_dim,\n    const float* __restrict__ norm_w,\n    const float* __restrict__ norm_b,\n    const float* __restrict__ qw,\n    const float* __restrict__ kw,\n    const float* __restrict__ vw,\n    const float* __restrict__ ow,\n    const float* __restrict__ ob)\n{\n    extern __shared__ float smem[];\n    float* smem_msa = smem;\n    float* smem_attn = smem + N * D;\n    int smem_per_warp = N * head_dim;\n    float* smem_k = smem + 2 * N * D + blockIdx.x * smem_per_warp; // not safe with dynamic, use warp offset\n\n    // Recompute proper shared memory layout\n    float* smem_k_base = smem + 2 * N * D;\n    float* smem_v_base = smem + 2 * N * D + (blockDim.x / 32) * N * head_dim;\n\n    int b = blockIdx.x;\n    int s = blockIdx.y;\n    int tid = threadIdx.x;\n    int warp_id = tid / 32;\n    int lane = tid % 32;\n    int num_warps = blockDim.x / 32;\n\n    const float* msa_ptr = msa + ((b * S + s) * N) * D;\n\n    // Load msa into smem_msa (chunked per thread for coalescing)\n    int total_msa = N * D;\n    int msa_per_thread = (total_msa + blockDim.x - 1) / blockDim.x;\n    int msa_start = tid * msa_per_thread;\n    int msa_end = msa_start + msa_per_thread;\n    if (msa_end &gt; total_msa) msa_end = total_msa;\n    for (int i = msa_start; i &lt; msa_end; i++) {\n        smem_msa[i] = msa_ptr[i];\n    }\n    __syncthreads();\n\n    // LayerNorm per row (32 threads handle 32 rows)\n    if (tid &lt; 32) {\n        int n = tid;\n        float sum = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; D; d++) {\n            sum += smem_msa[n * D + d];\n        }\n        float mean = sum / D;\n        float var_sum = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; D; d++) {\n            float diff = smem_msa[n * D + d] - mean;\n            var_sum += diff * diff;\n        }\n        float inv_std = rsqrtf(var_sum / D + 1e-5f);\n        #pragma unroll\n        for (int d = 0; d &lt; D; d++) {\n            smem_msa[n * D + d] = (smem_msa[n * D + d] - mean) * inv_std * norm_w[d] + norm_b[d];\n        }\n    }\n    __syncthreads();\n\n    // Per-head attention\n    int h = warp_id;\n    if (h &lt; num_heads) {\n        int n = lane;\n        float q_vec[16];\n        float scores[32];\n        float o_vec[16];\n        float scale = 1.0f / sqrtf((float)head_dim);\n\n        float* my_k = smem_k_base + warp_id * N * head_dim;\n        float* my_v = smem_v_base + warp_id * N * head_dim;\n\n        // Compute Q\n        #pragma unroll\n        for (int dh = 0; dh &lt; head_dim; dh++) {\n            float sum = 0.0f;\n            const float* w = qw + (h * head_dim + dh) * D;\n            #pragma unroll\n            for (int d = 0; d &lt; D; d++) {\n                sum += smem_msa[n * D + d] * w[d];\n            }\n            q_vec[dh] = sum;\n        }\n        // Compute K\n        #pragma unroll\n        for (int dh = 0; dh &lt; head_dim; dh++) {\n            float sum = 0.0f;\n            const float* w = kw + (h * head_dim + dh) * D;\n            #pragma unroll\n            for (int d = 0; d &lt; D; d++) {\n                sum += smem_msa[n * D + d] * w[d];\n            }\n            my_k[n * head_dim + dh] = sum;\n        }\n        // Compute V\n        #pragma unroll\n        for (int dh = 0; dh &lt; head_dim; dh++) {\n            float sum = 0.0f;\n            const float* w = vw + (h * head_dim + dh) * D;\n            #pragma unroll\n            for (int d = 0; d &lt; D; d++) {\n                sum += smem_msa[n * D + d] * w[d];\n            }\n            my_v[n * head_dim + dh] = sum;\n        }\n        __syncwarp();\n\n        // Q @ K^T\n        #pragma unroll\n        for (int m = 0; m &lt; N; m++) {\n            float dot = 0.0f;\n            #pragma unroll\n            for (int dh = 0; dh &lt; head_dim; dh++) {\n                dot += q_vec[dh] * my_k[m * head_dim + dh];\n            }\n            scores[m] = dot * scale;\n        }\n\n        // Softmax\n        float max_score = scores[0];\n        #pragma unroll\n        for (int m = 1; m &lt; N; m++) {\n            max_score = fmaxf(max_score, scores[m]);\n        }\n        float exp_sum = 0.0f;\n        #pragma unroll\n        for (int m = 0; m &lt; N; m++) {\n            scores[m] = expf(scores[m] - max_score);\n            exp_sum += scores[m];\n        }\n        float inv_es = 1.0f / exp_sum;\n        #pragma unroll\n        for (int m = 0; m &lt; N; m++) {\n            scores[m] *= inv_es;\n        }\n\n        // Attn @ V\n        #pragma unroll\n        for (int dh = 0; dh &lt; head_dim; dh++) {\n            o_vec[dh] = 0.0f;\n        }\n        #pragma unroll\n        for (int m = 0; m &lt; N; m++) {\n            float s = scores[m];\n            #pragma unroll\n            for (int dh = 0; dh &lt; head_dim; dh++) {\n                o_vec[dh] += s * my_v[m * head_dim + dh];\n            }\n        }\n\n        // Write to smem_attn\n        #pragma unroll\n        for (int dh = 0; dh &lt; head_dim; dh++) {\n            smem_attn[n * D + h * head_dim + dh] = o_vec[dh];\n        }\n    }\n    __syncthreads();\n\n    // Output linear + residual\n    int out_per_thread = (total_msa + blockDim.x - 1) / blockDim.x;\n    int out_start = tid * out_per_thread;\n    int out_end = out_start + out_per_thread;\n    if (out_end &gt; total_msa) out_end = total_msa;\n    for (int i = out_start; i &lt; out_end; i++) {\n        int n = i / D;\n        int d_out = i % D;\n        float s = ob[d_out];\n        const float* w = ow + d_out * D;\n        #pragma unroll\n        for (int d = 0; d &lt; D; d++) {\n            s += smem_attn[n * D + d] * w[d];\n        }\n        out_msa[((b * S + s) * N) * D + i] = msa_ptr[i] + s;\n    }\n}\n\n// ---------------------------------------------------------------------------\n// Kernel 2: Fused Outer Product Mean\n// ---------------------------------------------------------------------------\n__global__ void opm_kernel(\n    const float* __restrict__ msa,\n    float* __restrict__ pair,\n    int B, int S, int N, int D_msa, int H, int D_pair,\n    const float* __restrict__ norm_w,\n    const float* __restrict__ norm_b,\n    const float* __restrict__ aw,\n    const float* __restrict__ ab,\n    const float* __restrict__ bw,\n    const float* __restrict__ bb,\n    const float* __restrict__ ow,\n    const float* __restrict__ ob)\n{\n    extern __shared__ float smem[];\n    float* smem_i = smem;\n    float* smem_j = smem + S * D_msa;\n    float* smem_a = smem + 2 * S * D_msa;\n    float* smem_b = smem + 2 * S * D_msa + S * H;\n    float* smem_outer = smem + 2 * S * D_msa + 2 * S * H;\n\n    int b = blockIdx.x;\n    int i = blockIdx.y;\n    int j = blockIdx.z;\n    int tid = threadIdx.x;\n\n    // Load msa[b, :, i, :] and msa[b, :, j, :]\n    int total_load = S * D_msa;\n    int load_per_thread = (total_load + blockDim.x - 1) / blockDim.x;\n    int load_start = tid * load_per_thread;\n    int load_end = load_start + load_per_thread;\n    if (load_end &gt; total_load) load_end = total_load;\n    for (int idx = load_start; idx &lt; load_end; idx++) {\n        int s = idx / D_msa;\n        int d = idx % D_msa;\n        smem_i[idx] = msa[(((b * S + s) * N + i) * D_msa) + d];\n        smem_j[idx] = msa[(((b * S + s) * N + j) * D_msa) + d];\n    }\n    __syncthreads();\n\n    // LayerNorm for 2*S rows\n    int ln_rows = 2 * S;\n    int ln_per_thread = (ln_rows + blockDim.x - 1) / blockDim.x;\n    int ln_start = tid * ln_per_thread;\n    int ln_end = ln_start + ln_per_thread;\n    if (ln_end &gt; ln_rows) ln_end = ln_rows;\n    for (int row = ln_start; row &lt; ln_end; row++) {\n        float* row_ptr = (row &lt; S) ? smem_i + row * D_msa : smem_j + (row - S) * D_msa;\n        float sum = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; D_msa; d++) sum += row_ptr[d];\n        float mean = sum / D_msa;\n        float var = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; D_msa; d++) {\n            float diff = row_ptr[d] - mean;\n            var += diff * diff;\n        }\n        float inv_std = rsqrtf(var / D_msa + 1e-5f);\n        #pragma unroll\n        for (int d = 0; d &lt; D_msa; d++) {\n            row_ptr[d] = (row_ptr[d] - mean) * inv_std * norm_w[d] + norm_b[d];\n        }\n    }\n    __syncthreads();\n\n    // Compute a and b\n    int total_ab = S * H;\n    int ab_per_thread = (total_ab + blockDim.x - 1) / blockDim.x;\n    int ab_start = tid * ab_per_thread;\n    int ab_end = ab_start + ab_per_thread;\n    if (ab_end &gt; total_ab) ab_end = total_ab;\n    for (int idx = ab_start; idx &lt; ab_end; idx++) {\n        int s = idx / H;\n        int h = idx % H;\n        float a_val = ab[h];\n        float b_val = bb[h];\n        #pragma unroll\n        for (int d = 0; d &lt; D_msa; d++) {\n            a_val += smem_i[s * D_msa + d] * aw[h * D_msa + d];\n            b_val += smem_j[s * D_msa + d] * bw[h * D_msa + d];\n        }\n        smem_a[idx] = a_val;\n        smem_b[idx] = b_val;\n    }\n    __syncthreads();\n\n    // Outer product and sum over s\n    int total_outer = H * H;\n    int outer_per_thread = (total_outer + blockDim.x - 1) / blockDim.x;\n    int outer_start = tid * outer_per_thread;\n    int outer_end = outer_start + outer_per_thread;\n    if (outer_end &gt; total_outer) outer_end = total_outer;\n    for (int idx = outer_start; idx &lt; outer_end; idx++) {\n        int h1 = idx / H;\n        int h2 = idx % H;\n        float sum = 0.0f;\n        #pragma unroll\n        for (int s = 0; s &lt; S; s++) {\n            sum += smem_a[s * H + h1] * smem_b[s * H + h2];\n        }\n        smem_outer[idx] = sum / (float)S;\n    }\n    __syncthreads();\n\n    // Linear projection and residual add to pair\n    float* pair_ptr = pair + (((b * N + i) * N + j) * D_pair);\n    int lin_per_thread = (D_pair + blockDim.x - 1) / blockDim.x;\n    int lin_start = tid * lin_per_thread;\n    int lin_end = lin_start + lin_per_thread;\n    if (lin_end &gt; D_pair) lin_end = D_pair;\n    for (int d_out = lin_start; d_out &lt; lin_end; d_out++) {\n        float sum = ob[d_out];\n        #pragma unroll\n        for (int h = 0; h &lt; H * H; h++) {\n            sum += smem_outer[h] * ow[d_out * (H * H) + h];\n        }\n        pair_ptr[d_out] += sum;\n    }\n}\n\n// ---------------------------------------------------------------------------\n// Kernel 3: Fused Triangular Multiplicative Update (Out)\n// ---------------------------------------------------------------------------\n__global__ void trimul_kernel(\n    const float* __restrict__ pair,\n    float* __restrict__ out_pair,\n    int B, int N, int D_pair, int H,\n    const float* __restrict__ norm_w,\n    const float* __restrict__ norm_b,\n    const float* __restrict__ pa_w,\n    const float* __restrict__ pa_b,\n    const float* __restrict__ ga_w,\n    const float* __restrict__ ga_b,\n    const float* __restrict__ pb_w,\n    const float* __restrict__ pb_b,\n    const float* __restrict__ gb_w,\n    const float* __restrict__ gb_b,\n    const float* __restrict__ norm_out_w,\n    const float* __restrict__ norm_out_b,\n    const float* __restrict__ out_w,\n    const float* __restrict__ out_b,\n    const float* __restrict__ gate_w,\n    const float* __restrict__ gate_b)\n{\n    extern __shared__ float smem[];\n    float* smem_xi = smem;\n    float* smem_xj = smem + N * D_pair;\n    float* smem_a = smem + 2 * N * D_pair;\n    float* smem_b = smem + 2 * N * D_pair + N * H;\n    float* smem_o = smem + 2 * N * D_pair + 2 * N * H;\n    float* smem_out = smem + 2 * N * D_pair + 2 * N * H + H;\n\n    int b = blockIdx.x;\n    int i = blockIdx.y;\n    int j = blockIdx.z;\n    int tid = threadIdx.x;\n\n    const float* pair_i_base = pair + ((b * N + i) * N) * D_pair;\n    const float* pair_j_base = pair + ((b * N + j) * N) * D_pair;\n\n    // Load pair rows\n    int total_load = N * D_pair;\n    int load_per_thread = (total_load + blockDim.x - 1) / blockDim.x;\n    int load_start = tid * load_per_thread;\n    int load_end = load_start + load_per_thread;\n    if (load_end &gt; total_load) load_end = total_load;\n    for (int idx = load_start; idx &lt; load_end; idx++) {\n        smem_xi[idx] = pair_i_base[idx];\n        smem_xj[idx] = pair_j_base[idx];\n    }\n    __syncthreads();\n\n    // LayerNorm on xi and xj rows\n    int ln_rows = 2 * N;\n    int ln_per_thread = (ln_rows + blockDim.x - 1) / blockDim.x;\n    int ln_start = tid * ln_per_thread;\n    int ln_end = ln_start + ln_per_thread;\n    if (ln_end &gt; ln_rows) ln_end = ln_rows;\n    for (int row = ln_start; row &lt; ln_end; row++) {\n        float* row_ptr = (row &lt; N) ? smem_xi + row * D_pair : smem_xj + (row - N) * D_pair;\n        float sum = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; D_pair; d++) sum += row_ptr[d];\n        float mean = sum / D_pair;\n        float var = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; D_pair; d++) {\n            float diff = row_ptr[d] - mean;\n            var += diff * diff;\n        }\n        float inv_std = rsqrtf(var / D_pair + 1e-5f);\n        #pragma unroll\n        for (int d = 0; d &lt; D_pair; d++) {\n            row_ptr[d] = (row_ptr[d] - mean) * inv_std * norm_w[d] + norm_b[d];\n        }\n    }\n    __syncthreads();\n\n    // Compute a[k,h] = pa(x_i[k]) * sigmoid(ga(x_i[k]))\n    int total_ab = N * H;\n    int ab_per_thread = (total_ab + blockDim.x - 1) / blockDim.x;\n    int ab_start = tid * ab_per_thread;\n    int ab_end = ab_start + ab_per_thread;\n    if (ab_end &gt; total_ab) ab_end = total_ab;\n    for (int idx = ab_start; idx &lt; ab_end; idx++) {\n        int k = idx / H;\n        int h = idx % H;\n        float pa = pa_b[h];\n        float ga = ga_b[h];\n        #pragma unroll\n        for (int d = 0; d &lt; D_pair; d++) {\n            pa += smem_xi[k * D_pair + d] * pa_w[h * D_pair + d];\n            ga += smem_xi[k * D_pair + d] * ga_w[h * D_pair + d];\n        }\n        smem_a[idx] = pa * (1.0f / (1.0f + expf(-ga)));\n    }\n    __syncthreads();\n\n    // Compute b[k,h] = pb(x_j[k]) * sigmoid(gb(x_j[k]))\n    for (int idx = ab_start; idx &lt; ab_end; idx++) {\n        int k = idx / H;\n        int h = idx % H;\n        float pb = pb_b[h];\n        float gb = gb_b[h];\n        #pragma unroll\n        for (int d = 0; d &lt; D_pair; d++) {\n            pb += smem_xj[k * D_pair + d] * pb_w[h * D_pair + d];\n            gb += smem_xj[k * D_pair + d] * gb_w[h * D_pair + d];\n        }\n        smem_b[idx] = pb * (1.0f / (1.0f + expf(-gb)));\n    }\n    __syncthreads();\n\n    // Compute o[h] = sum_k a[k,h] * b[k,h]\n    if (tid &lt; H) {\n        int h = tid;\n        float sum = 0.0f;\n        #pragma unroll\n        for (int k = 0; k &lt; N; k++) {\n            sum += smem_a[k * H + h] * smem_b[k * H + h];\n        }\n        smem_o[h] = sum;\n    }\n    __syncthreads();\n\n    // LayerNorm on o\n    if (tid &lt; H) {\n        float sum = 0.0f;\n        for (int h = 0; h &lt; H; h++) sum += smem_o[h];\n        float mean = sum / H;\n        float var = 0.0f;\n        for (int h = 0; h &lt; H; h++) {\n            float diff = smem_o[h] - mean;\n            var += diff * diff;\n        }\n        float inv_std = rsqrtf(var / H + 1e-5f);\n        for (int h = 0; h &lt; H; h++) {\n            smem_o[h] = (smem_o[h] - mean) * inv_std * norm_out_w[h] + norm_out_b[h];\n        }\n    }\n    __syncthreads();\n\n    // Output linear: H -&gt; D_pair\n    if (tid &lt; D_pair) {\n        int d = tid;\n        float val = out_b[d];\n        #pragma unroll\n        for (int h = 0; h &lt; H; h++) {\n            val += smem_o[h] * out_w[d * H + h];\n        }\n        smem_out[d] = val;\n    }\n    __syncthreads();\n\n    // Gate from original pair[b,i,j,:] and residual add\n    const float* pair_ij = pair + (((b * N + i) * N + j) * D_pair);\n    if (tid &lt; D_pair) {\n        int d = tid;\n        float gate = gate_b[d];\n        #pragma unroll\n        for (int h = 0; h &lt; D_pair; h++) {\n            gate += pair_ij[h] * gate_w[d * D_pair + h];\n        }\n        gate = 1.0f / (1.0f + expf(-gate));\n        out_pair[(((b * N + i) * N + j) * D_pair) + d] = pair_ij[d] + gate * smem_out[d];\n    }\n}\n\n// ---------------------------------------------------------------------------\n// Host wrappers\n// ---------------------------------------------------------------------------\ntorch::Tensor msa_attn_cuda(\n    torch::Tensor msa,\n    torch::Tensor norm_w, torch::Tensor norm_b,\n    torch::Tensor qw, torch::Tensor kw, torch::Tensor vw,\n    torch::Tensor ow, torch::Tensor ob)\n{\n    int B = msa.size(0);\n    int S = msa.size(1);\n    int N = msa.size(2);\n    int D = msa.size(3);\n    int num_heads = qw.size(0) / D;  // qw shape is (D, D), num_heads = D / head_dim\n    int head_dim = D / num_heads;\n\n    auto out = torch::empty_like(msa);\n\n    dim3 grid(B, S);\n    dim3 block(128);\n    size_t smem_size = (2 * N * D + 2 * (block.x / 32) * N * head_dim) * sizeof(float);\n\n    msa_attn_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n        msa.data_ptr&lt;float&gt;(), out.data_ptr&lt;float&gt;(),\n        B, S, N, D, num_heads, head_dim,\n        norm_w.data_ptr&lt;float&gt;(), norm_b.data_ptr&lt;float&gt;(),\n        qw.data_ptr&lt;float&gt;(), kw.data_ptr&lt;float&gt;(), vw.data_ptr&lt;float&gt;(),\n        ow.data_ptr&lt;float&gt;(), ob.data_ptr&lt;float&gt;()\n    );\n    return out;\n}\n\nvoid opm_cuda(\n    torch::Tensor msa,\n    torch::Tensor pair,\n    torch::Tensor norm_w, torch::Tensor norm_b,\n    torch::Tensor aw, torch::Tensor ab,\n    torch::Tensor bw, torch::Tensor bb,\n    torch::Tensor ow, torch::Tensor ob)\n{\n    int B = msa.size(0);\n    int S = msa.size(1);\n    int N = msa.size(2);\n    int D_msa = msa.size(3);\n    int H = aw.size(0);\n    int D_pair = pair.size(3);\n\n    dim3 grid(B, N, N);\n    dim3 block(128);\n    size_t smem_size = (2 * S * D_msa + 2 * S * H + H * H) * sizeof(float);\n\n    opm_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n        msa.data_ptr&lt;float&gt;(), pair.data_ptr&lt;float&gt;(),\n        B, S, N, D_msa, H, D_pair,\n        norm_w.data_ptr&lt;float&gt;(), norm_b.data_ptr&lt;float&gt;(),\n        aw.data_ptr&lt;float&gt;(), ab.data_ptr&lt;float&gt;(),\n        bw.data_ptr&lt;float&gt;(), bb.data_ptr&lt;float&gt;(),\n        ow.data_ptr&lt;float&gt;(), ob.data_ptr&lt;float&gt;()\n    );\n}\n\nvoid trimul_cuda(\n    torch::Tensor pair,\n    torch::Tensor norm_w, torch::Tensor norm_b,\n    torch::Tensor pa_w, torch::Tensor pa_b,\n    torch::Tensor ga_w, torch::Tensor ga_b,\n    torch::Tensor pb_w, torch::Tensor pb_b,\n    torch::Tensor gb_w, torch::Tensor gb_b,\n    torch::Tensor norm_out_w, torch::Tensor norm_out_b,\n    torch::Tensor out_w, torch::Tensor out_b,\n    torch::Tensor gate_w, torch::Tensor gate_b)\n{\n    int B = pair.size(0);\n    int N = pair.size(1);\n    int D_pair = pair.size(3);\n    int H = pa_w.size(0);\n\n    dim3 grid(B, N, N);\n    dim3 block(128);\n    size_t smem_size = (2 * N * D_pair + 2 * N * H + H + D_pair) * sizeof(float);\n\n    trimul_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n        pair.data_ptr&lt;float&gt;(), pair.data_ptr&lt;float&gt;(),\n        B, N, D_pair, H,\n        norm_w.data_ptr&lt;float&gt;(), norm_b.data_ptr&lt;float&gt;(),\n        pa_w.data_ptr&lt;float&gt;(), pa_b.data_ptr&lt;float&gt;(),\n        ga_w.data_ptr&lt;float&gt;(), ga_b.data_ptr&lt;float&gt;(),\n        pb_w.data_ptr&lt;float&gt;(), pb_b.data_ptr&lt;float&gt;(),\n        gb_w.data_ptr&lt;float&gt;(), gb_b.data_ptr&lt;float&gt;(),\n        norm_out_w.data_ptr&lt;float&gt;(), norm_out_b.data_ptr&lt;float&gt;(),\n        out_w.data_ptr&lt;float&gt;(), out_b.data_ptr&lt;float&gt;(),\n        gate_w.data_ptr&lt;float&gt;(), gate_b.data_ptr&lt;float&gt;()\n    );\n}\n&#x27;&#x27;&#x27;\n\n# Compile the extension\n_m = load_inline(\n    name=&#x27;evoformer_fused&#x27;,\n    cpp_sources=&#x27;&#x27;,\n    cuda_sources=cuda_source,\n    functions=[&#x27;msa_attn_cuda&#x27;, &#x27;opm_cuda&#x27;, &#x27;trimul_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, msa_dim, pair_dim, num_heads, tri_hidden):\n        super().__init__()\n        self.msa_attn = MSARowSelfAttention(msa_dim, num_heads)\n        self.opm = OuterProductMeanSmall(msa_dim, pair_dim)\n        self.tri_mul = TriMulOut(pair_dim, tri_hidden)\n\n    def forward(self, msa_repr, pair_repr):\n        # MSA Attention\n        m = self.msa_attn\n        w = msa_repr\n        msa_new = w + _m.msa_attn_cuda(\n            w.contiguous(),\n            m.norm.weight.contiguous(), m.norm.bias.contiguous(),\n            m.q.weight.contiguous(),\n            m.k.weight.contiguous(),\n            m.v.weight.contiguous(),\n            m.out.weight.contiguous(), m.out.bias.contiguous()\n        )\n\n        # Outer Product Mean\n        o = self.opm\n        pair_work = pair_repr.contiguous()\n        _m.opm_cuda(\n            msa_new.contiguous(), pair_work,\n            o.norm.weight.contiguous(), o.norm.bias.contiguous(),\n            o.a.weight.contiguous(), o.a.bias.contiguous(),\n            o.b.weight.contiguous(), o.b.bias.contiguous(),\n            o.out.weight.contiguous(), o.out.bias.contiguous()\n        )\n\n        # TriMulOut\n        t = self.tri_mul\n        _m.trimul_cuda(\n            pair_work,\n            t.norm.weight.contiguous(), t.norm.bias.contiguous(),\n            t.pa.weight.contiguous(), t.pa.bias.contiguous(),\n            t.ga.weight.contiguous(), t.ga.bias.contiguous(),\n            t.pb.weight.contiguous(), t.pb.bias.contiguous(),\n            t.gb.weight.contiguous(), t.gb.bias.contiguous(),\n            t.norm_out.weight.contiguous(), t.norm_out.bias.contiguous(),\n            t.out.weight.contiguous(), t.out.bias.contiguous(),\n            t.gate_out.weight.contiguous(), t.gate_out.bias.contiguous()\n        )\n\n        return msa_new, pair_work\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;evoformer_fused&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=evoformer_fused -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=evoformer_fused -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/main.cpp -o main.o 
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/main.cpp: In function &#x27;void pybind11_init_evoformer_fused(pybind11::module_&amp;)&#x27;:
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/main.cpp:4:52: error: &#x27;msa_attn_cuda&#x27; was not declared in this scope
+    4 | m.def(&quot;msa_attn_cuda&quot;, torch::wrap_pybind_function(msa_attn_cuda), &quot;msa_attn_cuda&quot;);
+      |                                                    ^~~~~~~~~~~~~
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/main.cpp:5:47: error: &#x27;opm_cuda&#x27; was not declared in this scope
+    5 | m.def(&quot;opm_cuda&quot;, torch::wrap_pybind_function(opm_cuda), &quot;opm_cuda&quot;);
+      |                                               ^~~~~~~~
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/main.cpp:6:50: error: &#x27;trimul_cuda&#x27; was not declared in this scope
+    6 | m.def(&quot;trimul_cuda&quot;, torch::wrap_pybind_function(trimul_cuda), &quot;trimul_cuda&quot;);
+      |                                                  ^~~~~~~~~~~
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=evoformer_fused -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 --use_fast_math -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/cuda.cu -o cuda.cuda.o 
+FAILED: [code=2] cuda.cuda.o 
+/usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=evoformer_fused -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 --use_fast_math -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/cuda.cu(189): error: expression must have integral or unscoped enum type
+          out_msa[((b * S + s) * N) * D + i] = msa_ptr[i] + s;
+                  ^
+
+1 error detected in the compilation of &quot;/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_8_cache/k_c59ce5927e94/evoformer_fused/cuda.cu&quot;.
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
