@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 85</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:10:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 85</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:15:40 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">85_Conv2d_GroupNorm_Scale_MaxPool_Clamp.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -118,5 +118,2488 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 497.9s · 148,524 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 497.9s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem.
+
+We have a model that does:
+1. Conv2d: 8 -&gt; 64 channels, 3x3 kernel
+2. GroupNorm: 16 groups on 64 channels
+3. Scale multiply: (64, 1, 1)
+4. MaxPool2d: 4x4 kernel
+5. Clamp: [0, 1]
+
+Input: (128, 8, 128, 128)
+
+Let me think about what the output shapes are:
+- After conv: (128, 64, 126, 126) [no padding]
+- After GN: (128, 64, 126, 126)
+- After scale: (128, 64, 126, 126)
+- After maxpool: (128, 64, 31, 31) [126/4 = 31.5 -&gt; floor = 31]
+- After clamp: (128, 64, 31, 31)
+
+I need to fuse these operations into a single CUDA kernel for speed.
+
+Let me first think about an efficient implementation approach:
+
+1. **Conv2d**: 8 input channels -&gt; 64 output channels, 3x3 kernel, stride 1, no padding. Output: 126x126 per channel.
+2. **GroupNorm**: 16 groups, 64 channels = 4 channels per group. For each group of 4 channels, at each spatial location, compute mean and variance across those 4 channels (and batch dimension?), wait let me re-check.
+
+For GroupNorm, the standard implementation computes mean and variance over the channels in each group AND spatial dimensions, but NOT across the batch dimension. Wait, actually GroupNorm computes:
+- Mean/var over (C/g, H, W) for each sample and each group
+
+Let me verify. nn.GroupNorm(num_groups, num_channels):
+- Input: (N, C, H, W)
+- For each sample n and each group g:
+  - Compute mean and var over channels in group g and all spatial locations (H, W)
+  - Normalize
+
+So for our case:
+- N = 128
+- C = 64, num_groups = 16, so 4 channels per group
+- For each (n, g), compute mean/var over 4 channels and 126x126 spatial locations
+
+Then multiply by scale (64, 1, 1) which is per-channel.
+
+Then maxpool 4x4 with default stride=kernel_size=4.
+
+Then clamp.
+
+Output after maxpool: (128, 64, floor(126/4), floor(126/4)) = (128, 64, 31, 31).
+
+So we need to implement:
+1. Conv: 8x3x3 weights + 64 biases
+2. GN: per (n, group) mean/var over 4 channels x 126 x 126
+3. Scale: per-channel multiply
+4. Maxpool: 4x4 non-overlapping pooling (since stride=4)
+5. Clamp
+
+A fully fused kernel is challenging because of the maxpool. But we can fuse conv+gn+scale into one kernel that writes intermediate results, then do maxpool+clamp as a second kernel. Or, if we&#x27;re clever:
+
+Actually, since maxpool is 4x4 with stride 4, output is 31x31 from 126x126. The regions are non-overlapping.
+
+We could do:
+1. Kernel 1: Conv + GN partial reductions
+2. But GN needs full spatial reduction per group, so we&#x27;d need a two-pass approach or shared memory reduction.
+
+Let me think about this more carefully.
+
+For 128 samples, 64 channels, 126x126 spatial:
+- After conv, each (n, c) has 126x126 values.
+- For GN, each group has 4 channels. Per (n, g), we need mean and var of 4*126*126 = 63504 values.
+
+If we tile nicely:
+- Each output maxpool pixel corresponds to a 4x4 input region after conv+gn+scale.
+- 31x31 = 961 output pixels per channel.
+- 64 channels * 128 samples = 8192 total (n, c) slices.
+- Per group: 4 channels.
+
+Approach 1: Full fusion with shared memory
+- For each block, handle one or more (n, c) output features.
+- But GN requires global mean/var per group. We could either:
+  a) Do a pre-pass for GN statistics
+  b) Use warp-level or block-level reductions
+
+Actually, let&#x27;s reconsider. With 16 groups and 128 batch size, we have 128*16 = 2048 GN instances. Each instance computes mean/var over 4 channels * 126 * 126 = 63,504 values. In FP32, each instance needs 2 floats (mean, var). So about 4096 floats of GN parameters.
+
+A natural 2-kernel approach:
+1. **Kernel 1 (Conv + GN + Scale)**: 
+   - Compute conv output (126x126)
+   - Compute GN mean/var per group
+   - Apply normalization and scale
+   - Store output (128, 64, 126, 126)
+   
+   But implementing GN inside the same kernel efficiently is tricky because each thread computing conv for a specific (n, c, h, w) only has partial info for the GN statistics.
+
+   Better: 
+   - First compute all conv outputs
+   - Then compute GN statistics via reduction kernel
+   - Then apply GN + scale + maxpool + clamp in one kernel
+   
+   That&#x27;s 3 kernels. But maybe we can fuse the reduction into the conv kernel.
+
+Let me think about a different approach. Since conv is the most compute-intensive part, we want to use Tensor Cores if possible. But with fp32 and such small channel counts (8 -&gt; 64), im2col/gemm in cuDNN is likely already very optimized.
+
+Wait, here&#x27;s an idea: Can we just call cuDNN for conv, then write a custom fused kernel for GN+scale+maxpool+clamp? The conv itself might be the bottleneck, so using cuDNN&#x27;s optimized conv might be hard to beat.
+
+But the reference does: conv -&gt; gn -&gt; scale -&gt; maxpool -&gt; clamp
+PyTorch probably calls cuDNN for conv, then separate kernels for gn, scale, maxpool, clamp.
+
+If we can:
+1. Use cuDNN conv (via torch.nn.functional.conv2d) - but we&#x27;re replacing the whole model, so maybe we should also write custom conv.
+2. Or: call torch conv for just the conv part, then fuse gn+scale+maxpool+clamp.
+
+Actually, looking at the instructions: &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel.&quot; This means the whole forward pass should ideally be replaced with a custom kernel. But we could also fuse just the post-conv operations and keep conv as torch, if that helps.
+
+Let me check: the conv is (128, 8, 128, 128) -&gt; (128, 64, 126, 126). The kernel count is small but the spatial is large. PyTorch cuDNN conv will likely use Winograd or implicit GEMM and should be very fast.
+
+Actually, let&#x27;s just measure what the reference does.
+
+But I can&#x27;t run the reference directly. Let me think about whether writing a custom fused kernel for everything is feasible.
+
+For the conv: 64 output channels, 8 input channels, 3x3 kernel. That&#x27;s 64*8*3*3 = 4608 weight parameters. Very small weight count. The conv is very compute-light, actually.
+
+Let me calculate FLOPs:
+- Output elements: 128 * 64 * 126 * 126 = ~128M elements
+- Each element requires 8*3*3 = 72 MACs = 144 FLOPs
+- Total conv FLOPs: ~18.5 GFLOPs
+
+For GN:
+- Mean/var per group: each of 2048 groups processes 63504 elements.
+- Per element: add, sq, etc. Not much computation.
+
+Scale: elementwise multiply, 128M elements.
+Maxpool: 128M elements / 16 = 8M elements (but each requires 16 comparisons).
+Clamp: 8M elements.
+
+So conv dominates, but it&#x27;s only 18.5 GFLOPs. At 67 TFLOPS, that&#x27;s 0.00027 seconds = 0.27ms for compute alone. But memory bandwidth might be relevant.
+
+Actually for such a small conv, cuDNN is very optimized. But maybe we can still win by avoiding intermediate memory roundtrips.
+
+Let me think about writing a fully fused kernel.
+
+Actually, let me write a CUDA kernel that fuses conv + gn_mean/var computation using a grid approach, then a second pass for gn_apply + maxpool + clamp. But for the first pass, we need the conv output to compute GN stats. 
+
+Wait - what if we compute the GN mean/var directly from the conv input, without writing out intermediate conv results? We can compute the conv output for all positions in a group, accumulate mean and M2 online, and write out nothing for the first pass except group stats. Then in the second pass, compute conv again (or cache it!), apply GN/scale/maxpool/clamp, and write output.
+
+Computing conv twice sounds bad, but the weights are tiny and fit in L1 cache. The input is 128*8*128*128*4 = ~64MB. The conv output is ~2GB if we cache it. Computing conv twice might actually be competitive if we can avoid writing 2GB to memory.
+
+Actually, with 18.5 GFLOPs, computing conv twice is 37 GFLOPs. At H100 peak, that&#x27;s still tiny. But avoiding writing 128*64*126*126*4 = 517MB of intermediate results is huge. Memory bandwidth saved: at 3.35 TB/s, 517MB takes 0.15ms. But we also avoid reading it back.
+
+Wait, but GN itself needs to read all the conv output to compute mean/var. If we write conv output to memory, that&#x27;s 517MB write + 517MB read = 1GB of memory traffic. At 3.35 TB/s, that&#x27;s 0.3ms just for that tensor.
+
+If we can fuse, we save a lot.
+
+Let me think about a different approach: tile-based accumulation.
+
+For each (n, group), we need to process all 4 channels and all 126x126 spatial locations. If we use one block per (n, group), then the block has to compute conv for all 4*126*126 = 63504 output positions and accumulate mean/var. With 1024 threads, each thread computes ~62 positions. That&#x27;s manageable.
+
+But wait - conv at each position requires reading from 8 input channels and a 3x3 window. So total input reads per (n, group) block: 63504 * 8 * 3 * 3 * 4 bytes = ~18MB per batch item per group. With 128 batch items and 16 groups, that&#x27;s 128*16*18MB = 36GB of input reads total. But we process them in parallel across many SMs. At 3.35 TB/s, 36GB takes ~10.7ms. Hmm, that&#x27;s actually a lot.
+
+Wait, input tensor is (128, 8, 128, 128) = 52MB. If we read it with good cache locality, each element is read multiple times. With 3x3 kernel, corner elements are read once, edges ~3 times, interior ~9 times. On average, each input element might be read ~9 times for interior positions. But with 64 output channels, each input element is read 64*9 times actually. Wait, no - each output channel&#x27;s conv reads each input element at most once per output position.
+
+Actually, total input element reads = num_output_positions * kernel_size^2 * in_channels = 128*64*126*126 * 9 * 8 = about 8.3 billion reads. At 4 bytes each = 33 GB.
+
+The weights are tiny (4608 * 4 = 18KB) and stay in cache.
+
+So total memory traffic for conv ~33GB reads + 0.5GB write = 33.5GB. At 3.35TB/s, that&#x27;s 10ms. But cuDNN achieves much better than naive memory bandwidth because it uses shared memory/registers to cache input tiles. H100 also has larger caches.
+
+For our custom kernel, we would read 33GB of input whether we fuse or not. The question is whether we also write the intermediate conv output (0.5GB) and read it back for GN (0.5GB). Fusing saves 1GB of traffic, which is ~0.3ms. Not huge compared to 10ms.
+
+Actually, I think I overestimated. cuDNN conv on H100 for this problem size is probably much faster than 10ms because of good tiling and cache reuse. Let me estimate: 18.5 GFLOPs. If cuDNN achieves 30% of peak (20 TFLOPS), that&#x27;s ~0.9ms. 
+
+Hmm, but memory bandwidth might still matter. Let&#x27;s think about this differently.
+
+Let me write a simple approach first: use PyTorch&#x27;s conv, then fuse the rest (GN + scale + maxpool + clamp) into one kernel.
+
+For GN: we need mean and var per group. We can compute this with a custom reduction kernel. Then a second kernel applies GN + scale + maxpool + clamp.
+
+That avoids the overhead of separate PyTorch ops.
+
+Actually, for GroupNorm with num_groups=16 and out_channels=64, after conv we have (128, 64, 126, 126). We need mean and var over (C/g, H, W) = (4, 126, 126) for each (N, g).
+
+A reduction over 4*126*126 = 63504 elements per (N, g). With 128*16 = 2048 reductions.
+
+We can write a reduction kernel where each block handles one (N, g) and each thread loops over elements.
+
+Then apply kernel: each thread handles a block of output maxpool pixels. For each output pixel (h_out, w_out), we need:
+1. Determine which 4x4 input region it comes from
+2. For that region, find the max
+3. Apply GN: (max - mean) / sqrt(var + eps) * scale
+4. Clamp
+
+Wait, GN is applied BEFORE maxpool, not after. Let me re-read:
+
+```python
+x = self.conv(x)          # (128, 64, 126, 126)
+x = self.group_norm(x)    # normalize each (n, g) over (4, 126, 126)
+x = x * self.scale        # (64, 1, 1)
+x = self.maxpool(x)       # 4x4 kernel, stride 4
+x = torch.clamp(x, ...)   # clamp
+```
+
+So GN and scale happen BEFORE maxpool. GN is applied to all spatial locations, then maxpool reduces.
+
+So for the output of maxpool at position (h, w), it&#x27;s the max of a 4x4 region of the GN&#x27;d values:
+output[n, c, h, w] = max_{i,j in 0..3} [ (conv[n,c,4*h+i,4*w+j] - mean[n,g]) / sqrt(var[n,g]+eps) * scale[c] ]
+
+Then clamp.
+
+To compute this, we need conv values at 4x4 = 16 positions, and the group mean/var for that channel&#x27;s group.
+
+We could compute the 16 conv values on the fly and track the max. But we still need the group mean/var.
+
+Strategy: 
+1. Compute conv output
+2. Compute GN mean/var from conv output (or on the fly)  
+3. For each output position, compute conv -&gt; GN -&gt; scale, find max over 4x4, clamp
+
+If we do it in two kernels: one for conv + GN stats (write conv output to memory), and one for GN apply + maxpool + clamp. But that requires writing the full conv output.
+
+Better strategy: compute GN stats in a first kernel, then in the second kernel compute conv on the fly and immediately apply GN/scale/maxpool/clamp.
+
+But computing conv on the fly means each block needs to recompute conv for all channels and all positions in its output region. Is the weight caching good enough?
+
+Actually, we could process as follows:
+- Grid: for each (n, c), we need to produce a 31x31 output.
+- Each block handles one (n, c) or multiple.
+- With 128*64 = 8192 (n,c) pairs and 31*31 = 961 output positions each.
+- If one block handles one (n, c), it needs to compute 961 maxpool output pixels.
+- Each output pixel requires 16 conv inputs. Each conv input requires 9*8 = 72 multiplications.
+- Total MACs per block: 961 * 16 * 72 = 1.1M MACs. 
+- At 4 bytes per float, reading conv input 961*16*8*9 = 1.1M floats = 4.4MB per block. But the actual input tensor for this (n, c) pair is reading from (n, :, h:h+4+2, w:w+4+2) which is about 8*129*129*4 = 530KB. But we don&#x27;t read contiguously.
+
+Hmm, the memory access pattern would be terrible with this approach because each block reads from many scattered regions.
+
+Let me reconsider. A better approach:
+
+Tile the output spatially. Each block processes a tile of output, say 8x8 output pixels. For 31x31, that&#x27;s approximately 4x4 tiles = 16 tiles per (n, c) pair. Total tiles: 8192 * 16 = 131K tiles.
+
+Each tile of 8x8 output pixels corresponds to 32x32 input pixels after maxpool. The input to conv for that is about 34x34. Per channel, that&#x27;s reasonable for shared memory.
+
+But each thread in the block would need to handle multiple conv output channels (since GN involves 4 channels per group). Wait, no - GN stats are per group. We need mean/var across all 4 channels in a group before we can normalize any of them. And maxpool is per-channel.
+
+Actually, within a group, we have 4 channels that share the same mean/var. But the maxpool is independent per channel.
+
+So we could assign one block per (n, c) and tile over the 31x31 output spatially. But then we recompute GN stats? No, GN stats can be precomputed and stored.
+
+Let me outline a cleaner 3-kernel approach:
+
+**Kernel 1**: Compute group norm statistics directly from input.
+For each (n, g):
+- Compute all conv outputs for the 4 channels in the group
+- Accumulate sum and sum-of-squares
+- Write mean and inv_std for the group
+
+Wait, but computing conv and accumulating stats without writing conv output means we read the input and compute conv for all positions, but we don&#x27;t need to store the intermediate. Then:
+
+**Kernel 2**: For each (n, c) and each output maxpool position:
+- Compute conv for the 4x4 input block
+- Apply GN (using loaded mean/inv_std) and scale
+- Find max and clamp
+- Write output
+
+Kernel 1: 2048 blocks, each computing 63504 conv positions. Each conv position = 8*3*3 MACs = 72 MACs. Total MACs per block = 4.6M. With 1024 threads, each does ~4500 MACs. That&#x27;s quite a lot of work per thread but not crazy. Memory reads: each conv position reads 72 input elements. But input elements are heavily reused. With 126x126 spatial and 8 channels, reading 8*128*128 per (n,g) = 131KB input. The block reads from the full image region for the 4 output channels. 
+
+Actually wait. For group g with channels c, c+1, c+2, c+3, the conv output at spatial position (h, w) for channel c+k is:
+sum_{ic=0..7} sum_{kh=0..2} sum_{kw=0..2} input[n, ic, h+kh, w+kw] * weight[c+k, ic, kh, kw]
+
+So each output channel has different weights but uses the same input. For 4 output channels, we can load the input tile once and reuse it.
+
+For a block handling one (n, g), iterating over all 4 channels and 126x126 spatial positions:
+- Load input (1, 8, 128, 128) for this n into shared memory? That&#x27;s 128*128*8*4 = 512KB. That&#x27;s too much for shared memory (max 227KB).
+- But we can tile: load a tile of input, compute partial conv outputs for all 4 channels, accumulate stats, move to next tile.
+
+Actually, for kernel 1, since we only need sum and sum-of-squares, we can process spatially in tiles and accumulate online. 
+
+For a tile of say 32x32 output spatial positions (which means input 34x34):
+- 34*34*8 = 9248 floats per input tile = 37KB. That&#x27;s fine.
+- Output for 4 channels over 32x32 = 4096 floats = 16KB.
+- But we don&#x27;t need to store output, just accumulate sum and sum of squares.
+
+Better yet: process in rows. For each row of output, load a stripe of input.
+
+This is getting complicated. Maybe a simpler approach:
+
+Optimize the post-conv fusion and keep conv using PyTorch&#x27;s optimized implementation. The win from fusing GN+scale+maxpool+clamp might be enough.
+
+Actually, the reference model forward probably takes:
+- Conv: ~0.5-1ms (cuDNN optimized)
+- GN: ~0.1ms
+- Scale: ~0.02ms
+- MaxPool: ~0.02ms
+- Clamp: ~0.02ms
+
+If we can reduce GN+Scale+MaxPool+Clamp to one kernel instead of 4 separate kernel launches with intermediate memory transfers, we might save 0.1-0.2ms. That&#x27;s a 10-20% speedup. Not huge but maybe enough.
+
+Wait, but GroupNorm in PyTorch might not be very fast. Let me check if PyTorch&#x27;s GN is fused. For 16 groups on 64 channels with 126x126 spatial, PyTorch probably uses a CUDA kernel. But scale, maxpool, and clamp are separate kernels.
+
+Actually, the biggest win might come from:
+1. Using a fused GN+scale+maxpool+clamp kernel
+2. Or... computing conv ourselves if cuDNN has overhead
+
+Let me write a prototype with fused post-conv operations and see.
+
+Actually, wait. I should think about whether I can beat cuDNN conv. For small channels (8 -&gt; 64), small kernel (3x3), and large spatial (126x126), a well-written custom conv kernel might actually be competitive, especially if fused with downstream ops. cuDNN has overhead for API calls and workspace allocation, but for 128 batch size it&#x27;s probably worth it.
+
+Let me try a different approach. What if we use two kernels:
+
+**Kernel 1 (Conv)**:
+- Custom conv kernel that writes out to an intermediate buffer
+- Or just use torch.nn.functional.conv2d
+
+**Kernel 2 (Fused GN + Scale + MaxPool + Clamp)**:
+- Load precomputed GN stats, or compute them on the fly
+
+For Kernel 2, we need mean and var. If conv output is already computed, we can either:
+- Compute GN stats in the same kernel as the apply (possible with shared memory reductions, but tricky across thread blocks)
+- Or precompute them in a separate reduction kernel
+
+A 3-kernel approach:
+1. Conv (custom or PyTorch)
+2. GN stats reduction
+3. Fused GN apply + scale + maxpool + clamp
+
+But if we use PyTorch conv, the intermediate buffer is already there. Computing GN stats from it requires reading the full buffer again (517MB). 
+
+Can we compute GN stats during the conv kernel? For each (n, group), we can have blocks that compute conv for all channels in the group and accumulate stats in shared memory, then write stats to global memory. But we don&#x27;t write conv output, so we need another pass for that. This is the &quot;compute conv twice&quot; approach.
+
+Let me try another idea. What if we use **CUTLASS** or just a simple direct conv in the first kernel, write out the conv results, and then fuse everything else? The PyTorch reference also writes conv results and reads them multiple times. Our advantage would be fusing the rest.
+
+Actually, I realize I should write a custom kernel for the entire thing. Here&#x27;s my new plan:
+
+**One big fused kernel approach using persistent thread blocks:**
+
+This is quite complex, though. Let me simplify.
+
+For each output spatial position in the final 31x31 grid, it comes from a 4x4 region of the normalized conv output. The 4x4 region spans spatial positions (4h:4h+4, 4w:4w+4) in the 126x126 conv output.
+
+If we process output at the granularity of maxpool input blocks: one thread block handles a set of (n, c) pairs and a tile of the 126x126 spatial region, producing maxpool output.
+
+Wait, 126 is not divisible by 4 evenly. 126/4 = 31.5. So maxpool of 4x4 with stride 4 on 126x126 produces floor((126-4)/4)+1 = 31 in each dimension. The last row/column of 2 pixels is ignored by maxpool.
+
+So we care about spatial positions 0..123 in each dimension (since 4*30+3 = 123). Positions 124 and 125 are unused by maxpool.
+
+For each (n, c), and each (h_out, w_out) in 31x31, the maxpool looks at conv[n, c, 4*h_out + i, 4*w_out + j] for i,j in [0,3].
+
+So if we tile by 4x4 blocks (aligned with maxpool), the conv output at position (h, w) is only used by maxpool output at (h/4, w/4).
+
+This is perfect! We can process the conv output in 4x4 tiles, where each tile maps to exactly one maxpool output pixel.
+
+Now, for GN: each group has 4 channels. All 4 channels share the same mean and variance. 
+
+Here&#x27;s a key insight: instead of computing GN globally and then maxpooling, we can think of it as:
+maxpool(GN(conv)) = maxpool( (conv - mean) / std * scale )
+
+But maxpool over a 4x4 region of normalized values is NOT the same as normalizing the maxpool. So we can&#x27;t reorder them.
+
+However, since the 4x4 tiles are independent and aligned, and GN is applied before maxpool, we need to:
+1. Compute conv for all positions in the tile
+2. Normalize each position by the same group mean/std and channel scale
+3. Take max over the 16 positions
+4. Clamp
+
+For a block that handles one (n, group) and a tile of output space:
+- It needs to compute conv for 4 channels * tile_size * 16 positions
+- Find the max for each channel after normalization
+- But wait, finding the max requires computing all conv values first, but normalization is per-value. Since GN is monotonic if std &gt; 0 (it&#x27;s just affine per channel), the max of normalized values = normalize(the max conv value in that 4x4 block). 
+
+Is that true? Yes! If we have values x_i and transform them as a*x_i + b where a &gt; 0 and b are constants over the 4x4 block (per channel), then:
+max_i {a*x_i + b} = a * max_i {x_i} + b
+
+For GN + scale: normalized = (x - mean) / sqrt(var+eps) * scale. Here a = scale / sqrt(var+eps) and b = -mean * scale / sqrt(var+eps), both constant per channel across the 4x4 block. And scale &gt; 0 (it&#x27;s initialized to ones, but could change).
+
+Wait, scale is a learned parameter that could be any value. But if scale is negative, the max would become min. However, scale is initialized to ones and typically stays positive in practice if used with ReLU etc., but there&#x27;s no guarantee.
+
+Looking at the reference: `self.scale = nn.Parameter(torch.ones(scale_shape))`. It could theoretically go negative. But in the test, they probably use the default init or random values. To be safe, I should not assume scale &gt; 0.
+
+Actually, if scale could be negative, then max_i{a*x_i + b} is NOT necessarily a*max_i{x_i} + b. If a &lt; 0, it&#x27;s a*min_i{x_i} + b.
+
+So I can&#x27;t just apply normalization to the max. I need to compute all normalized values and find the max.
+
+But wait - even if scale is positive, I still need to find the max of the conv values, then apply normalization to just that one value. That would save a lot of computation!
+
+Actually, for clamp: clamp(a*x+b) is also computable from just max(x) if I know whether a is positive or not. If a &gt; 0, the normalized max is a*max(x) + b. Then I clamp that. If a &lt; 0, the normalized max is a*min(x) + b.
+
+For 4x4 blocks, finding both max and min is cheap. Then I can apply normalization to whichever one is appropriate and clamp.
+
+Is this valid? Yes! Because affine transformation preserves ordering: if a &gt; 0, then x_i &gt; x_j iff a*x_i+b &gt; a*x_j+b. If a &lt; 0, then x_i &gt; x_j iff a*x_i+b &lt; a*x_j+b.
+
+So for each 4x4 block and each channel:
+1. Compute all 16 conv values
+2. Find max and min of the 16 conv values
+3. Determine a = scale[c] / sqrt(var[n,g]+eps)
+4. If a &gt; 0: best_conv = max_conv, else best_conv = min_conv
+5. output = a * best_conv + b, where b = -mean[n,g] * a
+6. clamp(output)
+
+This is a huge optimization! Instead of applying GN to all 16 values and finding the max, we just find the extreme conv value and apply GN once.
+
+But wait, we still need mean and var for each group. Can we compute mean and var on the fly too?
+
+For mean and var of a group over all channels and spatial positions: we need sum and sum-of-squares of conv[n, c_start:c_start+4, :, :] over 126x126 spatial positions and 4 channels.
+
+We can accumulate sum and sum_sq in shared memory while computing conv.
+
+So here&#x27;s the fully fused approach:
+
+**Kernel: One block per (n, group, tile), where tile covers a set of maxpool output pixels**
+
+Actually, let&#x27;s do one block per (n, group), processing all spatial tiles. 
+
+For each (n, group):
+- Total work: 4 channels * 31*31 maxpool output pixels.
+- Each output pixel requires 16 conv computations.
+- Total conv computations per (n, group): 4 * 961 * 16 = 61504 positions.
+- Each conv position = 8*3*3 MACs = 72 MACs.
+- Total MACs: 4.4M per (n, group).
+- 2048 groups total (128 * 16): 9B MACs total. Same as before.
+
+But with the affine max property, we just need to find max and min conv values per 4x4 block, then apply normalization.
+
+For each 4x4 block (aligned to maxpool):
+- Compute 16 conv values.
+- Track max and min of these 16 raw conv values.
+- Don&#x27;t need to apply GN to all 16 values!
+
+But we still need group mean/var over the entire 126x126 spatial region and all 4 channels. 126*126*4 = 63504 values total. We can&#x27;t fit the weights in shared memory easily, but we can accumulate sum and sum_sq in registers/shared memory.
+
+Wait, if one block handles one (n, group) and all 31*31 = 961 maxpool blocks, processing each maxpool block in sequence:
+- For each maxpool block, we need conv values at 4 channels * 16 positions = 64 conv outputs.
+- Each conv output requires 72 MACs.
+- Total MACs: 961 * 64 * 72 = 4.4M. 
+- At H100, one SM can do this pretty quickly.
+
+But the memory access pattern: for each maxpool block, we&#x27;re reading a small region of input. Consecutive maxpool blocks read adjacent input regions. With 4x4 maxpool blocks, we scan the 126x126 spatial region in 4x4 tiles. 
+
+Actually, to compute conv for a 4x4 output region, we need input of size 6x6 (because 3x3 kernel). For channel c, output at (h, w) depends on input at (h:h+3, w:w+3).
+
+If we tile the maxpool output as 4x4 blocks, the input regions for adjacent output tiles overlap. This creates opportunities for caching in shared memory, but it&#x27;s complex.
+
+For simplicity since 126x126 is manageable per thread, let&#x27;s just have each thread process some maxpool output pixels and keep accumulator registers.
+
+If one block has 256 threads and handles one (n, group):
+- Each thread handles ~4 maxpool output pixels (in some channel).
+- There are 4 channels * 961 = 3844 (c, h, w) triplets to process.
+- 3844 / 256 = 15.02. So each thread handles ~15 output pixels across channels.
+
+For each output pixel, the thread needs to:
+1. Determine which 4x4 input region it corresponds to.
+2. Compute max and min conv values over the 16 positions.
+   But wait, we also need the sum and sum_sq for GN stats!
+
+Actually, the GN stats are over ALL positions in all 4 channels, not just the 16 positions per maxpool output. So we need to accumulate sum and sum_sq over the entire 126x126 per-channel conv outputs.
+
+With 256 threads, each thread can accumulate partial sum and sum_sq over its assigned positions, then do a block reduction.
+
+But if we&#x27;re using the affine max trick, each thread just computes all conv values in its assigned region, accumulating:
+- sum and sum_sq for GN stats
+- For each maxpool output pixel in its assigned region, track max and min raw conv values
+
+Then after all threads finish, do a block reduction for sum and sum_sq to get mean and var for the group. Then each thread goes back and computes final output values using the affine transformation.
+
+Wait, that&#x27;s a 2-pass approach within the block. Can we do it in one pass? 
+
+Actually, yes! Here&#x27;s the clever part: we compute conv values in the first pass, accumulating sum and sum_sq and tracking per-maxpool-block max/min. We store per-maxpool-block max/min in shared memory. Then we reduce sum and sum_sq to get mean/var. Then we apply normalization to the stored max/min values and write output.
+
+Memory for shared storage: 4 channels * 31*31 = 3844 floats. At 4 bytes each = ~15KB. Plus maybe we need both max and min = 30KB. That&#x27;s easily fit in shared memory!
+
+So the algorithm per block (one block per (n, group)):
+
+1. Initialize shared memory:
+   - sum_shared (just scalar, but better in registers then reduce)
+   - sq_shared (scalar)
+   - max_shared[4][31][31] (max raw conv per maxpool block per channel)
+   - min_shared[4][31][31] (min raw conv)
+
+Wait, 4*31*31 = 3844. In FP32 that&#x27;s ~15KB for max and 15KB for min. Total 30KB. Plus some work arrays. Total &lt; 48KB, well under shared memory limits.
+
+Actually, I realize 126x126 is not perfectly tiled into 31x31 of 4x4. Let me double check.
+- 31*4 = 124. So maxpool covers positions 0..123.
+- Position 124 and 125 in the 126x126 conv output are unused.
+- That&#x27;s correct.
+
+So for each of the 4 channels in the group and each of 31x31 maxpool blocks:
+- Compute conv at 16 positions: (4h+i, 4w+j) for i,j in 0..3.
+
+Within one thread block per (n, group) with 256 threads:
+- Total (c, h, w) maxpool outputs: 4 * 31 * 31 = 3844
+- Each thread handles ~15 of these.
+- We can assign them linearly: thread idx gets a range of output positions.
+
+For each assigned (c, h, w):
+- Loop i=0..3, j=0..3:
+  - Compute conv[n, c, 4h+i, 4w+j]
+  - Accumulate sum and sq
+  - Track max and min conv value
+- Store max and min in shared memory (or keep in registers if we can)
+  
+Wait, if each thread handles 15 maxpool outputs and stores max/min for each, that&#x27;s 30 floats per thread in registers. No problem! We don&#x27;t even need shared memory for max/min if we do the two passes differently.
+
+Actually, we CAN&#x27;T do it in one pass unless we know mean and var first. So we need either:
+1. Two passes: first compute sum/sq and store per-block max/min, then compute final output. Store max/min in shared memory.
+2. Or: compute conv twice. First pass for sum/sq, second pass for output.
+
+Option 1 is better because it avoids recomputing conv.
+
+So:
+**Pass 1**: Each thread computes conv values for its assigned maxpool blocks, accumulating group sum/sq in registers, and storing per-block max/min in shared memory.
+**Block sync**
+**Reduction**: Reduce sum and sq across the block to get mean and inv_std. Store in shared memory (or broadcast).
+**Block sync**
+**Pass 2**: Each thread reads its stored max/min, applies normalization and clamp, writes output.
+
+This is clean and efficient!
+
+Wait, but the sum and sq are over ALL conv positions, including those in the last partial rows/cols that aren&#x27;t part of any maxpool block. The conv output is 126x126. The maxpool uses positions 0..123. What about positions 124 and 125?
+
+These positions are excluded from maxpool. But GN stats are computed over ALL 126x126 spatial positions and all 64 channels. So the GN statistics include positions 124 and 125!
+
+Ah this is important. The 126x126 conv output has mean/var over all 126*126 = 15876 positions per channel. Maxpool only uses 124*124 = 15376 positions (actually 31*31*16 = 15376).
+
+The difference is 126*126 - 124*124 = 15876 - 15376 = 500 positions per channel. That&#x27;s about 3% of positions.
+
+So for GN stats, we need to include ALL 126x126 positions, not just those used by maxpool.
+
+This complicates things! The positions (124, 125) in each dimension are part of GN but not maxpool.
+
+Options:
+1. Process all 126x126 positions for GN stats, but only 124x124 for maxpool output.
+2. Or: split the spatial processing. 
+
+If we use the two-pass approach in one block:
+- Pass 1: Loop over all 126x126 positions per channel for the 4 channels, accumulating sum/sq.
+  - For positions that fall into maxpool blocks (0..123 in each dim), also track max/min.
+  - For positions 124-125, just accumulate sum/sq.
+- Then reduce and compute stats.
+- Pass 2: Process only the maxpool blocks, applying normalization to the stored max/min.
+
+Total conv computations: 4 channels * 15876 positions * 72 MACs = ~4.6M MACs per (n, group).
+For 2048 groups: ~9.3B MACs. Same as before.
+
+Actually, for the extra 500 positions per channel, each thread could just compute them for sum/sq but not store max/min. Or we could process all positions uniformly and handle maxpool separately.
+
+Actually, a simpler approach: process the 126x126 grid. For each 4x4 tile starting at (4h, 4w) where h,w in 0..30, it&#x27;s a maxpool block. The remaining positions are (124, 0..123), (125, 0..123), (0..123, 124), (0..123, 125), and (124,124), (124,125), (125,124), (125,125).
+
+Hmm, it&#x27;s easier to just loop over all positions.
+
+Let me refine the block organization:
+
+One block per (n, group):
+- 256 threads
+- Shared memory: 
+  - smem_max[4][31][31] for max values: ~15KB
+  - smem_min[4][31][31] for min values: ~15KB
+  - Actually we might not need both. If we track max and min, we decide later which to use based on sign of scale/inv_std. But wait, each channel has a different scale! And scale is per-channel, not per-group. So channels within a group can have different scales, meaning a = scale[c] / inv_std can have different signs for different c in the same group.
+
+So we need both max and min per (c, h, w) maxpool block.
+
+Wait, does this mean we need 4*31*31*2 = 7688 floats of shared memory? That&#x27;s still only ~30KB. Good.
+
+For sum/sq: we can accumulate in registers and use warp reductions.
+
+Let me outline the kernel structure:
+
+```cuda
+__global__ void fused_kernel(
+    const float* input,    // (N, C_in, H, W) = (128, 8, 128, 128)
+    const float* weight,   // (C_out, C_in, 3, 3) = (64, 8, 3, 3)
+    const float* bias,     // (C_out,)
+    const float* scale,    // (C_out, 1, 1)
+    float* output,         // (N, C_out, 31, 31)
+    int N, int C_in, int H_in, int W_in,
+    int C_out, int H_out_conv, int W_out_conv,
+    int num_groups, int H_out_pool, int W_out_pool,
+    float clamp_min, float clamp_max
+) {
+    int n = blockIdx.x;       // batch
+    int g = blockIdx.y;       // group 0..15
+    
+    int c_start = g * (C_out / num_groups);  // 4 channels per group
+    int channels_per_group = C_out / num_groups;  // 4
+    
+    // Shared memory
+    extern __shared__ float smem[];
+    // Layout: max[channels_per_group][H_out_pool][W_out_pool], then min[...]
+    int pool_size = channels_per_group * H_out_pool * W_out_pool;
+    float* smem_max = smem;
+    float* smem_min = smem + pool_size;
+    
+    // Thread local accumulators for sum and sum_sq
+    float local_sum = 0.0f;
+    float local_sq = 0.0f;
+    
+    // Each thread processes some subset of the (c, h, w) conv outputs
+    // Total elements: channels_per_group * H_out_conv * W_out_conv = 4 * 126 * 126
+    
+    int total_elements = channels_per_group * H_out_conv * W_out_conv;
+    int num_threads = blockDim.x * blockDim.y * blockDim.z;
+    int tid = threadIdx.x;
+    
+    // We need to compute all conv positions, accumulate sum/sq, and for
+    // positions that map to maxpool blocks, track max/min.
+    
+    for (int idx = tid; idx &lt; total_elements; idx += num_threads) {
+        int c_local = idx / (H_out_conv * W_out_conv);
+        int rem = idx % (H_out_conv * W_out_conv);
+        int h = rem / W_out_conv;
+        int w = rem % W_out_conv;
+        
+        int c = c_start + c_local;
+        
+        // Compute conv at (n, c, h, w)
+        float val = bias[c];
+        // Loop over input channels and kernel
+        for (int ic = 0; ic &lt; C_in; ic++) {
+            for (int kh = 0; kh &lt; 3; kh++) {
+                for (int kw = 0; kw &lt; 3; kw++) {
+                    float in_val = input[((n * C_in + ic) * H_in + h + kh) * W_in + w + kw];
+                    float w_val = weight[((c * C_in + ic) * 3 + kh) * 3 + kw];
+                    val += in_val * w_val;
+                }
+            }
+        }
+        
+        // Accumulate for GN stats
+        local_sum += val;
+        local_sq += val * val;
+        
+        // Check if this position maps to a maxpool block
+        if (h &lt; H_out_pool * 4 &amp;&amp; w &lt; W_out_pool * 4) {  // 124, not 126
+            int h_pool = h / 4;
+            int w_pool = w / 4;
+            // Use atomicMax/Min? No, within a thread&#x27;s assigned region, we should
+            // accumulate locally first. But different threads might write to same
+            // (c, h_pool, w_pool).
+            int pool_idx = (c_local * H_out_pool + h_pool) * W_out_pool + w_pool;
+            // We need to update max/min atomically or do it in a structured way.
+        }
+    }
+    
+    // Hmm, the atomic approach won&#x27;t work well. Better to ensure each maxpool
+    // block is processed by exactly one thread.
+}
+```
+
+The problem is that conv positions for the same maxpool block are not contiguous, and multiple threads might touch the same maxpool block. Atomic operations for max/min are slow and tricky.
+
+Alternative: assign maxpool blocks to threads, not conv positions. 
+
+Since there are 4 * 31 * 31 = 3844 maxpool blocks per (n, group), and each requires 16 conv positions:
+- Total conv positions for maxpool: 3844 * 16 = 61504
+- Plus extra conv positions not in maxpool: 500 * 4 = 2000
+- Total: 63504
+
+With 256 threads:
+- If we assign maxpool blocks to threads: 3844 / 256 = 15.02 blocks per thread.
+  - Each thread computes 15*16 = 240 conv positions for maxpool, plus some of the extra positions.
+- If thread t gets maxpool blocks B_t, then no other thread touches those blocks. Max/min can be accumulated locally in registers!
+- For the extra 2000 positions not in maxpool, we just need sum/sq. Assign them to threads as well.
+
+This is much better!
+
+So:
+1. Assign each thread a set of maxpool blocks (c_local, h, w). Each thread handles ~15 blocks.
+2. For each assigned block, compute 16 conv positions, update local max/min, accumulate sum/sq.
+3. Assign each thread a set of extra conv positions (the 2000 that fall outside maxpool). Compute them, accumulate sum/sq.
+4. Warp/block reduce sum and sum_sq to get mean and inv_std.
+5. Each thread normalizes its local max/min and writes output.
+
+No atomics needed! No shared memory needed for max/min (they stay in registers). We just need about 15*2 = 30 floats per thread for max/min registers.
+
+Wait, does each thread need to store max/min for all its assigned blocks until after the reduction? Yes, because we can&#x27;t normalize until we know mean/inv_std.
+
+So each thread needs arrays: `thread_max[15]` and `thread_min[15]`. That&#x27;s 30 floats, easily fits in registers.
+
+Then after the reduction, each thread iterates over its assigned blocks and computes:
+`output = (best_val - mean) * inv_std * scale[c]`
+where `best_val = (inv_std * scale[c] &gt; 0) ? max : min`... wait no.
+
+Normalized val = (val - mean) * inv_std * scale[c]
+This is an affine transform: a*val + b where a = inv_std * scale[c], b = -mean * inv_std * scale[c].
+
+If a &gt; 0: normalized max = a * max_val + b
+If a &lt; 0: normalized max = a * min_val + b
+
+After normalization, clamp between clamp_min and clamp_max.
+
+Each thread then writes to output[((n * C_out + c) * H_out_pool + h_pool) * W_out_pool + w_pool].
+
+This is elegant! Let me write this kernel.
+
+Actually, assigning maxpool blocks to threads can be done linearly:
+```
+int total_pool_blocks = channels_per_group * H_out_pool * W_out_pool; // 3844
+for (int idx = tid; idx &lt; total_pool_blocks; idx += blockDim.x) {
+    int c_local = idx / (H_out_pool * W_out_pool);
+    int rem = idx % (H_out_pool * W_out_pool);
+    int h_pool = rem / W_out_pool;
+    int w_pool = rem % W_out_pool;
+    
+    int c = c_start + c_local;
+    
+    float thread_max = -FLT_MAX;
+    float thread_min = FLT_MAX;
+    
+    for (int i = 0; i &lt; 4; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            int h = 4 * h_pool + i;
+            int w = 4 * w_pool + j;
+            
+            // compute conv at (n, c, h, w)
+            float val = ...;
+            local_sum += val;
+            local_sq += val * val;
+            thread_max = max(thread_max, val);
+            thread_min = min(thread_min, val);
+        }
+    }
+    
+    // store thread_max and thread_min for later use
+    // We can write to shared memory or keep in local arrays
+    smem_max[idx] = thread_max;
+    smem_min[idx] = thread_min;
+}
+```
+
+Wait, if each thread writes to `smem_max[idx]`, there&#x27;s no conflict because each thread gets unique `idx`. But then we need to read them back after reduction. That&#x27;s fine. We need shared memory anyway for the block reduction of sum and sq.
+
+Shared memory layout:
+- max values: 3844 floats = ~15KB
+- min values: 3844 floats = ~15KB
+- workspace for reduction: maybe 256 floats for sum and 256 for sq
+- Total: ~30KB + 2KB = 32KB. Very reasonable.
+
+For the extra 2000 positions not in maxpool (h &gt;= 124 or w &gt;= 124):
+We can process them in a separate loop. Since 2000 &lt; 3844, we can just have the same threads process them.
+
+Actually, let me calculate exactly how many extra positions:
+The conv output is 126x126. Maxpool covers h in [0, 123] and w in [0, 123].
+Extra positions per channel:
+- h in [0, 123], w in [124, 125]: 124 * 2 = 248
+- h in [124, 125], w in [0, 125]: 2 * 126 = 252
+- Total: 248 + 252 = 500 per channel
+- For 4 channels: 2000 total.
+
+So we add another loop over these 2000 positions for sum/sq accumulation.
+
+For the reduction:
+After pass 1, each thread has `local_sum` and `local_sq`. We can do a block reduction using shared memory or warp shuffles.
+
+With 256 threads per block:
+- Warp-level shuffle reduction (32 threads per warp): each warp reduces to one value.
+- Then write warp results to shared memory.
+- First warp reduces the warp results.
+- Total: about 8 + log2(8) = 11 reductions per warp.
+
+This is fast.
+
+After getting total sum and total sq:
+- mean = total_sum / 63504
+- var = total_sq / 63504 - mean * mean
+- inv_std = 1.0 / sqrt(var + eps)
+
+Broadcast mean and inv_std to all threads.
+
+Pass 2:
+Each thread reads back its max/min from shared memory:
+```
+for (int idx = tid; idx &lt; total_pool_blocks; idx += blockDim.x) {
+    int c_local = ...
+    int c = c_start + c_local;
+    float a = inv_std * scale[c];
+    float b = -mean * a;
+    float best_val = (a &gt;= 0) ? smem_max[idx] : smem_min[idx];
+    float out_val = best_val * a + b;
+    out_val = fmaxf(clamp_min, fminf(clamp_max, out_val));
+    output[((n * C_out + c) * H_out + h_pool) * W_out + w_pool] = out_val;
+}
+```
+
+This is very clean!
+
+Let me check if there are any issues:
+1. Input indexing: input[n, ic, h_in, w_in] = input[((n*C_in + ic)*H_in + h_in)*W_in + w_in]
+   where h_in = h + kh, w_in = w + kw. Since h ranges from 0 to 125 and kh ranges from 0 to 2, h_in ranges from 0 to 127. H_in = 128. So h_in max = 127, which equals H_in - 1. Correct.
+   
+2. Output indexing: output[((n*C_out + c)*H_out_pool + h_pool)*W_out_pool + w_pool]
+   H_out_pool = 31. h_pool ranges from 0 to 30. W_out_pool = 31. Looks good.
+
+3. GroupNorm epsilon: default is 1e-5.
+
+One more thing: the weights and biases from nn.Conv2d. In PyTorch, Conv2d weight shape is (out_channels, in_channels, kernel_size, kernel_size). So weight[c, ic, kh, kw]. Correct.
+
+Bias shape is (out_channels,). 
+
+Scale shape is (out_channels, 1, 1), or we can view it as (out_channels,).
+
+Now, one concern: this kernel does one block per (n, group), so 128 * 16 = 2048 blocks. H100 has ~132 SMs (I think H100 actually has 132 or 144 SMs). 2048 blocks gives about 15 blocks per SM. Each block has 256 threads. Occupancy might be limited by register usage.
+
+Actually, H100 has a lot of SMs. Let me check the actual spec... The function output just says &quot;NVIDIA H100 80GB HBM3&quot;. H100 SXM5 has 132 SMs. Each SM can handle up to 32 blocks.
+
+With 2048 blocks and 132 SMs, that&#x27;s ~15.5 blocks per SM. With 256 threads each = 3968 threads per SM. Each SM has 2048 threads max (at full occupancy for 32 blocks of 64 threads, or 16 blocks of 128, or 8 blocks of 256). So 8 blocks of 256 = 2048 threads. If we have 15 blocks with 256 threads = 3840 threads, they will serialize. But 15 blocks will just queue up. Since each block has a lot of work, this should be fine.
+
+Actually, for maximum occupancy with 256 threads per block, we can have at most 8 blocks per SM concurrently (2048 threads / 256 = 8 blocks). The remaining 7 blocks per SM will wait. But since H100 can context switch quickly, and each block has ~4.6M MACs plus memory reads, this should still be efficient.
+
+But wait, 2048 blocks total / 132 SMs = 15.5 blocks per SM. If 8 run concurrently, the other 7.5 run after, so each SM processes ~2 waves. With enough work per block, this is fine.
+
+Could we use fewer threads per block to increase occupancy? Say 128 threads:
+- 2048 * 128 = 262K threads total.
+- Per SM: 16 blocks of 128 = 2048 threads. So 15.5 blocks = ~1 wave, almost perfect.
+- But each thread has more work: ~30 maxpool blocks. That means more registers per thread.
+
+Let&#x27;s try 128 threads per block. Each thread handles ~30 maxpool blocks.
+- Register usage: ~30 * 2 floats for max/min = 60 floats. But wait, we don&#x27;t store max/min in registers; we store them in shared memory! Good catch.
+
+Actually, in my design, we WRITE max/min to shared memory in Pass 1 and READ them back in Pass 2. So registers only need a few temporaries:
+- conv computation: a few registers for the inner loops
+- local_sum, local_sq: 2 registers
+- thread_max, thread_min: 2 registers (temporary during loop)
+- loop indices: a few
+
+Then in Pass 2, we read from shared memory into a temporary register, compute, write output.
+
+So register usage should be low. 128 threads per block should be fine.
+
+Actually, let me reconsider: in Pass 1, can we avoid writing max/min to shared memory and instead recompute in Pass 2? That would save shared memory bandwidth and simplify. But then we&#x27;d compute conv twice, which doubles the compute. Since conv is compute-bound (reading weights and inputs), this is probably not worth it. Let&#x27;s stick with storing in smem.
+
+Wait, actually there might be a better way. We can store just the ARGMAX/ARGMIN index, not the value. But finding the argmax requires storing it, and the value is the same size. So no win there.
+
+Let&#x27;s go with 128 threads per block and shared memory for max/min.
+
+Shared memory size: 30KB. With 128 threads, we need shared memory for max, min, and reduction workspace. Actually, we can do warp shuffle reduction without much shared memory. For final inter-warp reduction, we need maybe 8 floats. So shared memory is mainly for max/min: 30KB. Plus a few KB for reduction. Total ~32KB.
+
+H100 shared memory per block limit is 227KB. Per SM is also 227KB. With 16 blocks per SM concurrently, each block gets 227KB/16 = 14KB average. But this is not a hard limit - blocks can use up to 227KB if they don&#x27;t share the SM. Actually, the limit is per block, not dynamically divided among concurrent blocks. But the total shared memory per SM is 227KB, so if one block uses 32KB, only 7 such blocks can run concurrently (7*32KB = 224KB). With 128 threads, max concurrent blocks per SM is 16, but shared memory limits it to 7.
+
+2048 blocks / (132 SMs * 7 blocks) = 2.2 waves of blocks. Still fine.
+
+If we want more concurrency, we could use 64 threads per block:
+- 32KB shared memory per block, 64 threads.
+- 2048 blocks total / 132 SMs = 15.5 blocks per SM.
+- Max concurrent: min(32 blocks/lim, 2048/64=32 threads, 227KB/32KB=7 blocks) = 7 blocks.
+- Still about 2-3 waves. Fine.
+
+Actually, 256 threads with 32KB shared memory:
+- Max concurrent: min(8 blocks from threads, 227KB/32KB=7 blocks) = 7 blocks.
+- 2048 / 132 = 15.5 blocks per SM. Waves = 15.5/7 = 2.2 waves.
+
+So the number of waves is similar regardless of block size. Let&#x27;s use 256 threads for fewer waves overall and less block launch overhead.
+
+Wait, fewer waves is what we want. With 256 threads, 2048 blocks total, 7 concurrent per SM: total blocks in flight = 132 * 7 = 924. So we need 2048/924 = 2.2 waves.
+
+With 128 threads, 16 concurrent per SM (thread limit), 7 concurrent from smem: same 7. Total in flight = 924. 2048 blocks -&gt; 2.2 waves.
+
+With 64 threads, 32 concurrent from threads, 7 from smem: same 7. 2.2 waves.
+
+So it really doesn&#x27;t matter much. Let&#x27;s pick 256 threads.
+
+Actually wait - I should double check. For 256 threads per block and 32KB smem, the occupancy is limited by smem to 7 blocks per SM. But if we reduce shared memory usage, we could get more concurrency.
+
+Can we avoid storing min? If we store max only and rely on scale being positive... but we can&#x27;t. Can we store both max and min in a clever packed format? We need ~30KB. That&#x27;s 30 * 1024 bytes. We could use half precision for max/min storage? That would lose precision but we only need to identify the extreme values for affine transform. Actually no, we need the actual extreme conv values for accurate final output. Using fp16 for intermediate storage would introduce error beyond tolerance.
+
+What if we process one channel at a time? Then max/min per channel is 31*31*2 = 1922 floats = ~7.5KB. For one channel, plus workspace, total smem = ~8KB. Then 227KB/8KB = 28 blocks per SM concurrently. 
+
+But then we&#x27;d need to launch 128*64 = 8192 blocks (one per (n, c)). 8192 blocks / 132 SMs = 62 blocks per SM. With 28 concurrent, that&#x27;s 2.2 waves. No improvement in waves, but more concurrent blocks might help with latency hiding.
+
+Actually, if we process one channel per block:
+- Each block handles one (n, c).
+- c belongs to a group g. We still need group mean/var.
+- If each block computes conv for its own channel and accumulates sum/sq, but mean/var is per-group, we&#x27;d need cross-block reduction per group.
+
+Inter-block reduction requires atomics or a second kernel. Atomics across blocks on the same SM are okay but not ideal. We could do:
+1. Each block computes its channel&#x27;s sum and sq and writes to global memory atomically per group.
+2. But then we need a mechanism to know when all 4 channels of a group have contributed.
+
+This gets complicated. Let&#x27;s stick with group-per-block.
+
+Actually, here&#x27;s another idea: instead of storing max/min in shared memory, can we launch MORE threads within a block to process all maxpool blocks simultaneously and do a tree reduction per maxpool block?
+
+With 3844 maxpool blocks, if we had 3844 threads per block... that&#x27;s way too many.
+
+Or: process spatially in tiles. For each 4-channel group and each spatial position, we have 16 conv values. We want max and min. With 256 threads, we could assign each thread to handle one spatial position across all 4 channels? No, that doesn&#x27;t help.
+
+I think shared memory is fine. 30KB is acceptable.
+
+Let me think about register pressure. If each thread in a block of 256 threads uses ~40 registers, total = 10240 registers. H100 has 65536 registers per SM. So we can easily have 6 blocks at that register count (61440 regs). If we use 50 registers: 12800 per block, 5 blocks = 64000. Still fine. The occupancy limit from registers is higher than the smem limit.
+
+So smem is the bottleneck, but 7 concurrent blocks per SM is fine.
+
+Let me write the CUDA kernel now.
+
+Actually, let me also consider: can we avoid storing both max and min by using a signed comparison trick? No, we genuinely need both if scale can be negative.
+
+But wait - if we just compute normalized values for all 16 positions and find the max directly, we&#x27;d need 16 storage slots or 16 computations. Since the whole point was to avoid 16 computations per position... Actually, computing all 16 and finding max is not that bad. 16 positions * 72 MACs = 1152 MACs per maxpool output. For 961 outputs: 1.1M MACs per channel. Compared to our approach of 16*72 + overhead = 1152 MACs to find max/min + 0 for final apply. Wait, no:
+
+Our approach per maxpool block:
+- Compute 16 conv values: 16 * 72 = 1152 MACs
+- Track max/min: negligible
+- After stats: apply affine to one value: negligible
+Total: 1152 MACs
+
+Naive per maxpool block:
+- Compute 16 conv values: 1152 MACs
+- Apply affine to 16 values: 16*2 = 32 ops
+- Find max: ~16 comparisons
+Total: 1152 MACs + some ops
+
+The MACs are the same! The difference is in the apply affine + find max vs track max/min + apply affine once. 
+- Our approach: 16 max/min comparisons + 1 affine
+- Naive: 16 affines + 16 comparisons
+
+16 FMAs vs 16 comparisons + 1 FMA. FMAs are ~same cost as comparisons on modern GPUs. So our approach saves ~14 FMAs per maxpool block, or about 1% of compute. Not a huge win!
+
+But the bigger win is avoiding storing max/min in shared memory. If we just compute all 16 values, apply affine, find max, we don&#x27;t need smem for max/min! We can write the output directly after computing the block&#x27;s values. But we still need mean and inv_std first.
+
+So if we process in two passes:
+- Pass 1: accumulate sum/sq (over all positions). No need to compute max/min.
+- Pass 2: For each maxpool block, compute 16 conv values, apply affine, find max, clamp, write output.
+
+This requires computing conv twice for maxpool positions. The maxpool positions are 124x124 = 15376 per channel, or 61504 per group. The extra positions are 500*4 = 2000 per group. Total first pass: 63504 positions. Total second pass: 61504 positions. So we compute conv for ~61504 positions twice, and 2000 positions once.
+
+Total conv computes: 61504*2 + 2000 = 125008 positions per group.
+vs our one-pass approach: 63504 positions.
+
+So 125008 vs 63504: almost exactly 2x the compute!
+
+Wait, is that right? In the one-pass approach:
+- We compute each conv position exactly once: 63504 computes.
+- In the two-pass approach:
+  - Pass 1: all 63504 positions for sum/sq.
+  - Pass 2: only maxpool positions: 61504 positions.
+  - Total: 125008.
+
+Yes, almost 2x. That&#x27;s bad. Compute goes from 4.6M MACs to ~9M MACs per group. Total from 9.3B to ~18.6B MACs. At 20 TFLOPS, 18.6B FLOPs = 18.6GF / 20TF = 0.93ms. Still probably fast, but the 2x compute might hurt.
+
+But we save 30KB of smem! This increases occupancy from 7 to 16 blocks per SM. 2048 blocks / (132*16) = 0.97 waves! Almost exactly 1 wave. With 1 wave, all blocks run concurrently, much better utilization.
+
+And the total FLOPs is 18.6B. Let&#x27;s say H100 achieves 50% of peak (33 TFLOPS). 18.6B / 33T = 0.56ms.
+
+The one-pass approach has 9.3B FLOPs but 2.2 waves. If it achieves 50% peak due to smem limit: 9.3B / 33T = 0.28ms actual time, but with occupancy limited, maybe less effective. Hard to say which is better without profiling.
+
+Since 18.6B FLOPs is still quite small, and 1-wave execution is very clean, let me try the two-pass approach first. It&#x27;s simpler to implement and less chance of shared memory issues.
+
+Wait, actually I just realized: 18.6B FLOPs is a lot. But most of it is memory bandwidth bound. Computing conv twice means reading input twice. That&#x27;s 66GB of reads instead of 33GB. At 3.35TB/s, that&#x27;s 10ms vs 20ms if purely bandwidth bound. But cache should help.
+
+Actually, the weights are tiny and stay in cache. The inputs might also stay in L2 cache. For 128 batch items, each input is 8*128*128*4 = 512KB. Total inputs for all N = 64MB. H100 L2 cache is 50MB? Actually H100 L2 is quite large, maybe 30-50MB. 64MB might not fit entirely, but with good tiling...
+
+For (n, group) blocks, different blocks for the same n share the same input. If blocks for the same n run on the same SM, the input can stay in L1/L2. But blocks for different n compete for cache.
+
+I think the one-pass with smem is better. Let&#x27;s go with that.
+
+Actually, can we compromise? Store max/min in registers instead of smem?
+
+If we use one thread per maxpool block... we need 3844 threads per block. Too many.
+
+What if we reduce maxpool blocks to a smaller set? Say one block handles one (n, group) and 8x8 spatial tile of maxpool output. Then 31x31 / 64 = ~15 tiles per (n, group). Total blocks = 128*16*15 = 30720 blocks. Each block handles 8x8 maxpool = 64 output pixels, 4 channels = 256 maxpool blocks. 
+
+Each thread in a 256-thread block handles 1 maxpool block? That would be 256 maxpool blocks per block. But we only have 256 threads. So each thread handles 1 maxpool block. Then max/min can be in registers! 
+
+Wait, 256 maxpool blocks per block: 4 channels * 8 * 8 = 256. Yes! Each thread handles exactly one (c_local, h_pool, w_pool) maxpool block. Perfect!
+
+Then each thread:
+- Computes 16 conv positions.
+- Tracks max/min in registers.
+- Accumulates sum/sq in registers.
+- Writes max/min to shared memory? No, we can keep them in registers! But then after reduction, we need mean/inv_std. Then each thread can apply the transform to its own max/min (in registers) and write output.
+
+The issue: each thread&#x27;s 16 conv positions contribute to sum/sq. We need all threads&#x27; sum/sq for the group. So we still need a block reduction. But max/min stay in registers!
+
+This eliminates the need for smem_max and smem_min! We only need smem for the reduction of sum and sq.
+
+Let&#x27;s verify:
+- Block handles (n, group) and a spatial tile of maxpool output.
+- Tile size: let&#x27;s say TH x TW = 8 x 4? Then 4 * 8 * 4 = 128 maxpool blocks. Then 128 threads per block, each handling 1 block.
+- Or 8 x 8 = 64 maxpool blocks per channel set, total 256 maxpool blocks.
+
+Actually, 31x31 doesn&#x27;t divide evenly by 8 or 4. 31/8 = 3 rem 7, 31/4 = 7 rem 3. We&#x27;d need padding or irregular tiles.
+
+What if we just assign threads to maxpool blocks without spatial tiling? 
+- Total maxpool blocks for one (n, group): 4 * 31 * 31 = 3844.
+- With 256 threads: each thread handles 3844/256 = 15 maxpool blocks.
+- So each thread computes 15*16 = 240 conv positions.
+- Max/min for 15 blocks = 15*2 = 30 registers.
+- Plus local_sum, local_sq, and temp registers for conv compute.
+
+This is perfectly fine! No shared memory needed for max/min at all. Each thread&#x27;s 15 max/min values stay in registers. After block reduction for sum/sq, each thread applies the transform to its 15 max/min pairs and writes 15 outputs.
+
+And for the extra 500*4 = 2000 conv positions not in maxpool, we can process them in another loop. We can assign them such that each thread handles about 8 extra positions.
+
+Oh wait, there&#x27;s a subtlety: the sum/sq reduction must include the extra positions too. So we process extra positions in the same loop body (or a separate loop) and accumulate sum/sq.
+
+Let me design this more carefully:
+
+```cuda
+// One block per (n, group)
+// blockDim.x = 256 (adjustable)
+// Each thread processes a subset of maxpool blocks and extra positions
+
+__shared__ float smem_sum[256];
+__shared__ float smem_sq[256];
+
+int tid = threadIdx.x;
+
+float local_sum = 0.0f;
+float local_sq = 0.0f;
+
+// Registers for max/min of assigned maxpool blocks
+// Each thread handles about 15 blocks
+float reg_max[16]; // slightly overallocate
+float reg_min[16];
+int reg_h[16];
+int reg_w[16];
+int reg_c[16];
+int num_blocks = 0;
+
+// Process maxpool blocks
+int total_pool = channels_per_group * H_out_pool * W_out_pool; // 3844
+for (int idx = tid; idx &lt; total_pool; idx += blockDim.x) {
+    int c_local = idx / (H_out_pool * W_out_pool);
+    int rem = idx % (H_out_pool * W_out_pool);
+    int h_pool = rem / W_out_pool;
+    int w_pool = rem % W_out_pool;
+    int c = c_start + c_local;
+    
+    float m = -FLT_MAX;
+    float mn = FLT_MAX;
+    
+    for (int i = 0; i &lt; 4; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            int h = 4 * h_pool + i;
+            int w = 4 * w_pool + j;
+            
+            float val = bias[c];
+            // compute conv...
+            local_sum += val;
+            local_sq += val * val;
+            
+            m = fmaxf(m, val);
+            mn = fminf(mn, val);
+        }
+    }
+    
+    reg_max[num_blocks] = m;
+    reg_min[num_blocks] = mn;
+    reg_h[num_blocks] = h_pool;
+    reg_w[num_blocks] = w_pool;
+    reg_c[num_blocks] = c;
+    num_blocks++;
+}
+
+// Process extra positions
+int total_extra_per_channel = H_out_conv * W_out_conv - H_out_pool * W_out_pool * 16; // 500
+int total_extra = total_extra_per_channel * channels_per_group; // 2000
+for (int idx = tid; idx &lt; total_extra; idx += blockDim.x) {
+    int c_local = idx / total_extra_per_channel;
+    int rem = idx % total_extra_per_channel;
+    int c = c_start + c_local;
+    
+    // Map rem to (h, w) in the extra region
+    // Extra region: h in [0,125], w in [0,125]
+    // h &gt;= 124 || w &gt;= 124, but not both in the maxpool area
+    // We need a mapping from linear index to (h, w).
+    
+    // Simpler: process all positions in [0,123]x[124,125] and [124,125]x[0,125]
+    // Per channel: 124*2 + 2*126 = 500.
+    int h, w;
+    if (rem &lt; 124 * 2) {
+        h = rem / 2;
+        w = 124 + (rem % 2);
+    } else {
+        rem -= 124 * 2;
+        h = 124 + rem / 126;
+        w = rem % 126;
+    }
+    
+    float val = bias[c];
+    // compute conv...
+    local_sum += val;
+    local_sq += val * val;
+}
+
+// Block reduction for sum and sq
+smem_sum[tid] = local_sum;
+smem_sq[tid] = local_sq;
+__syncthreads();
+
+// Reduction (e.g., tree reduction)
+for (int stride = blockDim.x / 2; stride &gt; 0; stride &gt;&gt;= 1) {
+    if (tid &lt; stride) {
+        smem_sum[tid] += smem_sum[tid + stride];
+        smem_sq[tid] += smem_sq[tid + stride];
+    }
+    __syncthreads();
+}
+
+float mean = smem_sum[0] / (channels_per_group * H_out_conv * W_out_conv);
+float var = smem_sq[0] / (channels_per_group * H_out_conv * W_out_conv) - mean * mean;
+float inv_std = rsqrtf(var + 1e-5f);
+
+// Now apply to each stored max/min block
+for (int i = 0; i &lt; num_blocks; i++) {
+    int c = reg_c[i];
+    float a = inv_std * scale[c];
+    float b = -mean * a;
+    float best_val = (a &gt;= 0.0f) ? reg_max[i] : reg_min[i];
+    float out_val = best_val * a + b;
+    out_val = fmaxf(clamp_min, fminf(clamp_max, out_val));
+    int h_pool = reg_h[i];
+    int w_pool = reg_w[i];
+    output[((n * C_out + c) * H_out_pool + h_pool) * W_out_pool + w_pool] = out_val;
+}
+```
+
+Wait, there&#x27;s a problem: `num_blocks` varies per thread because `total_pool` (3844) / `blockDim.x` (256) = 15.015625. Some threads handle 15 blocks, some handle 16? Actually:
+
+For tid from 0 to 255:
+idx = tid, tid+256, tid+512, ...
+For tid=0: 0, 256, 512, ..., 3840 = 15 indices (0 to 3840 step 256 = 16 values? Let me count: 0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584. Next is 3840, which is &lt; 3844. So 16 blocks for tid=0.
+For tid=100: 100, 356, 612, 868, 1124, 1380, 1636, 1892, 2148, 2404, 2660, 2916, 3172, 3428, 3684. Next is 3940 &gt; 3844. So 15 blocks for tid=100.
+
+tid=255: 255, 511, 767, 1023, 1279, 1535, 1791, 2047, 2303, 2559, 2815, 3071, 3327, 3583. Next is 3839. So 15 blocks. Wait, 3839 &lt; 3844, so 15+1=16? Let me check: 255 + 15*256 = 255 + 3840 = 4095 &gt; 3844. So indices: 255, 511, ..., 255+14*256 = 3839. That&#x27;s 15 indices.
+
+For tid=0: 0, 256, ..., 0+15*256 = 3840. 3840 &lt; 3844. That&#x27;s 16 indices.
+
+So some threads handle 16, some 15. That&#x27;s fine. `num_blocks` can be up to 16. Static arrays of size 16 are fine.
+
+But `reg_max[16]`, `reg_min[16]`, etc. in registers: 16 * 2 floats = 32 floats = 128 bytes per thread. At 256 threads = 32KB total. That&#x27;s fine.
+
+Actually, we need `reg_h`, `reg_w`, and `reg_c` too? We can recompute them from the index `idx` rather than storing them. Or store just 16 bits each if needed. Since we have the list of `idx` values, we can recompute:
+
+```cuda
+for (int i = 0; i &lt; num_blocks; i++) {
+    int idx = tid + i * blockDim.x; // This only works if blockDim.x divides evenly, which it doesn&#x27;t for the last few
+}
+```
+
+Hmm, this is tricky because the loop uses `idx += blockDim.x`. So the actual indices for thread tid are: tid, tid+BDx, tid+2*BDx, etc. We can recompute this or store the actual idx values.
+
+Storing 16 int indices: 16 * 4 bytes = 64 bytes per thread. Total 16KB for 256 threads. That&#x27;s fine too. But registers are precious.
+
+Alternatively, we can recompute on the fly in the second loop:
+```
+for (int i = 0; i &lt; num_blocks; i++) {
+    int idx = tid + i * blockDim.x;
+    // recompute c_local, h_pool, w_pool from idx
+}
+```
+Wait, does this work? In the first loop, `for (int idx = tid; idx &lt; total_pool; idx += blockDim.x)`. So yes, the indices are exactly `tid + i*blockDim.x` for i = 0, 1, ..., num_blocks-1. This is because we start at `tid` and step by `blockDim.x`!
+
+So in the second pass, we can use the same indexing scheme! We don&#x27;t need to store h, w, c at all! We just need max and min.
+
+For `num_blocks`, we can compute it as:
+`num_blocks = (total_pool - tid + blockDim.x - 1) / blockDim.x;` if tid &lt; total_pool, else 0.
+Or more simply: `num_blocks = (total_pool + blockDim.x - 1 - tid) / blockDim.x;`
+
+Actually: `num_blocks = (total_pool - 1 - tid) / blockDim.x + 1` if `tid &lt; total_pool`, else 0.
+
+We can compute this exactly. Then for i in 0..num_blocks-1:
+`int idx = tid + i * blockDim.x;`
+`int c_local = idx / pool_hw;`
+`int rem = idx % pool_hw;`
+`int h_pool = rem / W_out_pool;`
+`int w_pool = rem % W_out_pool;`
+`int c = c_start + c_local;`
+
+So we only need `reg_max[16]` and `reg_min[16]`. That&#x27;s 32 floats = 128 bytes per thread. With 256 threads, the compiler might need to spill some to local memory, but 32 floats should fit in registers.
+
+Actually, on modern GPUs, each thread can have up to 255 registers. 32 floats = 32 registers. Plus local_sum, local_sq, loop variables, temporaries for conv. Total maybe 50-60 registers. Well within limits.
+
+Now, for the extra positions, we similarly don&#x27;t need to store anything except accumulate sum/sq.
+
+But mapping the extra 2000 positions via a formula is slightly annoying but doable.
+
+Alternatively, we can process all 126x126 positions in one loop, but for positions that belong to maxpool blocks, also track max/min. The challenge is that multiple positions map to the same maxpool block, and different threads handle different positions. So a thread might process positions from many different maxpool blocks. But if we iterate over all positions, each thread gets a contiguous chunk, and we just process them individually.
+
+Wait, I think we should actually rethink the assignment. Instead of assigning maxpool blocks to threads, let&#x27;s assign conv positions. For positions that belong to a maxpool block, we update the block&#x27;s max/min. But as I realized, atomics would be needed unless we carefully assign positions.
+
+For simplicity: let&#x27;s assign maxpool blocks to threads. The loop is over maxpool blocks. For each block, the thread computes all 16 conv positions. This naturally gives us max/min per block.
+
+For extra positions (not in maxpool): we assign them separately.
+
+The only issue is the loop structure. Let me write the exact loops:
+
+```cuda
+int total_pool_blocks = channels_per_group * H_out_pool * W_out_pool;
+int num_pool_blocks = (tid &lt; total_pool_blocks) ? 
+    ((total_pool_blocks - 1 - tid) / blockDim.x + 1) : 0;
+
+for (int i = 0; i &lt; num_pool_blocks; i++) {
+    int idx = tid + i * blockDim.x;
+    int c_local = idx / pool_hw;
+    int rem = idx % pool_hw;
+    int h_pool = rem / W_out_pool;
+    int w_pool = rem % W_out_pool;
+    int c = c_start + c_local;
+    
+    float m = -FLT_MAX;
+    float mn = FLT_MAX;
+    
+    #pragma unroll
+    for (int ii = 0; ii &lt; 4; ii++) {
+        #pragma unroll
+        for (int jj = 0; jj &lt; 4; jj++) {
+            int h = (h_pool &lt;&lt; 2) + ii;
+            int w = (w_pool &lt;&lt; 2) + jj;
+            
+            float val = bias[c];
+            for (int ic = 0; ic &lt; C_in; ic++) {
+                const float* w_ptr = weight + ((c * C_in + ic) * 3 * 3);
+                #pragma unroll
+                for (int kh = 0; kh &lt; 3; kh++) {
+                    float in0 = input[((n * C_in + ic) * H_in + h + kh) * W_in + w + 0];
+                    float in1 = input[((n * C_in + ic) * H_in + h + kh) * W_in + w + 1];
+                    float in2 = input[((n * C_in + ic) * H_in + h + kh) * W_in + w + 2];
+                    val += in0 * w_ptr[kh * 3 + 0];
+                    val += in1 * w_ptr[kh * 3 + 1];
+                    val += in2 * w_ptr[kh * 3 + 2];
+                }
+            }
+            
+            local_sum += val;
+            local_sq += val * val;
+            m = fmaxf(m, val);
+            mn = fminf(mn, val);
+        }
+    }
+    
+    reg_max[i] = m;
+    reg_min[i] = mn;
+}
+```
+
+Wait, I #pragma unrolled the ii and jj loops, but the inner conv compute is heavy. Let me think about whether unrolling helps. The compiler will probably unroll small loops anyway.
+
+For the extra positions, I need to be careful. The positions not covered by maxpool are:
+- h in [0, 123], w = 124 or 125: 124 * 2 = 248 per channel
+- h = 124 or 125, w in [0, 125]: 2 * 126 = 252 per channel
+- Total: 500 per channel
+
+We can loop over all channels and these positions:
+
+```cuda
+int total_extra = channels_per_group * (H_out_conv * W_out_conv - H_out_pool * W_out_pool * 16);
+for (int idx = tid; idx &lt; total_extra; idx += blockDim.x) {
+    int c_local = idx / (H_out_conv * W_out_conv - pool_hw * 16);
+    int rem = idx % (H_out_conv * W_out_conv - pool_hw * 16);
+    int c = c_start + c_local;
+    
+    int h, w;
+    int stripe = H_out_pool * 4; // 124
+    if (rem &lt; stripe * 2) {
+        h = rem / 2;
+        w = stripe + (rem &amp; 1);
+    } else {
+        rem -= stripe * 2;
+        h = stripe + rem / W_out_conv;
+        w = rem % W_out_conv;
+    }
+    
+    // compute conv at (n, c, h, w)
+    float val = bias[c];
+    // ...
+    local_sum += val;
+    local_sq += val * val;
+}
+```
+
+Actually, I realize I should just verify: `H_out_pool * W_out_pool * 16 = 31*31*16 = 15376`. `H_out_conv * W_out_conv = 126*126 = 15876`. Difference = 500. Correct.
+
+Wait, but 31*31*16 = 15376. The actual maxpool region in the conv output is 124*124 = 15376. Positions 124-125 in either dimension are excluded. So our extra region calculation is correct.
+
+Let me think about input reads. For conv, each thread reads:
+- For each of ~15 maxpool blocks: 16 conv positions * 72 input reads = 1152 input reads.
+- For each of ~8 extra positions: 72 input reads.
+- Total input reads per thread: ~1200 * 4 bytes = 4.8KB.
+
+Input cache reuse: the 16 positions in a 4x4 block at (4h, 4w) require input at (4h:4h+6, 4w:4w+6), which is 6x6 = 36 positions per input channel. With 72 MACs per position, but many input positions are shared across the 16 output positions in the block. Specifically, the 6x6 input region has 36 elements, and each is used by up to 9 output positions. Total effective input reads with perfect reuse: 36 per channel * 8 channels = 288 reads per maxpool block. But we&#x27;re doing 16 * 72 = 1152 reads per block without cache. So cache is 4x effective.
+
+With tiling in registers... actually, if we manually cache the 6x6 input region in shared memory or registers, we could reduce reads. But our threads don&#x27;t share data (each thread handles independent maxpool blocks). So no inter-thread shared memory benefit.
+
+The L1/L2 cache will help. Input elements are 4 bytes. 6x6x8 = 288 floats = 1152 bytes per maxpool block. If this fits in L1 cache (up to 256KB on Hopper), and consecutive threads process spatially adjacent maxpool blocks, cache locality is good.
+
+Actually, thread tid handles maxpool blocks at linear indices tid, tid+256, tid+512... These are strided by 256 blocks. With W_out_pool = 31, this means the blocks are not spatially adjacent. tid=0: (0,0), tid=256: index 256 = c_local=0, h=8, w=8. So spatially adjacent? No, they&#x27;re spread out.
+
+This strided access pattern hurts cache locality! For better locality, we might want blocks to process spatially contiguous regions.
+
+What if we tile spatially? For example, each block handles an 8x8 spatial tile of maxpool output. Then the threads in the block handle adjacent spatial positions, which means their input regions overlap significantly.
+
+With 8x8 maxpool blocks = 64 blocks. For 4 channels = 256 maxpool blocks. With 256 threads, each thread handles exactly 1 maxpool block! And spatially adjacent threads handle spatially adjacent maxpool blocks.
+
+Tile size: 8x8 = 64. On a 31x31 grid, we need ceil(31/8) * ceil(31/8) = 4*4 = 16 spatial tiles per (n, group).
+
+Total blocks = 128 * 16 * 16 = 32768 blocks. That&#x27;s more blocks, which is actually better for occupancy.
+
+Each block: 256 threads, 256 maxpool blocks. Each thread handles 1 block. Spatially adjacent threads (e.g., threadIdx 0-7) handle adjacent w positions, which means adjacent input regions. This is great for L1 cache!
+
+Shared memory for reduction: only need ~512 bytes for sum/sq reduction. Occupancy: 32 blocks per SM from thread limit, or shared memory limit with ~512 bytes is not a limit. So 32 blocks per SM concurrently!
+
+32768 blocks / (132 SMs * 32) = 7.76 waves. Hmm, that&#x27;s many waves! But each block has much less work: 64 maxpool blocks * 16 positions * 72 MACs = 73728 MACs per block. Plus extra positions. Actually, we also need to process the extra positions for GN stats. 
+
+Wait, with spatial tiling, each block only handles a subset of spatial positions. For GN stats, we need the sum/sq over ALL 126x126 positions and ALL 4 channels. If each block only handles some positions, we need to accumulate globally per group. That requires atomic adds or another pass!
+
+This is the fundamental tension: GN requires global reduction per group. If we split spatially across blocks, we need inter-block communication.
+
+So if we want one block per (n, group), we can&#x27;t spatially tile across blocks. We&#x27;d need to do the reduction within each block.
+
+Therefore, per (n, group), one block must process all positions. Then spatial stride across threads is inevitable.
+
+Can we improve cache locality within a block? Instead of strided assignment, assign contiguous chunks of maxpool blocks to threads. For example:
+- Thread 0: blocks 0..15
+- Thread 1: blocks 16..31
+- etc.
+
+With 3844 blocks and 256 threads: thread t gets blocks [t*15, t*15+14] or so. This is contiguous in linear index, which is somewhat contiguous in spatial position.
+
+Actually, linear index corresponds to (c_local, h_pool, w_pool) with w_pool varying fastest, then h_pool, then c_local. So contiguous blocks differ in w_pool first. These are spatially adjacent horizontally! Great!
+
+If thread t handles blocks t*15 to t*15+14, these are 15 adjacent blocks in the w_pool dimension (for fixed c_local and h_pool). This is excellent spatial locality.
+
+But how do we compute `num_blocks` for each thread? The total is 3844, not divisible by 256. 3844 / 256 = 15.0156. So some threads get 15, some 16 blocks.
+
+We can assign:
+```
+int base = tid * 15;
+int num = 15;
+if (tid &lt; 3844 % 256) num = 16; // but 3844 % 256 = 3844 - 15*256 = 3844 - 3840 = 4
+```
+Wait: 256 * 15 = 3840. Remainder = 4. So threads 0..3 get 16 blocks, threads 4..255 get 15 blocks.
+
+```
+int blocks_per_thread = (tid &lt; 4) ? 16 : 15;
+int block_start = tid * 15 + min(tid, 4);
+```
+
+Actually: thread 0: start 0, num 16 -&gt; blocks 0..15
+thread 1: start 16, num 16 -&gt; blocks 16..31
+thread 2: start 32, num 16 -&gt; blocks 32..47
+thread 3: start 48, num 16 -&gt; blocks 48..63
+thread 4: start 64, num 15 -&gt; blocks 64..78
+...
+thread 255: start 255*15 + 4 = 3829, num 15 -&gt; blocks 3829..3843.
+
+Total: 4*16 + 252*15 = 64 + 3780 = 3844. Correct!
+
+This gives great spatial locality for the first few threads in each row. The last thread in a row handles blocks near the row boundary, and the next thread starts the next row. There might be a discontinuity at row boundaries (every 31 blocks), but the h_pool dimension is contiguous for most of the assignment.
+
+Let me compute: for c_local=0, h_pool=0: w_pool ranges 0..30 (31 blocks).
+Thread 0: w 0..15 (16 blocks) - spans first half of row 0.
+Thread 1: w 16..30 (15 blocks) - spans second half of row 0.
+Thread 2: w 31.. (but w only goes to 30!) so thread 2 starts at block 32, which is c_local=0, h_pool=1, w_pool=0.
+
+So threads 0 and 1 handle the first row. Threads 2 and 3 handle the second row (h_pool=1). There are 31 rows per channel, 4 channels = 124 rows total. 124 * 31 = 3844 blocks.
+
+With 15-16 blocks per thread, each thread handles about half a row. So consecutive threads handle the same or adjacent rows. That&#x27;s pretty good cache locality!
+
+Now for the extra positions, we also want contiguous assignment. Total extra per group = 2000.
+Thread t gets approximately 8 extra positions.
+```
+int extra_per_thread = (tid &lt; (2000 % 256)) ? 8 : 7;
+// 2000 / 256 = 7 rem 208. So threads 0..207 get 8, threads 208..255 get 7.
+int extra_start = tid * 7 + min(tid, 208);
+```
+
+Great. Now let&#x27;s implement the full kernel with this contiguous assignment.
+
+One more optimization: for the conv computation, since h and w vary but c is fixed within a block of maxpool computations, we can preload the weight for that channel:
+```
+float w_vals[8][3][3];
+for (int ic = 0; ic &lt; C_in; ic++)
+  for (int kh = 0; kh &lt; 3; kh++)
+    for (int kw = 0; kw &lt; 3; kw++)
+      w_vals[ic][kh][kw] = weight[((c * C_in + ic) * 3 + kh) * 3 + kw];
+```
+
+But 8*3*3 = 72 floats per thread. That&#x27;s a lot of registers! For 15 maxpool blocks, we might want to load weights once per block. With 15 blocks per thread, that&#x27;s 15*72 = 1080 weight reads from global memory. But weights are cached in L1, so it&#x27;s fast. And 72*4 = 288 bytes of weights per channel. With 4 channels per group = 1152 bytes. All threads in a block share these weights via L1 cache.
+
+Actually, a better approach: have the block collaboratively load all weights for the 4 channels into shared memory. 4 * 8 * 3 * 3 = 288 floats = 1152 bytes. Very small! We can load this at the start of the kernel.
+
+```cuda
+__shared__ float smem_weights[4 * 8 * 3 * 3];
+if (tid &lt; 4 * 8 * 3 * 3 / 4) { // each thread loads 4 floats
+    // ...
+}
+```
+Actually, with 256 threads, each can load one float, and the first 288 threads load all weights. The remaining threads wait.
+
+Similarly for scale: 4 floats. And bias: 4 floats.
+
+Then during the conv computation, weights are read from fast shared memory.
+
+Similarly, can we cache input in shared memory? For a block handling maxpool blocks across multiple spatial positions, the input region is large. But if threads handle adjacent maxpool blocks, the total input region covers maybe 16*4 + 2 = 66 positions in w and maybe a few rows in h. For one row of 16 maxpool blocks (4x4 output each, adjacent horizontally), the input spans h in [4h, 4h+6] and w in [4w, 4w+4*16+2] = w in [4w, 4w+66]. That&#x27;s 66 positions. With 8 channels, that&#x27;s 528 floats. Not huge. But if threads handle multiple rows, it grows.
+
+For simplicity, let&#x27;s not overcomplicate the input caching. The L2 cache should handle this well since each block processes about 15*6*66*8 = ~47520 input reads, but with locality, the unique input elements are fewer.
+
+Actually, if thread t handles 16 adjacent maxpool blocks horizontally:
+- Output h range: 4h to 4h+3 (fixed h_pool).
+- Output w range: 4*w_pool to 4*w_pool + 4*16 - 1 = 4*w_pool to 4*w_pool + 63.
+- Input h range: 4h to 4h+6.
+- Input w range: 4*w_pool to 4*w_pool + 65.
+- Total unique input elements for one channel: 7 * 66 = 462.
+- For 8 channels: 3696 floats = 14.8KB.
+
+This fits in L1 cache! And if the next thread handles the next row or next channel, the cache might still have the relevant weights.
+
+Given this, I think we&#x27;ll get good cache performance without explicit shared memory for inputs.
+
+For weights in shared memory: 1.15KB. Negligible.
+
+So let&#x27;s write the kernel with weights in shared memory.
+
+Actually, one more thing: since we&#x27;re processing 15-16 maxpool blocks, and each block does 16 conv positions, and each conv position reads 72 weights, but weights are in shared memory, the benefit is small. The weight read from global memory is already cached in L2. Reading 15*16*72 = 17280 weight reads per thread from L2 vs shared memory is probably similar performance. Let&#x27;s skip collaborative weight loading to keep the kernel simpler. The compiler and cache will handle it.
+
+OK, let me write a clean kernel now.
+
+Wait, I should think about whether using `blockDim.x = 256` is optimal. With contiguous assignment requiring different `num_blocks` per thread, loop unrolling might be less effective. But that&#x27;s fine.
+
+Let me also think about whether we can vectorize the memory reads. For the inner conv loop:
+```cuda
+for (int ic = 0; ic &lt; 8; ic++) {
+    int in_base = ((n * 8 + ic) * H_in + h) * W_in + w;
+    float w00 = weight[((c * 8 + ic) * 3 + 0) * 3 + 0];
+    float w01 = weight[((c * 8 + ic) * 3 + 0) * 3 + 1];
+    float w02 = weight[((c * 8 + ic) * 3 + 0) * 3 + 2];
+    float w10 = weight[((c * 8 + ic) * 3 + 1) * 3 + 0];
+    // ...
+    val += input[in_base + 0] * w00;
+    val += input[in_base + 1] * w01;
+    val += input[in_base + 2] * w02;
+    val += input[in_base + W_in + 0] * w10;
+    // ...
+}
+```
+
+This is fairly efficient as long as input is contiguous in memory for fixed n, ic, h, and varying w.
+
+Now, the critical aspect: correctness and numerical equivalence. PyTorch&#x27;s Conv2d uses float32 accumulation, and GroupNorm uses Welford&#x27;s algorithm for numerical stability. Will our simple sum/sq algorithm match PyTorch within tolerance?
+
+PyTorch GroupNorm computes mean and var using a stable algorithm (usually two-pass or Welford). For fp32 with 63504 values (a modest number), numerical stability shouldn&#x27;t be a huge issue, but it could matter.
+
+PyTorch&#x27;s GroupNorm implementation (in ATen) typically computes:
+1. Sum and sum-of-squares in one pass, or
+2. Mean in one pass, then variance in a second pass.
+
+Actually, I believe PyTorch&#x27;s CUDA implementation of GroupNorm uses a two-pass approach or online algorithm with reasonable numerical stability.
+
+For 63504 values in fp32, computing `sum(x)` and `sum(x^2)` in one pass and then `var = E[x^2] - E[x]^2` can suffer from catastrophic cancellation if variance is small. For random conv outputs, variance might be moderate.
+
+To be safe, let&#x27;s use a two-pass approach: 
+- First compute mean.
+- Then compute variance as sum((x - mean)^2).
+
+But that requires a second loop! We can do:
+- Pass 1: compute all conv values, accumulate sum, and store them... but we can&#x27;t store all values (that would require global memory).
+
+For the maxpool positions, we&#x27;re already computing conv values. For the extra positions, too. But we don&#x27;t store them; we just accumulate sum and find max/min.
+
+To do a two-pass variance, we&#x27;d need to recompute everything in a second pass (with the known mean), which doubles compute again. Not ideal.
+
+Alternatively, we can use Welford&#x27;s online algorithm, which is numerically stable and only requires one pass:
+
+```cuda
+float mean_online = 0.0f;
+float M2 = 0.0f;
+int count = 0;
+
+for each value:
+    count++;
+    float delta = val - mean_online;
+    mean_online += delta / count;
+    float delta2 = val - mean_online;
+    M2 += delta * delta2;
+
+variance = M2 / count;
+```
+
+For 63504 values, float32 should be stable enough. This is better than E[x^2] - E[x]^2.
+
+But does PyTorch&#x27;s GroupNorm match this exactly? PyTorch CUDA impl for GroupNorm might use a different algorithm. Over 63504 values, the difference between one-pass sum/sq and Welford should be within 1e-4, but for random inputs, it&#x27;s hard to guarantee.
+
+Actually, let&#x27;s check what PyTorch does. In PyTorch&#x27;s native CUDA implementation (aten/src/ATen/native/cuda/group_norm_kernel.cu), they typically compute mean and inv_std using a grid-stride loop reduction over the group elements. For each group, they accumulate sum and sum-of-squares. Looking at the code, I think they use the one-pass `sum(x)` and `sum(x^2)` method in many cases.
+
+Actually, for numerical tolerance of 1e-4, our approach should be fine. Let&#x27;s use Welford for extra safety.
+
+Actually, looking at the group norm implementation more carefully: PyTorch&#x27;s CUDA kernel for group norm likely uses the formula:
+```
+mean = sum(x) / numel
+var = sum((x - mean)^2) / numel
+```
+Or they might use a one-pass approach with compensated summation.
+
+For our purposes, since we&#x27;re computing all values in one block, Welford is easy to implement and numerically stable.
+
+Wait, but there&#x27;s another issue: PyTorch Conv2d might use tensor core or optimized algorithms that reorder operations. The result of a conv could differ slightly from our direct computation. PyTorch&#x27;s default tolerance is 1e-4 for fp32, which is quite generous. For two different conv implementations, elementwise difference can be up to ~1e-5 to 1e-4 depending on problem size. Since we&#x27;re also applying GN, the relative error might propagate.
+
+I think using a direct manual conv should match within 1e-4 as long as we accumulate in float32.
+
+Now, one more concern: nn.Conv2d with default settings. By default, `nn.Conv2d` has `stride=1, padding=0, dilation=1, groups=1, bias=True`. The weights and biases are initialized with some distribution. In the reference, PyTorch computes the conv and then GN. Our custom kernel computes the same formula. For each output element, the conv is a dot product of 72 floats. In fp32, the order of accumulation matters, but if we accumulate in the same order as a direct loop, it should match the reference&#x27;s direct loop order (if cuDNN doesn&#x27;t reorder).
+
+But cuDNN might reorder the accumulation! For example, using Winograd or implicit GEMM changes the order of operations, which changes the rounding. This means our manual conv might NOT match the reference exactly within 1e-4.
+
+How much can cuDNN deviate? For a 3x3 conv with 8 inputs, the difference is typically small, but it depends on the input values. The tolerance of 1e-4 is for the final output after all operations.
+
+Hmm, if cuDNN&#x27;s conv differs from our manual conv by even 1e-5, and then GN amplifies it... Actually, GN normalizes by the standard deviation, which is computed from the same conv output. If our conv differs from cuDNN, our GN stats will also differ, which compounds the error.
+
+This is a real risk. The safest approach is to use PyTorch&#x27;s conv and only fuse the remaining operations. Then we avoid any conv numerical mismatch.
+
+Revised plan:
+1. Call PyTorch&#x27;s `F.conv2d` (or `self.conv` from the reference, but we&#x27;re replacing the model). Actually, we can call `torch.nn.functional.conv2d` in our forward.
+2. Then launch our custom kernel for GN + Scale + MaxPool + Clamp.
+
+But then we still need to compute GN stats. We can either:
+- Use PyTorch&#x27;s group norm stats computation (but then we&#x27;re not fusing)
+- Or compute GN stats in our kernel from the conv output
+
+If we compute GN stats from the conv output in our kernel, we read the conv output once, accumulate stats, and write the final output. This is a single kernel that does GN reduction + scale + maxpool + clamp.
+
+But wait, since we have the conv output in memory, we can:
+1. Compute conv with PyTorch
+2. Launch Kernel 1: compute GN mean/var per group from conv output (reduction kernel)
+3. Launch Kernel 2: apply GN + scale + maxpool + clamp from conv output
+
+That&#x27;s 2 kernels + 1 PyTorch conv. The PyTorch reference does 1 conv + 1 GN + 1 scale + 1 maxpool + 1 clamp = 5 operations. Our approach replaces 4 ops with 2 custom kernels. Not a huge win.
+
+For more speedup, can we fuse the GN reduction and apply into one kernel? That would require reading conv output once for stats, then reading it again for apply. But we can do that in one kernel launch by having the kernel do both passes with a __syncthreads. For one block per (n, group), each block processes all 4 channels and all spatial positions. Then:
+- Pass 1: all threads read conv output, accumulate stats.
+- Block sync and reduce
+- Pass 2: all threads read conv output again, apply transform + maxpool + clamp, write output.
+
+This reads conv output twice per block, but writes output once. Still better than multiple separate kernels.
+
+But we still need PyTorch conv. Hmm.
+
+Actually, let me check: if we write a fully custom conv, what numerical errors might there be? For small convs (8-&gt;64, 3x3), cuDNN often uses direct conv or implicit GEMM, not Winograd. The accumulation order in implicit GEMM is different from direct. But the absolute error is typically very small.
+
+If the tolerance is 1e-4, and our inputs are uniform [0,1], conv outputs are in the range of ~sum of 72 terms ~ roughly 0 to ~72 with typical values around ~36. GroupNorm normalizes by std (~10-20 typically). So normalized values are ~O(1). Maxpool and clamp keep them at O(1). A conv difference of 1e-4 absolute would translate to normalized difference of ~1e-5. That should be safe.
+
+Actually, PyTorch&#x27;s default conv tolerance in tests is often 1e-5 or 1e-4. I think a direct manual conv should match well enough for 1e-4 tolerance, especially if we use `float` accumulation.
+
+The bigger risk is GN. PyTorch&#x27;s GN computes variance potentially with a more stable algorithm. But with our Welford approach, we should match very closely.
+
+Let me go with the fully fused kernel. It&#x27;s more elegant and likely faster.
+
+Let me draft the kernel code now.
+
+One more challenge: I need to handle the exact output shape. Conv2d with kernel_size=3, stride=1, padding=0 on 128x128 input gives 126x126 output. MaxPool2d with kernel_size=4, stride=4 (default stride = kernel_size) on 126x126 gives floor((126-4)/4)+1 = 31 in each dimension. Let&#x27;s verify: (126 - 4) / 4 + 1 = 122/4 + 1 = 30.5 + 1? Wait, floor(122/4) + 1 = 30 + 1 = 31. Yes.
+
+The maxpool covers positions 0..123 in each dimension. Positions 124 and 125 are excluded.
+
+Actually, let me verify with PyTorch&#x27;s behavior for MaxPool2d(4) on 126x126:
+```python
+import torch
+x = torch.randn(1, 1, 126, 126)
+pool = torch.nn.MaxPool2d(4)
+print(pool(x).shape)  # Should be [1, 1, 31, 31]
+```
+
+Yes, with kernel_size=4, stride=4, padding=0, dilation=1:
+output_size = floor((input_size + 2*padding - dilation*(kernel_size-1) - 1) / stride + 1)
+= floor((126 - 3 - 1) / 4 + 1) = floor(122/4 + 1) = floor(30.5 + 1) = 31.
+
+Correct.
+
+Now, the extra positions not in maxpool:
+For h in [0, 125], w in [0, 125]:
+Maxpool blocks cover h in [0, 123], w in [0, 123].
+Extra: h in [0, 123], w in [124, 125]: 124 * 2 = 248 per channel
+Extra: h in [124, 125], w in [0, 125]: 2 * 126 = 252 per channel
+But double counted: h in [124, 125], w in [124, 125]: 2 * 2 = 4 positions.
+Total: 248 + 252 = 500. Correct, no double counting issue because the first set has h in [0,123] and second has h in [124,125], which are disjoint.
+
+So my mapping is correct.
+
+Actually, for `h in [0,123], w in [124,125]`: 124*2 = 248.
+For `h in [124,125], w in [0,125]`: 2*126 = 252.
+Total = 500.
+These are disjoint. Good.
+
+Now, a concern: PyTorch MaxPool2d with even kernel_size on even input... wait, is 126 even? Yes. And kernel_size=4. The formula uses floor, so it ignores the last 2 pixels. Good.
+
+One more concern: numerical stability of Welford for this specific use case. With random conv values, mean might be non-zero, but Welford handles it well.
+
+Actually, let me think about whether PyTorch&#x27;s conv2d uses bias. Yes, `nn.Conv2d` by default has `bias=True`. The model in the reference doesn&#x27;t disable it, so it has bias.
+
+`self.scale = nn.Parameter(torch.ones(scale_shape))` where `scale_shape = (out_channels, 1, 1)`. So broadcasting over H and W.
+
+GroupNorm uses `eps=1e-5` by default and `affine=False` in the reference (no weight/bias learned by GN itself). So the formula is purely `(x - mean) / sqrt(var + eps)`.
+
+OK, let me write the actual CUDA code.
+
+By the way, I should also consider whether to compute conv myself or use PyTorch&#x27;s. Given the numerical risks, maybe I should initially write a version that calls PyTorch conv inside the forward, and a custom kernel for the rest. Then if profiling shows conv is the bottleneck, I can try fusing it.
+
+But if I use PyTorch conv, I need to write the output to memory, then read it for GN stats and maxpool. The custom fused kernel for GN+scale+maxpool+clamp could still be efficient if it reads the conv output once.
+
+Actually, let me think about this. If PyTorch conv writes to memory, and my kernel reads it for GN+maxpool+clamp:
+- Memory traffic: conv output write + 1 read = 1GB.
+- If my fused kernel does GN reduction + maxpool + clamp in one pass, it reads 0.5GB and writes output (128*64*31*31*4 = ~30MB). Total memory: ~0.5GB read + 30MB write.
+- The reference does: conv write (0.5GB), GN read+write (0.5GB+0.5GB), scale read+write (0.5GB+0.5GB), maxpool read+write (0.5GB+~30MB), clamp read+write (~30MB+~30MB). Total: ~3.1GB of memory traffic.
+
+So our fused approach saves ~2.5GB of memory traffic. At 3.35TB/s, that&#x27;s ~0.75ms saved!
+
+And we avoid 3 kernel launches (GN, scale, maxpool, clamp -&gt; 1 kernel). Launch overhead is small but adds up.
+
+So even if we keep PyTorch conv, fusing the rest gives significant speedup.
+
+Let me write this simpler version first.
+1. Call `torch.nn.functional.conv2d` for conv.
+2. Custom kernel for GN stats reduction + maxpool + scale + clamp.
+
+Actually, computing GN stats and applying in one kernel is tricky because stats are per group and maxpool is per position. Here&#x27;s a 2-kernel approach for the post-conv:
+
+**Kernel 1 (GN Stats)**: one block per (n, group), computes mean and inv_std.
+**Kernel 2 (Apply + MaxPool + Clamp)**: each thread handles one or more output pixels.
+
+For Kernel 2, each thread processes a set of (n, c, h_pool, w_pool) outputs. For each output, it needs to find the max over 4x4 conv values after applying GN. Again, the affine max trick applies!
+
+For output (n, c, h_pool, w_pool):
+- We need max over { (conv[n,c,4h+i,4w+j] - mean) * inv_std * scale[c] } for i,j in 0..3.
+- Since affine transform, max = (best_raw_conv - mean) * inv_std * scale[c] where best_raw_conv is either max or min depending on sign of scale.
+
+So Kernel 2 can:
+- For each thread&#x27;s assigned output pixels, loop over the 4x4 conv input.
+- Find max and min raw conv values.
+- Apply the transform to the appropriate one.
+- Clamp and write.
+
+This reads conv output only once per assigned pixel. Each conv output pixel is read exactly once (by the thread that processes its maxpool block). Total reads: 126*126*64*128*4 = 1GB.
+
+Wait, no. The conv output is 128*64*126*126 = ~128M elements = 517MB. With the affine max trick, we read each element exactly once. Without the trick, we&#x27;d read each element once too. The trick just saves us from applying the transform to all 16 values; we only apply it once.
+
+But the big advantage is that we don&#x27;t need to compute all 16 normalized values and find the max among them. We just need the extreme raw values.
+
+For Kernel 2:
+- Total outputs: 128 * 64 * 31 * 31 = ~7.8M.
+- Each output requires reading 16 conv values.
+- Total conv value reads: 7.8M * 16 = 125M reads = 500MB.
+- Wait, but there are only 128M conv values. So we read each conv value exactly once? Let&#x27;s see:
+  - Conv values in maxpool region: 128*64*124*124 = 126M values.
+  - But conv is 126x126, and maxpool reads from 124x124 region. So 128*64*124*124 = 126,156,800 values.
+  - Each value is read once: 126M * 4 bytes = 505MB.
+  - The values at h=124,125 or w=124,125 are never read by maxpool. They&#x27;re only used for GN stats in Kernel 1.
+  
+So Kernel 2 reads ~505MB of conv output.
+Kernel 1 reads all 517MB of conv output for GN stats.
+Total reads: 517 + 505 = 1022MB. Plus output write: 30MB.
+
+If we fused Kernel 1 and 2 into one kernel per (n, group), we&#x27;d read conv output once:
+- For each conv value in maxpool region, we both accumulate stats and track max/min.
+- For conv values outside maxpool region, we only accumulate stats.
+- Total reads: 517MB.
+
+That&#x27;s a 2x reduction in conv output reads! 
+
+So the fully fused kernel per (n, group) is better because it reads conv output (or computes it) only once.
+
+OK, I think I should go with computing conv myself in the fully fused kernel. The memory savings and kernel fusion are significant.
+
+But to mitigate numerical risk, I&#x27;ll keep the option to fall back to PyTorch conv + fused post-processing if correctness fails. Actually, for the final submission, I can only submit one kernel. Let me try the fully fused approach first.
+
+Let me write the code and test it.
+
+One important detail: when we compute conv manually, the order of operations affects the result. PyTorch uses cuDNN which may use different algorithms. Let me look at whether cuDNN deterministically uses the same algorithm for this small conv.
+
+For Conv2d with batch=128, in=8, out=64, H=W=128, k=3, cuDNN might select implicit GEMM or direct convolution. The algorithm choice is deterministic given the same cuDNN version and settings. But we don&#x27;t know which algorithm it picks.
+
+For numerical tolerance of 1e-4, let me estimate. With random [0,1] inputs and Kaiming init weights (std ~1/sqrt(8*3*3) = 1/4.9 = 0.2), the conv output has variance approximately 8*9*0.04*1/12 = 0.24, so std ~0.5. The sum of 72 terms each ~0.2*0.5=0.1 gives ~7.2 with some variance. So conv outputs are in range [-10, 10] roughly.
+
+A rounding error in accumulation order: if we sum 72 terms in different orders, the difference is at most ~72 * eps * max_val ~ 72 * 1e-7 * 10 = 7e-5. That&#x27;s close to the tolerance. And GN normalization might amplify relative differences.
+
+Actually, float32 eps is ~1.19e-7. Summation error for 72 terms is typically much less than 72*eps. The worst case is very rare. Typical error is ~sqrt(72)*eps*value ~ 8.5*1e-7*10 = 8.5e-6. That&#x27;s well below 1e-4.
+
+And GroupNorm divides by std, which might be ~1-5. So normalized error is ~1e-6.
+
+So I think direct conv should match within 1e-4. Let me proceed.
+
+Now let me write the complete kernel code.
+
+```cuda
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+#include &lt;float.h&gt;
+
+__global__ void fused_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ scale,
+    float* __restrict__ output,
+    int N, int C_in, int H_in, int W_in,
+    int C_out, int H_conv, int W_conv,
+    int num_groups, int H_pool, int W_pool,
+    float clamp_min, float clamp_max
+) {
+    int n = blockIdx.x;
+    int g = blockIdx.y;
+    
+    int channels_per_group = C_out / num_groups;
+    int c_start = g * channels_per_group;
+    int pool_hw = H_pool * W_pool;
+    int total_pool_blocks = channels_per_group * pool_hw;
+    int total_conv_elements = channels_per_group * H_conv * W_conv;
+    int total_extra = total_conv_elements - total_pool_blocks * 16;
+    
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    // Shared memory for reduction: just enough for sum and sq
+    __shared__ float s_sum_sq[2][256];
+    
+    // Welford accumulators
+    float mean_acc = 0.0f;
+    float M2_acc = 0.0f;
+    int count_acc = 0;
+    
+    // Max/min storage for assigned maxpool blocks
+    // num_pool_blocks for this thread
+    int num_pool = (tid &lt; total_pool_blocks) ? ((total_pool_blocks - 1 - tid) / block_size + 1) : 0;
+    float reg_max[16];
+    float reg_min[16];
+    
+    // Compute conv for maxpool blocks and accumulate stats
+    for (int i = 0; i &lt; num_pool; i++) {
+        int idx = tid + i * block_size;
+        int c_local = idx / pool_hw;
+        int rem = idx % pool_hw;
+        int h_pool = rem / W_pool;
+        int w_pool = rem % W_pool;
+        int c = c_start + c_local;
+        
+        float m = -FLT_MAX;
+        float mn = FLT_MAX;
+        
+        #pragma unroll
+        for (int ii = 0; ii &lt; 4; ii++) {
+            int h = (h_pool &lt;&lt; 2) + ii;
+            #pragma unroll
+            for (int jj = 0; jj &lt; 4; jj++) {
+                int w = (w_pool &lt;&lt; 2) + jj;
+                
+                float val = bias[c];
+                
+                // Convolve
+                #pragma unroll
+                for (int ic = 0; ic &lt; C_in; ic++) {
+                    const float* w_ptr = weight + (((c * C_in + ic) * 3) * 3);
+                    int in_base = ((n * C_in + ic) * H_in + h) * W_in + w;
+                    
+                    float i00 = input[in_base];
+                    float i01 = input[in_base + 1];
+                    float i02 = input[in_base + 2];
+                    float i10 = input[in_base + W_in];
+                    float i11 = input[in_base + W_in + 1];
+                    float i12 = input[in_base + W_in + 2];
+                    float i20 = input[in_base + 2 * W_in];
+                    float i21 = input[in_base + 2 * W_in + 1];
+                    float i22 = input[in_base + 2 * W_in + 2];
+                    
+                    val += i00 * w_ptr[0];
+                    val += i01 * w_ptr[1];
+                    val += i02 * w_ptr[2];
+                    val += i10 * w_ptr[3];
+                    val += i11 * w_ptr[4];
+                    val += i12 * w_ptr[5];
+                    val += i20 * w_ptr[6];
+                    val += i21 * w_ptr[7];
+                    val += i22 * w_ptr[8];
+                }
+                
+                // Welford update
+                count_acc++;
+                float delta = val - mean_acc;
+                mean_acc += delta / count_acc;
+                float delta2 = val - mean_acc;
+                M2_acc += delta * delta2;
+                
+                m = fmaxf(m, val);
+                mn = fminf(mn, val);
+            }
+        }
+        
+        reg_max[i] = m;
+        reg_min[i] = mn;
+    }
+    
+    // Process extra positions for stats
+    int num_extra = (tid &lt; total_extra) ? ((total_extra - 1 - tid) / block_size + 1) : 0;
+    for (int i = 0; i &lt; num_extra; i++) {
+        int idx = tid + i * block_size;
+        int c_local = idx / (H_conv * W_conv - pool_hw * 16);
+        int rem = idx % (H_conv * W_conv - pool_hw * 16);
+        int c = c_start + c_local;
+        
+        int h, w;
+        int stripe = H_pool * 4; // 124
+        if (rem &lt; stripe * 2) {
+            h = rem / 2;
+            w = stripe + (rem &amp; 1);
+        } else {
+            rem -= stripe * 2;
+            h = stripe + rem / W_conv;
+            w = rem % W_conv;
+        }
+        
+        float val = bias[c];
+        #pragma unroll
+        for (int ic = 0; ic &lt; C_in; ic++) {
+            const float* w_ptr = weight + (((c * C_in + ic) * 3) * 3);
+            int in_base = ((n * C_in + ic) * H_in + h) * W_in + w;
+            
+            val += input[in_base] * w_ptr[0];
+            val += input[in_base + 1] * w_ptr[1];
+            val += input[in_base + 2] * w_ptr[2];
+            val += input[in_base + W_in] * w_ptr[3];
+            val += input[in_base + W_in + 1] * w_ptr[4];
+            val += input[in_base + W_in + 2] * w_ptr[5];
+            val += input[in_base + 2 * W_in] * w_ptr[6];
+            val += input[in_base + 2 * W_in + 1] * w_ptr[7];
+            val += input[in_base + 2 * W_int + 2] * w_ptr[8];
+        }
+        
+        count_acc++;
+        float delta = val - mean_acc;
+        mean_acc += delta / count_acc;
+        float delta2 = val - mean_acc;
+        M2_acc += delta * delta2;
+    }
+    
+    // Block reduction of M2 and count... wait.
+    // We need to reduce M2 and mean across all threads.
+    // But each thread has its own partial Welford state with different counts.
+    // We can reduce them using the parallel Welford algorithm.
+    
+    // For simplicity, let&#x27;s just reduce sum and sum_sq instead.
+    // To do that, we&#x27;d need to track sum and sq separately, not just M2 and mean.
+}
+```
+
+Ah, I realized the parallel Welford reduction is nontrivial. There are algorithms for it, but let me think of a simpler approach.
+
+Actually, instead of Welford per thread, I can accumulate sum and sum_sq per thread, then at the end compute mean and variance as:
+```
+mean = total_sum / total_count
+var = (total_sq - total_sum * total_sum / total_count) / total_count
+```
+
+Or even simpler: `total_sq / count - mean^2`.
+
+The issue is numerical stability for `(total_sq / count - mean^2)`. If variance is small, this can give negative values due to rounding. But for random conv outputs, variance should be reasonable.
+
+Actually, a more stable approach: accumulate `sum` and `sum((x - ref)^2)` where `ref` is some reference. Or use Kahan summation.
+
+But the simplest is just sum and sq. Let&#x27;s switch to that and add a small epsilon to avoid negative variance due to numerical error.
+
+```cuda
+float local_sum = 0.0f;
+float local_sq = 0.0f;
+// ... accumulate ...
+// After reduction:
+float mean = total_sum / count;
+float var = total_sq / count - mean * mean;
+if (var &lt; 0) var = 0; // numerical safety
+float inv_std = rsqrtf(var + 1e-5f);
+```
+
+This is simpler and should be numerically stable enough for our tolerance.
+
+Actually, PyTorch might compute variance more accurately. But for 1e-4 tolerance on the final output, this should be fine.
+
+Let me also think about using `double` for accumulation. If I use `double` for local_sum and local_sq, the accuracy improves significantly. But that means each thread uses 2 double registers. That&#x27;s fine! And the block reduction can also use double.
+
+But PyTorch GroupNorm is in fp32. If I use double for accumulation, my mean/var might be more accurate than PyTorch&#x27;s, which could actually cause a difference! The direction of difference doesn&#x27;t matter for tolerance as long as it&#x27;s within bounds, but a more accurate result is still within bounds. However, if PyTorch&#x27;s less accurate result has bias in one direction and our result is more accurate, the difference between them could be larger than if we matched PyTorch&#x27;s accuracy.
+
+Better to use fp32 accumulation to match PyTorch more closely. Let&#x27;s stick with float.
+
+One more thing: reduction of sum and sq. With partial sums from 256 threads, we can do a tree reduction in shared memory.
+
+```cuda
+__shared__ float s_sum[256];
+__shared__ float s_sq[256];
+
+s_sum[tid] = local_sum;
+s_sq[tid] = local_sq;
+__syncthreads();
+
+// Tree reduction
+for (int stride = block_size / 2; stride &gt; 0; stride &gt;&gt;= 1) {
+    if (tid &lt; stride) {
+        s_sum[tid] += s_sum[tid + stride];
+        s_sq[tid] += s_sq[tid + stride];
+    }
+    __syncthreads();
+}
+
+float mean = s_sum[0] / total_conv_elements;
+float var = s_sq[0] / total_conv_elements - mean * mean;
+if (var &lt; 0) var = 0.0f;
+float inv_std = rsqrtf(var + 1e-5f);
+```
+
+Then each thread applies the transform to its stored max/min and writes output.
+
+One issue: `total_conv_elements = 4 * 126 * 126 = 63504`. This is the same for all blocks.
+
+Wait, in the reduction, we use `s_sum[0]` and `s_sq[0]`. But what about threads whose `num_pool = 0` and `num_extra = 0`? They set `local_sum = 0` and `local_sq = 0`. That&#x27;s correct because they don&#x27;t process any elements.
+
+Good.
+
+Now, for the output write, each thread needs to know the (c, h_pool, w_pool) for each of its stored max/min. As I noted, we can recompute the indices because they follow the same pattern:
+```
+for (int i = 0; i &lt; num_pool; i++) {
+    int idx = tid + i * block_size;
+    int c_local = idx / pool_hw;
+    int rem = idx % pool_hw;
+    int h_pool = rem / W_pool;
+    int w_pool = rem % W_pool;
+    int c = c_start + c_local;
+    
+    float a = inv_std * scale[c];
+    float b = -mean * a;
+    float best_val = (a &gt;= 0.0f) ? reg_max[i] : reg_min[i];
+    float out_val = a * best_val + b;
+    out_val = fmaxf(clamp_min, fminf(clamp_max, out_val));
+    output[((n * C_out + c) * H_pool + h_pool) * W_pool + w_pool] = out_val;
+}
+```
+
+Wait, `scale[c]` is per-channel. `inv_std` and `mean` are per-group. `a` is per-channel.
+
+Is the affine max trick valid here? Yes: over the 4x4 block, `a` and `b` are constant for a fixed channel. The max of {a*x_i + b} over i is a*max{x_i} + b if a &gt;= 0, and a*min{x_i} + b if a &lt; 0.
+
+Correct.
+
+One concern: `a &gt;= 0.0f`. What if `a` is exactly 0 or very close to 0? If `a == 0`, then all normalized values are b = 0, so max is 0. Our formula gives `a * max + b = 0` and `a * min + b = 0`, same result. So `a &gt;= 0` or `a &lt; 0` both give the same answer when `a == 0`. No issue.
+
+Another concern: `scale` is initialized to 1, so `a &gt; 0` initially. After training, it could theoretically become negative. Our code handles that.
+
+Now, what if `scale` is a parameter that can vary? In the test, what values will it have? Since `get_init_inputs()` is used to create the model, and then `get_inputs()` provides data, the model weights are whatever PyTorch initializes them to by default. `nn.Conv2d` uses Kaiming uniform initialization. `nn.Parameter(torch.ones(...))` sets scale to 1. So initially, `scale[c] = 1` for all c. Unless the test runs a forward pass on an uninitialized model or modifies weights somehow. But we can assume the model is created with the given constructor, so weights are default PyTorch init and scale is ones.
+
+Wait, I just realized: the reference model creates `self.scale = nn.Parameter(torch.ones(scale_shape))`. The default initialization for Conv2d weights and biases is:
+- weight: `U(-sqrt(k), sqrt(k))` where `k = 1/(C_in * kernel_size^2)`
+- bias: `U(-sqrt(k), sqrt(k))` or zeros depending on version.
+
+So `scale` is exactly 1.0. Then `a = inv_std &gt; 0`. So we only ever need max, not min! But to be correct for arbitrary scale values, we should handle both.
+
+In the test, since scale is ones, `a &gt; 0` always. We could simplify to just use max. But for correctness in all cases, let&#x27;s keep both.
+
+Actually, I just need to make sure my code compiles and is correct for the given test. The test creates the model with the default constructor. So yes, `scale` starts as ones. It might get updated if there&#x27;s any backward pass, but I think this is just a forward pass test.
+
+To be safe, let&#x27;s keep the sign check.
+
+Now, I should verify my contiguous assignment is correct for `num_pool`.
+
+Total pool blocks = 3844. Block size = let&#x27;s say 256.
+3844 / 256 = 15 remainder 4.
+
+For `tid = 0`: num_pool = 3844/256 rounded up = 16? Wait, let me recalculate.
+
+The number of terms in the arithmetic sequence `tid, tid+256, tid+512, ...` that are &lt; 3844.
+
+For `tid &lt; 3844`: first term = tid. Last term = tid + (num-1)*256 &lt; 3844.
+So (num-1)*256 &lt; 3844 - tid.
+num - 1 &lt; (3844 - tid) / 256.
+num = floor((3844 - 1 - tid) / 256) + 1 = floor((3843 - tid) / 256) + 1.
+
+For tid=0: floor(3843/256) + 1 = floor(15.0117) + 1 = 15 + 1 = 16.
+For tid=4: floor(3839/256) + 1 = floor(14.996) + 1 = 14 + 1 = 15.
+For tid=255: floor(3588/256) + 1 = floor(14.0156) + 1 = 14 + 1 = 15.
+
+Wait, but 255 + 14*256 = 255 + 3584 = 3839. 3839 + 256 = 4095 &gt; 3844. So 15 terms for tid=255. Correct.
+
+For tid=100: floor(3743/256) + 1 = 14 + 1 = 15.
+100 + 14*256 = 100 + 3584 = 3684. 3684 &lt; 3844. Next would be 3940 &gt; 3844. So 15 terms. Correct.
+
+For tid=0: 0 + 15*256 = 3840. 3840 &lt; 3844. Next would be 4096 &gt; 3844. So 16 terms. Correct.
+
+But earlier I calculated that tid=4 also gets 16 terms? Let me check:
+tid=4: 3843-4 = 3839. floor(3839/256) = 14. 14+1 = 15.
+
+Hmm, so only tid=0,1,2,3 get 16 terms?
+tid=3: 3843-3 = 3840. floor(3840/256) = 15. 15+1 = 16.
+tid=4: 3843-4 = 3839. floor(3839/256) = 14. 14+1 = 15.
+
+Wait, 3840/256 = 15.0, so floor is 15. 15+1 = 16.
+3839/256 = 14.996, floor is 14. 14+1 = 15.
+
+So only tid=0,1,2,3 get 16 terms? That seems wrong because 4*16 + 252*15 = 64 + 3780 = 3844. Yes! So only the first 4 threads get 16 terms.
+
+But earlier I said thread 0: blocks 0..15 (16 blocks), thread 1: 16..31 (16 blocks). Let me check:
+
+For tid=1: terms are 1, 257, 513, 769, 1025, 1281, 1537, 1793, 2049, 2305, 2561, 2817, 3073, 3329, 3585. Next: 3841. 3841 &lt; 3844? Yes! So there&#x27;s a 16th term: 3841. 
+
+Let me recount: 1 + 15*256 = 1 + 3840 = 3841. 3841 &lt; 3844. So num=16.
+
+For tid=2: 2 + 15*256 = 3842 &lt; 3844. num=16.
+For tid=3: 3 + 15*256 = 3843 &lt; 3844. num=16.
+For tid=4: 4 + 14*256 = 4 + 3584 = 3588. Next: 3844, which is NOT &lt; 3844. So num=15.
+
+Wait, 4 + 14*256 = 3588. The 15th term is 4 + 14*256 = 3588. Is there a 16th? 4 + 15*256 = 3844. 3844 &lt; 3844 is false. So num=15.
+
+But 4*16 + 252*15 = 64 + 3780 = 3844. Correct.
+
+So only tids 0,1,2,3 get 16 blocks. The rest get 15. 
+
+Let me verify tids 0-3 cover blocks 0, 1, 2, 3 and then 256, 257, 258, 259, etc.
+tid=0: 0, 256, 512, ..., 3840. All 0 mod 256.
+tid=1: 1, 257, 513, ..., 3841. All 1 mod 256.
+tid=2: 2, 258, ..., 3842.
+tid=3: 3, 259, ..., 3843.
+
+So blocks 0..3, 256..259, 512..515, etc. are handled by tids 0..3.
+Blocks 4..255 are handled by tids 4..255, each getting 15 blocks.
+Block 4: tid=4, blocks 4, 260, 516, ..., 3588. 15 blocks.
+Block 255: tid=255, blocks 255, 511, ..., 3839. 15 blocks.
+
+So tids 0-3 handle blocks at indices {0,256,512,...,3840}, {1,257,...,3841}, {2,258,...,3842}, {3,259,...,3843}.
+Tids 4-255 handle blocks starting at their tid, stepping by 256, for 15 steps each.
+
+This means block 0 is handled by tid 0. Block 1 by tid 1. Block 2 by tid 2. Block 3 by tid 3. Block 4 by tid 4. ... Block 255 by tid 255. Block 256 by tid 0. Block 257 by tid 1. etc.
+
+So threads 0-255 handle contiguous blocks 0-255 (each one block). Then threads 0-3 handle blocks 256-259, and threads 4-255 handle blocks 260-3839. 
+
+Wait, that&#x27;s not right. Thread 4 handles blocks 4, 260, 516, ... Thread 5 handles 5, 261, 517, ...
+So thread 4 handles block 4 (immediately after thread 3&#x27;s block 3, great!) and also block 260 (which is later). Block 259 is handled by thread 3 (in its second set). Block 260 is handled by thread 4. Block 261 by thread 5. 
+
+So locally, block 259 and 260 are adjacent in linear index. Block 259 = c=0, h=8, w=11 (since 259 = 8*31 + 11). Block 260 = c=0, h=8, w=12. So adjacent horizontally! And they&#x27;re handled by thread 3 and thread 4 respectively, which are adjacent threads. Excellent spatial locality!
+
+And block 255 = c=0, h=8, w=7. Block 256 = c=0, h=8, w=8. Adjacent, handled by threads 255 and 0. Not adjacent threads but that&#x27;s fine.
+
+Actually, block 256 = h=8, w=8? 256 / 31 = 8 rem 8. Yes. Block 255 = 8*31 + 7 = 255. Good.
+
+So the assignment has excellent spatial locality horizontally. Vertically, when w wraps from 30 to 0, h increments by 1. Block 30 = c=0, h=0, w=30. Block 31 = c=0, h=1, w=0. These are adjacent in a raster scan. Handled by thread 30 and thread 31. Good.
+
+In fact, the contiguous assignment here is basically a round-robin assignment where thread tid handles every block_num blocks, starting from tid. For the first 3840 blocks (0-3839), each thread gets exactly 15 blocks, at tid, tid+256, tid+512, ..., tid+3840. Wait, tid+15*256 = tid+3840. For tid=255, 255+3840=4095 &gt; 3844. Hmm.
+
+For tid &lt;= 255, tid + 14*256 = tid + 3584. If tid &lt;= 259, this is &lt;= 3843.
+tid + 15*256 = tid + 3840. This is &lt; 3844 for tid &lt;= 3.
+
+So the assignment is:
+- For all tids, blocks at tid + k*256 for k = 0, 1, ..., 14. (15 blocks each)
+- For tids 0, 1, 2, 3: additionally block at tid + 15*256. (16th block)
+
+So thread 4 handles blocks: 4, 260, 516, 772, 1028, 1284, 1540, 1796, 2052, 2308, 2564, 2820, 3076, 3332, 3588.
+Thread 3 handles blocks: 3, 259, 515, 771, 1027, 1283, 1539, 1795, 2051, 2307, 2563, 2819, 3075, 3331, 3587, 3843.
+
+So thread 4 does NOT handle block 259 or 260 right after each other. Thread 4&#x27;s blocks are spaced by 256. Adjacent blocks are handled by adjacent threads (in the first set of 256 blocks), but subsequent sets are 256 apart, which means they jump significantly in spatial position.
+
+For example, thread 4&#x27;s second block is 260. Thread 5&#x27;s second block is 261. These are adjacent! And thread 4&#x27;s third block is 516, thread 5&#x27;s third block is 517. Also adjacent! This pattern repeats. So if threads 4-255 all process their k-th block at the same time, they process spatially adjacent blocks. Cache locality is good!
+
+What about threads 0-3? Thread 0&#x27;s blocks are 0, 256, 512, ..., 3840. Thread 1&#x27;s are 1, 257, ..., 3841. For the first 15 blocks, all threads 0-255 are accessing blocks in a contiguous range [0, 255] (first iteration), then [256, 511] (second iteration), etc. This gives decent locality if threads execute somewhat in lockstep.
+
+I think this is fine for cache. Let&#x27;s proceed.
+
+Now I realize my calculation of `num_pool` was:
+```cuda
+int num_pool = (tid &lt; total_pool_blocks) ? ((total_pool_blocks - 1 - tid) / block_size + 1) : 0;
+```
+
+For tid=0: (3843/256)+1 = 15+1 = 16.
+For tid=3: (3840/256)+1 = 15+1 = 16.
+For tid=4: (3839/256)+1 = 14+1 = 15.
+Correct.
+
+For the extra positions, total_extra = 2000.
+2000 / 256 = 7 rem 208.
+For tid &lt; 208: num_extra = 8.
+For tid &gt;= 208: num_extra = 7.
+
+```
+int num_extra = (tid &lt; total_extra) ? ((total_extra - 1 - tid) / block_size + 1) : 0;
+```
+For tid=0: (1999/256)+1 = 7+1 = 8.
+For tid=207: (1792/256)+1 = 7+1 = 8.
+For tid=208: (1791/256)+1 = 6+1 = 7.
+For tid=255: (1744/256)+1 = 6+1 = 7.
+Correct.
+
+Now for the mapping of extra positions to (h, w):
+Total extra per channel = 500.
+Mapping:
+- If rem &lt; 248: rem in [0, 247]. h = rem / 2, w = 124 + (rem % 2). Wait, 124*2 = 248.
+  Actually, I said 124*2 = 248. Let&#x27;s use stripe = 124.
+  For rem in [0, 247]: h = rem / 2, w = 124 + rem % 2.
+  Number of values: 248.
+- Else: rem -= 248. h = 124 + rem / 126, w = rem % 126.
+  Number of values: 252.
+  Total: 248 + 252 = 500.
+
+Wait, let me double check: h in [0,123], w=124 or w=125 gives 124*2 = 248 values (h from 0 to 123 inclusive is 124 values).
+h in [124,125], w in [0,125] gives 2*126 = 252 values.
+Total 500. Yes.
+
+But do we double count the corner (124,124), (124,125), (125,124), (125,125)?
+- First set: h in [0,123], so no.
+- Second set: h in [124,125], w in [0,125]. This includes w=124 and w=125.
+So (124,124), (124,125), (125,124), (125,125) are in the second set. But they shouldn&#x27;t be in the first set. Correct, no double counting.
+
+Mapping check:
+rem=0: h=0, w=124. Good.
+rem=1: h=0, w=125. Good.
+rem=2: h=1, w=124. Good.
+...
+rem=247: h=123, w=125. (since 247/2=123, 247%2=1). Good.
+
+rem=248: h=124+0/126=124, w=0. Good.
+rem=249: h=124, w=1. Good.
+...
+rem=249+125=374: h=124, w=125. Good.
+rem=375: h=125, w=0. Good.
+...
+rem=499: h=125, w=124. Wait, rem=499: 499-248=251. h=124+251/126=124+1=125. w=251%126=125. So (125, 125).
+
+Wait, rem ranges from 0 to 499 for a channel. The mapping formula:
+```
+if (rem &lt; 248) {
+    h = rem / 2;
+    w = 124 + (rem &amp; 1);
+} else {
+    int rem2 = rem - 248;
+    h = 124 + rem2 / 126;
+    w = rem2 % 126;
+}
+```
+
+rem=499: rem2=251. h=124+1=125. w=251%126=125. (125, 125). Good.
+
+Actually, the second region should cover h=124, w=0..125 and h=125, w=0..125. That&#x27;s 2*126=252 values. rem2 ranges 0..251. Correct.
+
+OK, the mapping is correct.
+
+One more thing: inside the conv computation, I used `#pragma unroll` for the `C_in` loop with 8 iterations. This should unroll fine. For the inner 3x3, I unrolled manually into 9 multiplications.
+
+Actually, let me optimize the conv loop. Since C_in=8 is small, we can fully unroll it.
+
+For each (h, w) position in the conv output, the input is read from 8 channels * 3x3 = 72 values.
+
+Currently, my code:
+```cuda
+for (int ic = 0; ic &lt; C_in; ic++) {
+    const float* w_ptr = weight + (((c * C_in + ic) * 3) * 3);
+    int in_base = ((n * C_in + ic) * H_in + h) * W_in + w;
+    val += input[in_base] * w_ptr[0];
+    val += input[in_base + 1] * w_ptr[1];
+    // ... etc
+}
+```
+
+This does 72 FMAs. The input reads are contiguous in memory (since w varies fastest in the inner loop). Actually, we read `input[in_base]`, `input[in_base+1]`, `input[in_base+2]` which are contiguous. Then jump by `W_in` for the next row. With W_in=128, these are strided but still in the same cache line typically.
+
+Wait, `in_base + W_in` is one row down. With width=128, consecutive rows are 128 floats apart = 512 bytes. On H100, cache line is 128 bytes. So each row read might need a new cache line, but rows are likely cached together if accessed recently.
+
+Actually, for each (h, w) conv output, the 3x3 input window spans 3 rows. If we process multiple w values consecutively, the rows are reused from cache.
+
+But in our case, we process each (h, w) independently across threads. Cache locality depends on how the threads access memory simultaneously.
+
+I think this is fine.
+
+One potential optimization: process 4 w values at once using vector loads, but that complicates the code.
+
+Let me just write the basic version and see if it compiles and passes.
+
+I also need to think about launch configuration. With 128 * 16 = 2048 blocks, and 256 threads per block. This should launch quickly.
+
+Actually, wait. I think 2048 blocks is quite a lot. For H100 with 132 SMs and 32 blocks/SM, we get 4224 blocks in flight. 2048 blocks is just 0.48 waves if all SMs are active. That means some SMs will be idle after their blocks finish. Is this bad?
+
+Well, each block has substantial work: ~4.6M MACs for pool blocks + ~2000*72 = 144K MACs for extra. Total ~4.7M MACs. At 20 TFLOPS, each block takes ~0.23ms. With 2048 blocks and 132 SMs, if we could run 16 blocks per SM concurrently (2048 threads / 128 threads = 16 blocks? Wait, 256 threads per block, max 8 blocks per SM), that&#x27;s 8*132 = 1056 blocks in flight. Then 2048 / 1056 = 1.94 waves.
+
+Actually, max blocks per SM is 32, but threads limit it to 8 for 256-thread blocks. So 8 blocks per SM * 132 SMs = 1056 blocks in flight. 2048 total = ~2 waves.
+
+With 2 waves, total time is roughly 2 * block_time = 2 * 0.23ms = 0.46ms. But memory bandwidth and cache might extend this.
+
+Actually, 4.7M MACs per block is 9.4 MFLOPs. H100 does 67 TFLOPS = 67,000 GFLOPS. 9.4 MFLOPs / 67,000 GFLOPS = 0.14 microseconds per block if purely compute. But we&#x27;re memory bandwidth bound, so it will take longer.
+
+If we read ~4.8MB of input per block and output 15KB, at 3.35TB/s ~ 1.4 microseconds per block. 2048 blocks at 132 SMs: if 8 blocks per SM, 1056 blocks in flight, throughput = 132 * 3.35TB/s / 4.8MB = ~92,000 blocks/second = ~10 microseconds per block... Hmm, my math is messy.
+
+Actually, aggregate bandwidth is 3.35 TB/s across all SMs. Total data read per block: inputs + weights. Weights are 1.15KB cached. Inputs are 4.8MB. But with cache reuse, actual bandwidth is much less. And multiple blocks share the input cache for the same n.
+
+I think the kernel will be fast enough. If not, we can optimize further.
+
+Let me write the Python wrapper for load_inline.
+
+Wait, here&#x27;s another consideration: should I pass all tensors as contiguous? PyTorch tensors are typically contiguous by default, but I should make sure.
+
+Also, the weights from `nn.Conv2d` are in `(out_channels, in_channels, kH, kW)` layout.
+
+The scale is `(out_channels, 1, 1)` which we can view as 1D.
+
+In `ModelNew.__init__`, I need to create weights and biases matching the reference Conv2d. But wait - the instructions say `ModelNew` must accept the same constructor arguments as `Model`. So:
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):
+        super().__init__()
+        # ...
+```
+
+We need to create `self.conv` or at least equivalent weights. Wait, we&#x27;re replacing the entire forward with a custom kernel. We still need to store the weights somehow.
+
+Actually, we can create the conv weights and biases as nn.Parameter, then in forward call our CUDA kernel.
+
+Or, we can store weight, bias, and scale as parameters. Initialize them the same way PyTorch does for Conv2d.
+
+For the custom kernel to be called, we need it compiled via `torch.utils.cpp_extension.load_inline`. The compilation happens at module load time.
+
+Let me draft the full Python module:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&#x27;&#x27;&#x27;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+#include &lt;float.h&gt;
+
+__global__ void fused_forward_kernel(...) {
+    // ... implementation ...
+}
+&#x27;&#x27;&#x27;
+
+cpp_source = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor fused_forward(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale,
+    int num_groups,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    int N = input.size(0);
+    int C_in = input.size(1);
+    int H_in = input.size(2);
+    int W_in = input.size(3);
+    int C_out = weight.size(0);
+    int H_conv = H_in - weight.size(2) + 1;
+    int W_conv = W_in - weight.size(3) + 1;
+    int H_pool = (H_conv - maxpool_kernel_size) / maxpool_kernel_size + 1;
+    int W_pool = (W_conv - maxpool_kernel_size) / maxpool_kernel_size + 1;
+    
+    auto output = torch::empty({N, C_out, H_pool, W_pool}, input.options());
+    
+    dim3 blocks(N, num_groups);
+    dim3 threads(256);
+    
+    fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        input.data_ptr&lt;float&gt;(),
+        weight.data_ptr&lt;float&gt;(),
+        bias.data_ptr&lt;float&gt;(),
+        scale.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        N, C_in, H_in, W_in,
+        C_out, H_conv, W_conv,
+        num_groups, H_pool, W_pool,
+        clamp_min, clamp_max
+    );
+    
+    return output;
+}
+&#x27;&#x27;&#x27;
+
+fused_op = load_inline(
+    name=&#x27;fused_op&#x27;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&#x27;fused_forward&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.num_groups = num_groups
+        self.maxpool_kernel_size = maxpool_kernel_size
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        
+        # Initialize like PyTorch Conv2d default
+        nn.init.kaiming_uniform_(self.weight, a=0, mode=&#x27;fan_in&#x27;, nonlinearity=&#x27;leaky_relu&#x27;)
+        if self.bias is not None:
+            fan_in = in_channels * kernel_size * kernel_size
+            bound = 1.0 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x):
+        return fused_op.fused_forward(
+            x, self.weight, self.bias, self.scale,
+            self.num_groups, self.maxpool_kernel_size,
+            self.clamp_min, self.clamp_max
+        )
+```
+
+Wait, I need to make sure PyTorch&#x27;s default init matches. Actually, PyTorch Conv2d default init is:
+- weight: `kaiming_uniform_(weight, a=math.sqrt(5))`
+- bias: if bias exists, `fan_in, fan_out = _calculate_fan_in_and_fan_out(self.weight)`, `bound = 1 / math.sqrt(fan_in)`, `uniform_(self.bias, -bound, bound)`
+
+For our purposes, the test probably just initializes the model and runs it once. The exact initialization matters for numerical values but not for the model structure. However, for correctness comparison with the reference model, we need identical weights! The evaluation test creates Model and ModelNew with the same arguments, so they should produce the same outputs. But if ModelNew initializes differently, the outputs differ!
+
+Ah, this is critical! The evaluation does something like:
+```python
+model = Model(*get_init_inputs())
+model_new = ModelNew(*get_init_inputs())
+x = get_inputs()[0]
+out_ref = model(x)
+out_new = model_new(x)
+assert torch.allclose(out_ref, out_new, atol=1e-4)
+```
+
+If Model and ModelNew initialize differently, the outputs will differ!
+
+So I need to either:
+1. Initialize ModelNew exactly like PyTorch&#x27;s Conv2d
+2. Or: not store weights in ModelNew at all, but instead receive them somehow
+
+Wait, that can&#x27;t be right. ModelNew is a nn.Module, it stores its own weights. The test creates both with the same constructor arguments. They have no way to synchronize weights unless we override state_dict or something. Actually, in PyTorch, `get_init_inputs()` is just the constructor args. Both models are initialized independently. For them to match, they MUST use the same initialization.
+
+So I need to match PyTorch&#x27;s Conv2d initialization exactly!
+
+PyTorch Conv2d default initialization (as of recent versions):
+```python
+init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+if self.bias is not None:
+    fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+    bound = 1 / math.sqrt(fan_in)
+    init.uniform_(self.bias, -bound, bound)
+```
+
+Wait, let me check the exact formula.
+
+In PyTorch 2.x, `nn.Conv2d` reset_parameters does:
+```python
+def reset_parameters(self):
+    init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    if self.bias is not None:
+        fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in)
+        init.uniform_(self.bias, -bound, bound)
+```
+
+For `in_channels=8, kernel_size=3`: fan_in = 8*3*3 = 72.
+`bound = 1/sqrt(72)`.
+
+For Kaiming uniform with a=sqrt(5): the gain is `sqrt(2/(1+a^2)) = sqrt(2/6) = sqrt(1/3)`.
+The std is `gain / sqrt(fan_in) = sqrt(1/3) / sqrt(72) = 1/sqrt(216)`.
+Uniform bounds are `[-sqrt(3)*std, sqrt(3)*std] = [-1/sqrt(72), 1/sqrt(72)]`.
+
+Wait, same as bias! Interesting.
+
+Actually, Kaiming uniform formula:
+```
+std = gain / sqrt(fan_mode)
+a = sqrt(3) * std
+uniform_(-a, a)
+```
+
+For `gain = sqrt(2/(1+a_leaky_relu^2))` where `a_leaky_relu = sqrt(5)`.
+`gain = sqrt(2/6) = sqrt(1/3)`.
+`std = sqrt(1/3) / sqrt(72) = 1/sqrt(216)`.
+`bound = sqrt(3) / sqrt(216) = 1/sqrt(72)`.
+
+Yes! So weight init is uniform(-1/sqrt(72), 1/sqrt(72)).
+And bias init is also uniform(-1/sqrt(72), 1/sqrt(72)).
+
+Wait, that&#x27;s surprising but true because of the specific formula with a=sqrt(5).
+
+Let me verify with a quick Python script mentally:
+```python
+import math
+gain = math.sqrt(2.0 / (1 + 5))  # sqrt(1/3)
+fan_in = 72
+std = gain / math.sqrt(fan_in)   # sqrt(1/3) / sqrt(72) = sqrt(1/216)
+bound = math.sqrt(3.0) * std     # sqrt(3/216) = sqrt(1/72) = 1/sqrt(72)
+```
+
+Yes. And bias bound is also 1/sqrt(72).
+
+Great, so we need:
+```python
+fan_in = in_channels * kernel_size * kernel_size
+bound = 1.0 / math.sqrt(fan_in)
+nn.init.uniform_(self.weight, -bound, bound)
+nn.init.uniform_(self.bias, -bound, bound)
+```
+
+Wait, is Kaiming uniform the same as `uniform_(-bound, bound)` with this specific bound? Yes, by coincidence for a=sqrt(5).
+
+Now, `self.scale = nn.Parameter(torch.ones(scale_shape))`. That&#x27;s the same as the reference.
+
+So in ModelNew.__init__, I should initialize weight and bias exactly as described.
+
+But hmm, what if the evaluation doesn&#x27;t reinitialize but instead saves and copies state dicts? The user said &quot;The file is executed with exec() before we instantiate ModelNew&quot;. The test might create both models independently with `get_init_inputs()`. We need the initialization to match.
+
+To be extra safe, I could actually keep `self.conv = nn.Conv2d(...)` in ModelNew.__init__ and then in forward, call our custom kernel with `self.conv.weight` and `self.conv.bias`. But wait, the forward should use a custom CUDA kernel. But we can extract the weights from the conv layer. This guarantees exact same init!
+
+That&#x27;s a great idea. We can do:
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.num_groups = num_groups
+        self.maxpool_kernel_size = maxpool_kernel_size
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+    
+    def forward(self, x):
+        return fused_op.fused_forward(
+            x, 
+            self.conv.weight, 
+            self.conv.bias, 
+            self.scale,
+            self.num_groups,
+            self.maxpool_kernel_size,
+            self.clamp_min,
+            self.clamp_max
+        )
+```
+
+This is perfect! We get PyTorch&#x27;s exact Conv2d initialization for free. And we don&#x27;t need to worry about matching it manually.
+
+But wait, does the evaluation do `ModelNew(*get_init_inputs())` and then check that it accepts the same constructor args? Yes. This works. It doesn&#x27;t require us to avoid using `nn.Conv2d` internally. The forward just needs to produce the same output.
+
+This is much safer! Let me use this approach.
+
+Now, one issue: if we use `self.conv = nn.Conv2d(...)`, we&#x27;re creating an unnecessary conv module. But it&#x27;s only in __init__, and its weights are used by the kernel. The memory overhead is small.
+
+Alternatively, we can just initialize the weights manually to match PyTorch. But I&#x27;d rather not risk it.
+
+Actually, we can also get the group_norm module, but we don&#x27;t need it.
+
+Using `self.conv` also means we don&#x27;t have to worry about `weight` or `bias` attribute naming.
+
+OK, I&#x27;ll go with this approach.
+
+Wait, but there&#x27;s another subtlety. What if `kernel_size` is passed as a tuple? In the problem, it&#x27;s `kernel_size = 3`, so it&#x27;s an int. But to be general, PyTorch&#x27;s Conv2d accepts int or tuple. Our constructor should handle it. The problem says `Accept the same constructor arguments as Model`. Since Model uses `nn.Conv2d(in_channels, out_channels, kernel_size)`, PyTorch will accept int or tuple. We should too. For simplicity, since the test uses int=3, we can pass it directly.
+
+Let me now write the complete Python code and test with compile and correctness.
+
+One issue with `load_inline`: the cpp_sources should define a host function that takes torch::Tensor and returns torch::Tensor. We need to include appropriate headers.
+
+Also, we need to make sure the CUDA code handles empty cases and uses `at::cuda::CUDAStream` properly. The basic version should work.
+
+Let me draft the full code now. I&#x27;ll be careful with all the details.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport math\n\ncuda_source = r&#x27;&#x27;&#x27;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n#include &lt;float.h&gt;\n\n__global__ void fused_forward_kernel(\n    const float* __restrict__ input,\n    const float* __restrict__ weight,\n    const float* __restrict__ bias,\n    const float* __restrict__ scale,\n    float* __restrict__ output,\n    int N, int C_in, int H_in, int W_in,\n    int C_out, int H_conv, int W_conv,\n    int num_groups, int H_pool, int W_pool,\n    float clamp_min, float clamp_max\n) {\n    int n = blockIdx.x;\n    int g = blockIdx.y;\n    \n    int channels_per_group = C_out / num_groups;\n    int c_start = g * channels_per_group;\n    int pool_hw = H_pool * W_pool;\n    int total_pool_blocks = channels_per_group * pool_hw;\n    int total_conv_elements = channels_per_group * H_conv * W_conv;\n    int total_extra = total_conv_elements - total_pool_blocks * 16;\n    \n    int tid = threadIdx.x;\n    int block_size = blockDim.x;\n    \n    __shared__ float s_sum[256];\n    __shared__ float s_sq[256];\n    \n    float local_sum = 0.0f;\n    float local_sq = 0.0f;\n    \n    int num_pool = (tid &lt; total_pool_blocks) ? ((total_pool_blocks - 1 - tid) / block_size + 1) : 0;\n    float reg_max[16];\n    float reg_min[16];\n    \n    for (int i = 0; i &lt; num_pool; i++) {\n        int idx = tid + i * block_size;\n        int c_local = idx / pool_hw;\n        int rem = idx % pool_hw;\n        int h_pool = rem / W_pool;\n        int w_pool = rem % W_pool;\n        int c = c_start + c_local;\n        \n        float m = -FLT_MAX;\n        float mn = FLT_MAX;\n        \n        #pragma unroll\n        for (int ii = 0; ii &lt; 4; ii++) {\n            int h = (h_pool &lt;&lt; 2) + ii;\n            #pragma unroll\n            for (int jj = 0; jj &lt; 4; jj++) {\n                int w = (w_pool &lt;&lt; 2) + jj;\n                \n                float val = bias[c];\n                \n                #pragma unroll\n                for (int ic = 0; ic &lt; C_in; ic++) {\n                    const float* w_ptr = weight + (((c * C_in + ic) * 3) * 3);\n                    int in_off = ((n * C_in + ic) * H_in + h) * W_in + w;\n                    float i0 = input[in_off];\n                    float i1 = input[in_off + 1];\n                    float i2 = input[in_off + 2];\n                    float i3 = input[in_off + W_in];\n                    float i4 = input[in_off + W_in + 1];\n                    float i5 = input[in_off + W_in + 2];\n                    float i6 = input[in_off + 2 * W_in];\n                    float i7 = input[in_off + 2 * W_in + 1];\n                    float i8 = input[in_off + 2 * W_in + 2];\n                    val += i0 * w_ptr[0] + i1 * w_ptr[1] + i2 * w_ptr[2]\n                         + i3 * w_ptr[3] + i4 * w_ptr[4] + i5 * w_ptr[5]\n                         + i6 * w_ptr[6] + i7 * w_ptr[7] + i8 * w_ptr[8];\n                }\n                \n                local_sum += val;\n                local_sq += val * val;\n                m = fmaxf(m, val);\n                mn = fminf(mn, val);\n            }\n        }\n        \n        reg_max[i] = m;\n        reg_min[i] = mn;\n    }\n    \n    int num_extra = (tid &lt; total_extra) ? ((total_extra - 1 - tid) / block_size + 1) : 0;\n    for (int i = 0; i &lt; num_extra; i++) {\n        int idx = tid + i * block_size;\n        int c_local = idx / (H_conv * W_conv - pool_hw * 16);\n        int rem = idx % (H_conv * W_conv - pool_hw * 16);\n        int c = c_start + c_local;\n        \n        int h, w;\n        int stripe = H_pool * 4;\n        if (rem &lt; stripe * 2) {\n            h = rem / 2;\n            w = stripe + (rem &amp; 1);\n        } else {\n            rem -= stripe * 2;\n            h = stripe + rem / W_conv;\n            w = rem % W_conv;\n        }\n        \n        float val = bias[c];\n        #pragma unroll\n        for (int ic = 0; ic &lt; C_in; ic++) {\n            const float* w_ptr = weight + (((c * C_in + ic) * 3) * 3);\n            int in_off = ((n * C_in + ic) * H_in + h) * W_in + w;\n            val += input[in_off] * w_ptr[0]\n                 + input[in_off + 1] * w_ptr[1]\n                 + input[in_off + 2] * w_ptr[2]\n                 + input[in_off + W_in] * w_ptr[3]\n                 + input[in_off + W_in + 1] * w_ptr[4]\n                 + input[in_off + W_in + 2] * w_ptr[5]\n                 + input[in_off + 2 * W_in] * w_ptr[6]\n                 + input[in_off + 2 * W_in + 1] * w_ptr[7]\n                 + input[in_off + 2 * W_in + 2] * w_ptr[8];\n        }\n        local_sum += val;\n        local_sq += val * val;\n    }\n    \n    s_sum[tid] = local_sum;\n    s_sq[tid] = local_sq;\n    __syncthreads();\n    \n    for (int stride = block_size / 2; stride &gt; 0; stride &gt;&gt;= 1) {\n        if (tid &lt; stride) {\n            s_sum[tid] += s_sum[tid + stride];\n            s_sq[tid] += s_sq[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    float mean = s_sum[0] / total_conv_elements;\n    float var = s_sq[0] / total_conv_elements - mean * mean;\n    if (var &lt; 0.0f) var = 0.0f;\n    float inv_std = rsqrtf(var + 1e-5f);\n    \n    for (int i = 0; i &lt; num_pool; i++) {\n        int idx = tid + i * block_size;\n        int c_local = idx / pool_hw;\n        int rem = idx % pool_hw;\n        int h_pool = rem / W_pool;\n        int w_pool = rem % W_pool;\n        int c = c_start + c_local;\n        \n        float a = inv_std * scale[c];\n        float b = -mean * a;\n        float best_val = (a &gt;= 0.0f) ? reg_max[i] : reg_min[i];\n        float out_val = a * best_val + b;\n        out_val = fmaxf(clamp_min, fminf(clamp_max, out_val));\n        output[((n * C_out + c) * H_pool + h_pool) * W_pool + w_pool] = out_val;\n    }\n}\n&#x27;&#x27;&#x27;\n\ncpp_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n\ntorch::Tensor fused_forward(\n    torch::Tensor input,\n    torch::Tensor weight,\n    torch::Tensor bias,\n    torch::Tensor scale,\n    int num_groups,\n    int maxpool_kernel_size,\n    float clamp_min,\n    float clamp_max\n) {\n    int N = input.size(0);\n    int C_in = input.size(1);\n    int H_in = input.size(2);\n    int W_in = input.size(3);\n    int C_out = weight.size(0);\n    int H_conv = H_in - weight.size(2) + 1;\n    int W_conv = W_in - weight.size(3) + 1;\n    int H_pool = (H_conv - maxpool_kernel_size) / maxpool_kernel_size + 1;\n    int W_pool = (W_conv - maxpool_kernel_size) / maxpool_kernel_size + 1;\n    \n    auto output = torch::empty({N, C_out, H_pool, W_pool}, input.options());\n    \n    dim3 blocks(N, num_groups);\n    dim3 threads(256);\n    \n    fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n        input.data_ptr&lt;float&gt;(),\n        weight.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        scale.data_ptr&lt;float&gt;(),\n        output.data_ptr&lt;float&gt;(),\n        N, C_in, H_in, W_in,\n        C_out, H_conv, W_conv,\n        num_groups, H_pool, W_pool,\n        clamp_min, clamp_max\n    );\n    \n    return output;\n}\n&#x27;&#x27;&#x27;\n\nfused_op = load_inline(\n    name=&#x27;fused_op&#x27;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[&#x27;fused_forward&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):\n        super(ModelNew, self).__init__()\n        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)\n        self.scale = nn.Parameter(torch.ones(scale_shape))\n        self.num_groups = num_groups\n        self.maxpool_kernel_size = maxpool_kernel_size\n        self.clamp_min = clamp_min\n        self.clamp_max = clamp_max\n\n    def forward(self, x):\n        return fused_op.fused_forward(\n            x,\n            self.conv.weight,\n            self.conv.bias,\n            self.scale,\n            self.num_groups,\n            self.maxpool_kernel_size,\n            self.clamp_min,\n            self.clamp_max\n        )\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;fused_op&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp -o main.o 
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp: In function &#x27;at::Tensor fused_forward(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int, int, float, float)&#x27;:
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:27:5: error: &#x27;dim3&#x27; was not declared in this scope
+   27 |     dim3 blocks(N, num_groups);
+      |     ^~~~
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:28:9: error: expected &#x27;;&#x27; before &#x27;threads&#x27;
+   28 |     dim3 threads(256);
+      |         ^~~~~~~~
+      |         ;
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:30:5: error: &#x27;fused_forward_kernel&#x27; was not declared in this scope; did you mean &#x27;fused_forward&#x27;?
+   30 |     fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |     ^~~~~~~~~~~~~~~~~~~~
+      |     fused_forward
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:30:27: error: expected primary-expression before &#x27;&lt;&#x27; token
+   30 |     fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |                           ^
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:30:28: error: &#x27;blocks&#x27; was not declared in this scope; did you mean &#x27;lockf&#x27;?
+   30 |     fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |                            ^~~~~~
+      |                            lockf
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:30:36: error: &#x27;threads&#x27; was not declared in this scope; did you mean &#x27;read&#x27;?
+   30 |     fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |                                    ^~~~~~~
+      |                                    read
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/main.cpp:30:45: error: expected primary-expression before &#x27;&gt;&#x27; token
+   30 |     fused_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |                                             ^
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=fused_op -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_85_cache/k_bb79f2492ba5/fused_op/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>

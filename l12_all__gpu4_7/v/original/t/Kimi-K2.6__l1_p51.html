@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 51</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:10:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 51</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:15:40 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">51_Argmax_over_a_dimension.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -399,5 +399,856 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 490.5s · 80,483 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 490.5s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to optimize argmax over a specified dimension. The input shape is [128, 4096, 4095] and dim=1 or maybe dim can be any. The reference uses torch.argmax(x, dim=self.dim). We need a custom CUDA kernel that&#x27;s faster.
+
+First, let&#x27;s think about the problem. Argmax is memory-bandwidth bound: we read the entire tensor (128*4096*4095 floats ~ 2.1 GB) and write out indices (128*4095 int64 ~ 4.2 MB). The operation is essentially a reduction: for each output element, find the index of the maximum value along the specified dimension.
+
+The H100 has 3.35 TB/s memory bandwidth. The input tensor is about 2.1 GB of fp32 data. Reading that at full bandwidth would take about 0.63 ms. PyTorch&#x27;s torch.argmax is implemented via reduction kernels, but may not be fully optimized for this particular size/dimension combination. Our custom kernel can likely beat it by using vectorized loads, better thread coarsening, avoiding overhead, etc.
+
+Dimension is 1 in the example (dim1=4096). So we need to find argmax over dimension 1 of shape [batch=128, dim=4096, seq=4095]. The output shape is [128, 4095].
+
+We can write a custom kernel where each thread block handles a contiguous chunk of the output (e.g., each block processes a set of (batch, seq) indices). Within each block, threads cooperate to find the argmax along dim 1.
+
+A simple efficient approach: For each output position (b, s), we need to find the argmax over d in [0, 4096). Each thread can process a chunk of d values, track local max value and index, then block-level reduction (e.g., using shared memory or warp shuffle) to find the global max.
+
+Given that dim=4096 is moderately sized, we could assign one warp or one block per output element. Let&#x27;s analyze:
+
+Output elements: 128 * 4095 = 524,160. If we assign one block per output element, we&#x27;d have 524k blocks, which is a lot but manageable. Each block would have e.g., 128 threads reducing over 4096 elements: each thread reads 32 elements (or 4096/128 = 32). That&#x27;s straightforward. However, launching 524k blocks may have some overhead, but it&#x27;s still okay.
+
+Alternatively, we could assign one thread per output element, and each thread loops over the dimension. With 524k threads, we could launch e.g., (128, 4095) grid with perhaps a 1D block of 256 threads? Actually if each thread handles one output, the block size can be anything, and grid would be ceil(524160/block_size). Each thread reads 4096 elements sequentially. That might be memory-coalesced if the dim being reduced is the innermost? Let&#x27;s check memory layout.
+
+Input x: shape [batch_size, dim1, dim2] with dim1=4096, dim2=4095. In PyTorch, default layout is contiguous and row-major: x[b, d, s] is at offset (b*dim1*dim2 + d*dim2 + s). If we are reducing over dim=1 (dim1), then for fixed (b, s), the elements x[b, :, s] are separated by stride = dim2 = 4095. That means consecutive d values are strided by 4095 floats (~16KB). That&#x27;s not contiguous in memory; thus memory access pattern is strided. However, if multiple threads in a warp access consecutive d for the same (b, s), they&#x27;d be accessing memory with large stride. But if multiple threads access different (b,s) but same d, they&#x27;d be contiguous.
+
+Wait, let&#x27;s think: If we parallelize over (b,s) and each thread reads x[b, d, s] for d=0..4095, then consecutive threads in a warp have consecutive s (or b). For a given d, x[b, d, s] are contiguous in s. So if warp threads read the same d but varying s, they are contiguous. But here each thread reads x[b, d, s] for varying d; for a fixed thread, the stride between d and d+1 is dim2. So each thread is doing strided reads.
+
+If we instead parallelize over d, i.e., have a block compute the argmax for a fixed (b,s) by reducing over d collaboratively, then thread i in the block reads x[b, i, s], x[b, i+blockDim, s], etc. Then threads in the same warp read consecutive s? No, they would all read the same s but different d. The offset for thread i at d=i is (b*dim1*dim2 + i*dim2 + s). So threads in a warp have offsets differing by dim2 (4095 floats). That&#x27;s a stride of 4095*4 = 16380 bytes. That&#x27;s not contiguous; each thread accesses a different 4-byte element separated by ~16KB. That&#x27;s terrible for coalescing: the L1 cache might help, but memory transactions would be inefficient.
+
+Actually, memory coalescing on modern GPUs groups threads that access addresses within a 128-byte cache line. If threads in a warp access addresses separated by 16KB, each warp issues many 32-byte transactions (or 128-byte) but only uses 4 bytes out of each, wasting bandwidth.
+
+Can we reorganize the reduction to improve coalescing? We could transpose the data or operate in a different order. But we cannot transpose unless we write a transpose kernel first, which may add overhead.
+
+Wait, perhaps the PyTorch reference kernel also suffers from strided access. But PyTorch might use TensorIterator which handles arbitrary strides. However, PyTorch may not be fully optimized for this specific case. Our custom kernel could use vectorized loads from strided memory? Vectorized loads require contiguous memory for each thread. If each thread reads a vector of e.g., 4 consecutive floats from the stride, that&#x27;s not possible because the stride is dim2.
+
+But we can change the parallelism: instead of assigning a block per (b,s), we can assign a block per (b) and have the block reduce over d and s simultaneously? Or per (b, chunk_of_s)? Let&#x27;s think.
+
+If we process a block for a fixed b and a range of s, we can have threads in the block read x[b, d, s] where d is blockIdx.x or something, and s is threadIdx.x. Let&#x27;s see: For a fixed b and varying s, x[b, d, s] are contiguous in s. So if we have a warp processing a range of s (e.g., 32 consecutive s), then threads in the warp are reading contiguous floats: x[b, d, s], x[b, d, s+1], etc. That&#x27;s perfectly coalesced.
+
+So here&#x27;s a good approach: For each batch element b, we want to compute argmax over d for each s. We can launch a 2D grid where blockIdx.x corresponds to b (0..127) and blockIdx.y corresponds to a tile of s (e.g., each block processes some number of s values). Within a block, threadIdx.x corresponds to s within the tile, and threads loop over d.
+
+Specifically:
+- Tile size: e.g., blockDim.x = 256 (or 512) threads, each handling one s index.
+- The grid in y dimension: ceil(dim2 / blockDim.x) = ceil(4095 / 256) ≈ 16.
+- So we have gridDim.y = 16, gridDim.x = 128.
+- Total blocks = 128 * 16 = 2048. That&#x27;s a reasonable number.
+
+Within each block, threads process a contiguous range of s: s_start = blockIdx.y * blockDim.x + threadIdx.x.
+
+Each thread needs to find argmax_d x[b, d, s]. So it loops over d from 0 to dim1-1, reading x[b, d, s] for its assigned s. Since threads in a warp have consecutive s, for a given d, their accesses are contiguous. This is perfectly coalesced! Each warp reads 256 consecutive floats (or 128) for each d. That&#x27;s 1KB or 512B per warp, well within a cache line.
+
+Wait, but each thread loops over all d: for d = 0..4095, read x[b, d, s], compare, update max_val and max_idx. The inner loop is over d, and the contiguous access is across threads. That&#x27;s very good. The memory layout is:
+
+for d in 0..4095:
+  warp reads x[b, d, s0...s0+31] -&gt; contiguous.
+
+Yes, because offset = b*dim1*dim2 + d*dim2 + s. For fixed b and d, varying s gives contiguous floats. So if threadIdx.x maps to s, coalescing is perfect.
+
+This is a great memory access pattern. The total memory reads are the same, but coalesced. Each thread does 4096 loads, each load is 4 bytes. Total loads per block: blockDim.x * dim1. With blockDim.x=256, each block reads 256*4096*4 = 4MB. With 2048 blocks, total reads = 8GB? Wait, 128*4095*4096*4 = 8,589,004,800 bytes = 8.0 GiB? Let&#x27;s recalc: batch=128, dim1=4096, dim2=4095. Total elements = 128*4096*4095 = 2,147,516,160? Actually 128*4096 = 524,288; 524,288*4095 = 2,147,516,160. Each element is 4 bytes. Total bytes = 8,590,064,640 ≈ 8.0 GiB? Wait, 2.147e9 * 4 = 8.589e9 bytes = 8 GiB. Yes, because 2^31 = 2.147e9, times 4 = 8.589e9. So total memory read is ~8 GB.
+
+Wait, earlier I said 2.1 GB. That was wrong: 128*4096*4095 is about 2.1 billion elements, which at 4 bytes is 8.4 GB. Yes. So memory bandwidth is 3.35 TB/s = 3350 GB/s. So reading 8.4 GB at full bandwidth takes ~2.5 ms. If we can achieve near-peak bandwidth, that&#x27;s the lower bound.
+
+PyTorch&#x27;s torch.argmax may not achieve peak bandwidth because of strided access if dim is not the last dimension. For dim=1, the inner loops over dim1 with stride dim2=4095. PyTorch&#x27;s reduction kernels likely use vectorized loads per thread if the stride is 1 across the reduction dimension? Actually, PyTorch&#x27;s TensorIterator reduction handles arbitrary strides. It might be suboptimal for non-contiguous reduction.
+
+Our kernel, as described, is coalesced and should achieve high bandwidth. We can further improve by unrolling the loop, using vectorized loads (float4), etc.
+
+But wait: each thread&#x27;s s must be unique and within range. For blockDim.x = 256, each block processes 256 consecutive s values. There are 4095 s values, so 16 blocks (0..15) cover 4096 s values, but we only have 4095, so the last block will have one thread with s=4095 which is out of bounds. We can handle that with a guard.
+
+The output is int64 (torch.argmax returns long). So each thread writes one int64 to out[b, s] if s &lt; dim2.
+
+Algorithm per thread:
+```
+int b = blockIdx.x;
+int s = blockIdx.y * blockDim.x + threadIdx.x;
+if (s &gt;= dim2) return;
+float max_val = x[b * dim1 * dim2 + 0 * dim2 + s]; // or -INF
+int max_idx = 0;
+for (int d = 1; d &lt; dim1; ++d) {
+    float val = x[b * dim1 * dim2 + d * dim2 + s];
+    if (val &gt; max_val) {
+        max_val = val;
+        max_idx = d;
+    }
+}
+out[b * dim2 + s] = max_idx;
+```
+
+Because the input is `torch.rand`, there won&#x27;t be NaNs. But for correctness, we might want to handle NaNs? The reference torch.argmax on floats with NaNs returns the first index if all NaN? Actually torch.argmax returns the index of the first maximum. If there are NaNs, comparison with NaN is false, so NaNs are ignored? Wait, in IEEE, `val &gt; max_val` is false if val is NaN or max_val is NaN. If max_val starts as NaN, then no val &gt; max_val ever, so max_idx stays 0. But torch.argmax behavior with NaNs: it returns the index of the first NaN? Actually, `torch.argmax` uses `std::max` semantics? Let&#x27;s check: PyTorch&#x27;s argmax uses `max_values` reduction with `argmax`. For floats, it likely uses `a &gt; b` comparison; if both are NaN, behavior may be to return the first element? The reference says &quot;numerically equivalent outputs at fp32 precision&quot;. Since inputs are random uniforms in [0,1), no NaNs or infinities. So we don&#x27;t need special NaN handling.
+
+Potential improvements:
+- Use `float` for max_val.
+- Unroll the loop? The compiler may unroll, but manual unrolling could help. However, with 4096 iterations, unrolling fully is impossible. We can perhaps process 2 or 4 elements per iteration.
+- Use shared memory? Not needed since each thread works independently.
+- Use vectorized loads? Since each thread accesses strided memory (stride dim2), vectorized loads per thread are not possible across the d loop. But we can process multiple d values per iteration in a way that each thread reads contiguous s for each d. Actually, for each d, we read x[b, d, s]. If we process d in steps of 1, each load is coalesced but scalar. We could use `float4` if we have each thread handle 4 s values: thread i handles s0 + i*4, s0+i*4+1, etc. But then the loads for a given d would be `float4` loads at offset b*... + d*dim2 + s0 + i*4. These are contiguous 16-byte chunks, and consecutive threads load consecutive 16-byte chunks. That is coalesced and uses vectorized loads. That could reduce instruction overhead and improve throughput.
+
+Let&#x27;s design with vectorized float4 loads:
+- Each thread handles 4 s indices. So blockDim.x = 64 or 128? Let&#x27;s say blockDim.x = 128, each thread handles 4 s values =&gt; tile width = 512 s values per block.
+- For a given d, thread i loads 4 floats: x[b, d, s_start + i*4 + 0..3]. This is a single float4 load (or two float2, etc.). Consecutive threads load consecutive float4s, so warp loads 512 consecutive floats (2048 bytes), perfectly coalesced into 16 128-byte cache lines or 32 64-byte lines.
+- Each thread maintains 4 max_vals and 4 max_idxs.
+- After looping over all d, each thread writes 4 int64 indices.
+
+This reduces the number of threads needed and increases arithmetic intensity slightly (more work per thread). The grid would be:
+- gridDim.x = batch_size = 128
+- gridDim.y = ceil(dim2 / (blockDim.x * 4)) = ceil(4095 / 512) = 8.
+
+Total blocks = 128*8 = 1024. Each block has 128 threads. This is fine.
+
+But we need to handle the last tile where s may be out of bounds. We can pad or guard.
+
+Alternative: use `half2`? Input is fp32; we can keep fp32. We can also try to use LDG.128 instructions. Using float4 should encourage that.
+
+Let&#x27;s also consider using `__ldg` for read-only data to use texture cache. Since x is read-only, that might help.
+
+Another angle: The problem is very memory-bandwidth bound. So maximizing bandwidth utilization is key. The kernel design with float4 loads and coalesced access should achieve ~90% of peak.
+
+Let&#x27;s write the CUDA kernel:
+
+```cuda
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+// We&#x27;ll pass x as a packed float pointer.
+// Shape: batch, dim, seq2
+// Strides: x.stride(0), x.stride(1), x.stride(2)
+// Since the input is contiguous, strides are dim1*dim2, dim2, 1.
+// But to be safe we can compute pointers using strides.
+
+__global__ void argmax_kernel(const float* __restrict__ x, long* __restrict__ out,
+                              int batch, int dim, int seq) {
+    int b = blockIdx.x;
+    int tile = blockIdx.y;
+    int lane = threadIdx.x;
+    
+    // each thread handles 4 s elements
+    int s0 = (tile * blockDim.x + lane) * 4;
+    
+    // load 4 values for d=0
+    float4 vals;
+    bool valid[4];
+    #pragma unroll
+    for (int i = 0; i &lt; 4; ++i) {
+        int s = s0 + i;
+        valid[i] = (s &lt; seq);
+    }
+    
+    float max_val[4];
+    int max_idx[4];
+    
+    // init with first d
+    for (int i = 0; i &lt; 4; ++i) {
+        if (valid[i]) {
+            max_val[i] = x[b * dim * seq + 0 * seq + (s0 + i)];
+            max_idx[i] = 0;
+        } else {
+            max_val[i] = -1e30f; // sentinel, won&#x27;t be written
+            max_idx[i] = 0;
+        }
+    }
+    
+    for (int d = 1; d &lt; dim; ++d) {
+        // For each of the 4 s elements, load value
+        for (int i = 0; i &lt; 4; ++i) {
+            if (valid[i]) {
+                float val = x[b * dim * seq + d * seq + (s0 + i)];
+                if (val &gt; max_val[i]) {
+                    max_val[i] = val;
+                    max_idx[i] = d;
+                }
+            }
+        }
+    }
+    
+    // Write output
+    for (int i = 0; i &lt; 4; ++i) {
+        int s = s0 + i;
+        if (s &lt; seq) {
+            out[b * seq + s] = max_idx[i];
+        }
+    }
+}
+```
+
+But wait, `float4` loads: `x` is a `float*` and we access with pointer arithmetic: `x + b*dim*seq + d*seq + s0`. We can cast to `float4` if s0 is aligned to 4? Since seq = 4095, s0 = (tile * blockDim.x + lane) * 4. If blockDim.x = 128, s0 for tile=0, lane=0 is 0, lane=1 is 4, etc. So s0 is always multiple of 4. However, the total seq = 4095, so the last group might exceed. But for valid loads where s0+3 &lt; seq, we can load float4. For the last tile, some s are out of bounds; we should use scalar loads for safety.
+
+But we can handle it by having the main loop load float4 for the first 3 elements of each tile if `s0 + 3 &lt; seq`. Wait, the last tile has s0 ranging up to 4092 (since tile=7, lane=127 =&gt; s0 = (7*128+127)*4 = (1023)*4 = 4092. s0+3 = 4095, which is == seq (4095), so it&#x27;s out of bounds (since indices are 0..4094). Actually seq=4095. So 4092+3=4095 is out of bounds. So for lane=127 in tile=7, s0=4092, valid s are 4092,4093,4094 (3 elements). So we cannot safely do a float4 load for that lane.
+
+To simplify, we could use scalar loads. The compiler may still generate good loads. Alternatively, we can pad dim2 to a multiple of 4 if we allocate the tensor accordingly? But we cannot change the input shape.
+
+Another approach: each thread handles 1 s. Block size 256 or 512. This is simpler and still coalesced. With block size 256, each warp reads 32 contiguous floats (or 64). That&#x27;s still good coalescing but not vectorized. The overhead of scalar loads vs vectorized loads may be small on H100 because the memory system is very wide.
+
+But maybe we can do better: process multiple s per thread but use scalar loads and let the compiler schedule them.
+
+We can also use `float` and `#pragma unroll 4` on the inner loop? Not straightforward.
+
+An alternative high-performance approach: Since reduction dimension is 4096, we could use a tree reduction per output element with shared memory. But that requires strided access across d. However, we can restructure: within a block, threads map to d (the reduction dimension), and we use a sequential reduction across s? Let&#x27;s think.
+
+For a fixed (b, chunk_s), we want to find for each s in the chunk the argmax over d. If we have blockDim.x = 128 mapping to d, and we process s sequentially within each thread? That&#x27;s the strided access pattern: thread d reads x[b, d, s]. For a fixed s, threads read stride dim2. As noted, that&#x27;s not coalesced. But on H100, the L1 cache is large (256KB). Each block could load a tile of d values for a given s into shared memory, then process s? Let&#x27;s explore:
+
+We can tile over s. For each s, we load x[b, :, s] into shared memory. Since d=4096, that&#x27;s 4096*4=16KB per block. That&#x27;s small. We can have blocks of 128 threads load 4096 floats in 32 iterations (each thread loads 32 floats). While loading, accesses are strided, but maybe the L2 cache can handle it. Then once in shared memory, we can do a tree reduction (or per-thread scan) to find argmax. But we need argmax for many s. If we process s sequentially in outer loop, then for each s we read a column of 4096 floats into smem. Memory access per s: 4096 floats strided by 4095. That&#x27;s one big non-coalesced read per s. But 4096 floats per s is 16KB. With 4095 s values, total reads are 64MB per batch. For 128 batches, total is 8GB. So regardless of coalescing, total data moved is the same. The question is whether the GPU can sustain bandwidth with strided 16KB reads.
+
+Actually, reading a column of 4096 floats with stride 4095 floats: each float is 4 bytes, stride 16380 bytes. A warp of 32 threads reading consecutive d would have thread i reading address base + i*16380. That&#x27;s not coalesced: each warp issues 32 separate transactions. However, the L2 cache on H100 is massive and may be able to service these from cache lines that were previously fetched? Not really, because each access is to a different cache line (since stride &gt; 128 bytes). So each warp reading a column would issue 32 32-byte transactions (or 128-byte?) Actually, each thread accesses a 4-byte element at offset i*16380. The L1/L2 cache line is 128 bytes. So each thread&#x27;s access falls into a distinct cache line. The warp would require 32 cache lines. So for a column of 4096 elements, we need 4096 cache lines * 128 bytes = 524KB of cache line data, but only 16KB is useful. That&#x27;s a waste factor of 32x. That would severely limit effective bandwidth. However, the memory controller might do some coalescing? No, with such a large stride, coalescing is impossible.
+
+Thus, the column-wise approach is bad. The row-wise approach (processing s contiguously) is much better because it uses contiguous memory. So we should stick with processing contiguous s per block.
+
+Given that, each thread handling one s with scalar loads is already fetching contiguous 4-byte chunks across the warp. The memory controller will coalesce these into few transactions. For a warp of 32 threads reading 32 contiguous floats (128 bytes), that&#x27;s exactly 1 or 2 128-byte cache lines. So it&#x27;s very efficient.
+
+But can we vectorize? If each thread processes 4 s values, then a warp of 32 threads reads 128 contiguous floats (512 bytes). That&#x27;s 4 cache lines. Still fine. The benefit is fewer instructions per load: instead of 32 scalar load instructions, we have 32 vector load instructions (float4). Actually each thread does one float4 load. The hardware still issues 32 memory instructions, but each loads 4 floats. The memory unit might handle them more efficiently. However, on H100, scalar loads are already quite efficient.
+
+I think a per-thread scalar approach with block size 256 or 512 will be very good.
+
+Let&#x27;s consider occupancy. The kernel does very little computation (just a comparison per load). The bottleneck is memory bandwidth. Occupancy may not matter much, but we want enough warps to hide latency. With block size 256, each block has 8 warps. If we have 128*16 = 2048 blocks, total warps = 16384. H100 has many SMs (~132). Each SM can have up to 32 blocks and 2048 threads. So occupancy is fine.
+
+Loop unrolling: Since dim1=4096 is constant? Actually dim is passed as an argument, but at runtime it&#x27;s known. The compiler may unroll small constant loops, but not 4096. We can add `#pragma unroll 4` on the inner loop to unroll 4 iterations at a time. That can help instruction scheduling. But since we are memory bound, unrolling may not help much. However, it might allow the compiler to schedule loads and comparisons better, overlapping memory latency.
+
+We can also do software pipelining: read next value while comparing current? Not easy in a simple loop.
+
+Another idea: The input is random uniform. Comparing floats is cheap. Maybe we can reduce memory traffic by using `__half` or `bf16`? No, input is fp32 and we need exact fp32 semantics.
+
+What if we process multiple s values per thread by reading a float4? Let&#x27;s calculate arithmetic: Each thread does 4096 loads and 4096 comparisons. With float4, each thread does 1024 float4 loads and 4096 comparisons. That reduces the number of load instructions by 4x. Since loads are expensive and we&#x27;re memory bound but instruction-limited? Actually, on H100, memory subsystems are independent of ALUs. Fewer load instructions might not increase throughput, but it could reduce register pressure and thread instruction overhead. But scalar loads are likely fine.
+
+Another improvement: Since the output is int64, writing 64-bit per thread might be slower than 32-bit, but we need int64. We can write `int64_t`.
+
+We can also consider using `uint32_t` for indices if dim &lt; 2^32, but PyTorch expects int64 for argmax. We can cast.
+
+Let&#x27;s write a kernel with scalar loads, blockDim = 256, grid = (batch, ceil(seq/blockDim.x)).
+
+But wait: The input shape is [128, 4096, 4095]. The memory access for threadIdx.x mapping to s is contiguous for each d. So for a given d, block reads x[b, d, s_block_start + threadIdx.x]. With blockDim.x=256, warp0 reads s=0..31, warp1 reads s=32..63, etc. This is perfect.
+
+Let&#x27;s also consider using `__ldg` for read-only data. That uses the texture cache and can improve performance for read-only data, especially with coalesced patterns.
+
+Implementation details:
+- Define `argmax_kernel` as `__global__`.
+- It takes `const float* __restrict__ input`, `int64_t* __restrict__ output`, and dimensions `batch`, `dim`, `seq`.
+- The kernel computes the argmax over dim.
+
+Potential issue: The input pointer may not be aligned to 16 bytes for float4. But we are using scalar loads, so alignment is fine.
+
+What if dim is not 1 but could be any dimension? The constructor takes `dim: int`. The `get_inputs` uses `dim=1`. But the model should work for any dim. However, the prompt says &quot;Accept the same constructor arguments as Model&quot; and &quot;Produce numerically equivalent outputs&quot;. So our kernel must support arbitrary dim. We can write a general kernel that handles any dim by computing appropriate strides and loop. But for performance, we could specialize for common cases (e.g., dim=-1, dim=1, etc.). But probably dim=1 is the benchmark.
+
+Wait, if dim can be any dimension, we need to handle arbitrary dim. But the `get_init_inputs` returns `[1]`, so dim=1. We could optimize for dim=1 but also handle other dims generically. For simplicity and speed, let&#x27;s write a kernel that works for any dim using TensorIterator-like logic but with specific optimizations for contiguous cases.
+
+But CUDA kernel specialization over dim at runtime is tricky. We could write a single kernel that uses strides. We can compute the offset for each element using pointer arithmetic based on strides.
+
+Specifically, for a 3D tensor with strides (s0, s1, s2), and we reduce over dimension `dim`, then for a given (b, s) in the output (where the output corresponds to all dims except dim), we need to iterate over d from 0 to size[dim]-1 and compute address: base + b*stride[0] + d*stride[dim] + s*stride[other]. But mapping output coordinates to input is nontrivial if dim is arbitrary.
+
+Simpler: Since the reference is 3D and dim is one of {0,1,2}, we can handle each case. But the model signature just says `dim: int`. In practice, the benchmark will use dim=1. We can implement a generic version that works for any dim, or we can assume dim=1 and write a fast kernel. But we need correctness for any dim. Let&#x27;s write a generic kernel that handles any dim by precomputing the strides and using them.
+
+Given input shape (N, C, D) and dim, we can treat it as a 3D tensor. The output shape is 2D. We can linearize the output index `out_idx = blockIdx.x * blockDim.x + threadIdx.x` (or 2D grid). For each output index, we compute the corresponding input base pointer by expanding the output index into coordinates excluding `dim`. Then loop over `dim` offset.
+
+But that would involve integer division/modulo per thread, which is expensive. However, we can precompute on the host and pass a 2D or 3D grid where block indices map directly to coordinates.
+
+Better: Let&#x27;s use a 1D grid of thread blocks where each block handles a contiguous chunk of output elements. Within a block, each thread handles one or more output elements. For each output element, we compute its coordinates using division. But for 3D tensor, it&#x27;s just 2 divisions per thread. That may be okay.
+
+However, to maximize memory coalescing, we want threads in a warp to access contiguous memory. If each thread handles a different output element, and we loop over the reduction dimension, then for a given step in the reduction loop, the threads access memory at offsets that depend on their output coordinates. If the reduction dimension is the middle one (dim=1), and the output coordinates are (b, s), then as thread processes (b0,s0), (b1,s1), etc., adjacent threads may have different b or s. If we assign output linearly, thread i gets output index i. For output shape [128, 4095], linear index maps to `(b = idx / 4095, s = idx % 4095)`. Adjacent threads have adjacent `s` until they cross a boundary. Specifically, within a warp of 32 threads, if `s` wraps around at 4095, but 4095 is not a multiple of 32, so some warp may have threads crossing the boundary, leading to different `b`. Then for a given `d`, the addresses are `base + b*stride0 + d*stride1 + s*stride2`. If `b` changes, the address jumps by `stride0` (4096*4095*4 ≈ 64MB). That&#x27;s terrible for coalescing.
+
+Thus, a 1D linear mapping of output to threads is bad for dim=1 if not carefully tiled. We need to ensure threads in a warp have the same `b` and contiguous `s`. That means our grid should be 2D: blockIdx.x = b, blockIdx.y = tile of s. We already have that design.
+
+Generalizing to arbitrary dim:
+- If dim=0: reduce over batch. Output shape is [4096, 4095]. We want threads in a warp to have same d and contiguous s. So grid = (d, tile_s) and threads have contiguous s. That works similarly: b loops.
+- If dim=1: reduce over dim1. Output shape [batch, seq]. Threads in warp same batch, contiguous seq. Grid = (batch, tile_seq). Loops over dim1.
+- If dim=2: reduce over seq. Output shape [batch, dim1]. Threads in warp same batch, contiguous dim1. Grid = (batch, tile_dim1). Loops over seq.
+
+So the general approach: The reduction dimension is the one we loop over. The other two are the outer and inner dimensions. We tile the inner dimension across threads (so contiguous access). The outer dimension is blockIdx.x. The inner dimension is tiled in blockIdx.y.
+
+We can implement three kernels (one for each dim) selected at runtime. Or a single generic kernel where we pass strides and which dimension is the reduction dimension, and compute offsets accordingly. Since there are only 3 dims, we can template the kernel on `dim` to allow the compiler to optimize loops. Or we can have a single kernel that takes dim as runtime parameter and uses it to compute pointer offsets. The overhead of a switch is negligible.
+
+Let&#x27;s write a generic kernel:
+
+We have 3D tensor with shape (size0, size1, size2), strides (stride0, stride1, stride2). The reduction dimension is `rdim`. The output dimensions are the other two: `dimA` and `dimB`. We can map blockIdx.x to the first non-reduction dimension (let&#x27;s call it dim0_out) and blockIdx.y to tiles of the second non-reduction dimension (dim1_out). Within a block, threadIdx.x maps to contiguous indices in dim1_out.
+
+So we need to know which of the original dims corresponds to dimA and dimB. Let&#x27;s define:
+- If rdim == 0, then dimA = 1 (grid.x), dimB = 2 (block tile).
+- If rdim == 1, then dimA = 0 (grid.x), dimB = 2.
+- If rdim == 2, then dimA = 0, dimB = 1.
+
+In the kernel:
+```
+int idxA = blockIdx.x;
+int idxB = blockIdx.y * blockDim.x + threadIdx.x;
+if (idxB &gt;= sizeB) return;
+
+float max_val;
+int max_idx;
+
+// compute base pointer for idxA, idxB
+ptr = input + idxA * strideA + idxB * strideB;
+
+// loop over rdim
+for (int r = 0; r &lt; sizeR; ++r) {
+    float val = ptr[r * strideR];
+    // compare
+}
+```
+
+This is generic and simple. Since the tensor is contiguous, strides are known but we can pass them.
+
+Now, for the specific case dim=1, grid.x=batch=128, grid.y=ceil(4095/256)=16. Block size=256. Memory access is coalesced.
+
+For dim=0, grid.x=4096, grid.y=ceil(4095/256)=16. Each warp reads contiguous s for fixed d. But wait, if rdim=0, we reduce over batch. The base pointer for thread is `d * stride1 + s * stride2`. Looping over batch r: `ptr = base + r * stride0`. For fixed d and s, consecutive r values are separated by stride0 = size1*size2*4 = 4096*4095*4 = ~64MB. That&#x27;s strided. Within a warp, threads have same d and contiguous s. For a given r, the warp reads `base + r*stride0 + s*stride2` for s contiguous. Since s varies, stride2=1, so contiguous. So loads are coalesced across s! Yes! Because the contiguous dimension is the last one (s). So the pattern is similar: for each r, the block reads a row of contiguous floats. So coalescing is perfect.
+
+For dim=2, reduce over s (last dim). Output dims are batch and d. Grid.x=batch=128, grid.y=ceil(4096/256)=16. Threads have contiguous d. Base pointer = b*stride0 + d*stride1. Loop over r (s): `ptr = base + r * stride2`. Since stride2 = 1, consecutive r values are contiguous in memory for each thread. But within a warp, threads have different d (contiguous), so for a given r, warp reads `x[b, d_contiguous, r]`. Are these contiguous? Offsets: `b*stride0 + d*stride1 + r*stride2`. Since stride1 = size2 = 4095, and stride2=1. For fixed b,r, varying d gives offsets differing by 4095 floats (~16KB). That&#x27;s strided! So for dim=2, this generic tiling leads to strided access.
+
+Wait, check: rdim=2, dimA=0 (batch), dimB=1 (dim1). Grid.x=batch, blockIdx.y tiles dim1. threadIdx.x maps to contiguous d. For a given loop index r (s), each thread reads x[b, d, r]. Threads in warp have d = start + 0..31. Offset difference between d and d+1 is stride1 = size2 = 4095 floats. That&#x27;s a large stride. So memory accesses are not coalesced.
+
+So the generic tiling works well when the contiguous dimension (dim2, stride2=1) is the one tiled across threads. That means dimB must be the last dimension (dim2). In our mapping:
+- rdim=0 =&gt; dimB=2 (last) -&gt; good.
+- rdim=1 =&gt; dimB=2 (last) -&gt; good.
+- rdim=2 =&gt; dimB=1 (not last) -&gt; bad.
+
+To handle dim=2 efficiently, we should tile the contiguous dimension across threads. That means we need a different mapping: When reducing over dim2, the output dimensions are dim0 and dim1. The contiguous dimension in the output is not relevant; what matters is the innermost dimension of the input (dim2) is the reduction dimension. For each output element (b, d), we need to read x[b, d, :] which is contiguous in memory (stride2=1). So we could assign each thread to one (b,d) and have it loop contiguously over s. Then threads in a warp would have different (b,d), so for a given s, warp reads x[b0, d0, s], x[b1, d1, s], etc. Offsets differ by stride0 or stride1. Are they contiguous? No: (b,d) are not contiguous in memory. Adjacent output elements linearized as `b*size1 + d`. For linear idx `i` and `i+1`, if they are in the same batch, d differs by 1, so offset differs by stride1 = size2 = 4095 floats (16KB). If they cross batch boundary, offset jumps by stride0 - (size1-1)*stride1 = size1*size2 - (size1-1)*size2 = size2 = 4095 floats. Wait, linear index `i = b*size1 + d`. `i+1` has either d+1 (same b) or b+1, d=0. Offset difference:
+- Same b: stride1 = size2 = 4095 floats.
+- Next b: offset = (b+1)*stride0 + 0*stride1 = (b+1)*size1*size2. Previous offset = b*size1*size2 + (size1-1)*size2 = (b*size1 + size1 - 1)*size2 = (b+1)*size1*size2 - size2. Difference = size2 floats.
+
+So adjacent output elements are separated by 4095 floats in memory. That&#x27;s not contiguous. So if we assign one thread per output element and loop over s contiguously, each thread makes contiguous reads (good for L1 cache), but across the warp, at any given s, the accesses are strided by 4095 floats. This is exactly the same as the column access pattern but transposed: each thread reads a contiguous vector, but warp reads strided vectors. On GPUs, this is also fine because each thread&#x27;s contiguous accesses can be coalesced within that thread? No, coalescing is across threads in a warp. A warp&#x27;s accesses at a given instruction are to different addresses. If they are strided by 16KB, that&#x27;s 32 separate cache lines. However, if the loop is over s, the warp executes `load x[b0,d0,s]` for all threads, then `load x[b0,d0,s+1]`? Actually threads diverge? No, all threads execute the same instruction `load from ptr + s*stride2`. Since stride2=1, but ptr differs per thread. So the addresses differ by multiples of stride1. That&#x27;s not coalesced.
+
+But there is a better way for dim=2: we can tile the contiguous reduction dimension across threads within a warp. For example, for each output element (b,d), the reduction dimension s is contiguous. We could assign a warp to a single (b,d) and have the 32 threads in the warp read consecutive s values. That is, thread i reads x[b, d, s0 + i], x[b, d, s0 + i + 32], etc. Then within the warp, for a given chunk, threads read contiguous s: offsets are ptr + s0 + i. That&#x27;s coalesced! Then the warp does a warp-level reduction to find the max and index. This is analogous to the first approach (block per output element) but using warp-level parallelism for the contiguous reduction dimension.
+
+General solution: We could implement a kernel that, for any dim, assigns a block (or warp) per output element, and threads in the block read strided elements. But if the reduction dimension is contiguous (stride=1), we can have threads read consecutive elements along it for coalescing. If the reduction dimension is not contiguous, coalescing is bad. However, for dim=1, the reduction dimension has stride = dim2 = 4095, which is not contiguous. The non-reduction dimensions are batch (stride = dim1*dim2) and seq (stride=1). If we tile seq across threads, then for each d, threads read contiguous seq, which is coalesced. So the key is: tile the dimension with stride=1 across threads, and loop over the reduction dimension.
+
+So a general strategy: Find which non-reduction dimension has stride 1. Tile that dimension across threads. Loop over the reduction dimension. This ensures that within each iteration of the loop, the warp reads contiguous memory.
+
+In a 3D contiguous tensor, the last dimension always has stride 1. So:
+- If rdim != last_dim: tile the last_dim across threads. Good.
+- If rdim == last_dim: there is no non-reduction dimension with stride 1. In this case, we can tile the reduction dimension across threads (i.e., each thread reads a chunk of the contiguous reduction dimension), and have each thread/warp handle one output element. Then memory access is coalesced because threads read contiguous elements along the reduction dimension.
+
+Thus we need two kernel variants:
+1. **Outer reduction**: reduction dimension is not the last. Tile the last dimension across threads. Loop over rdim.
+2. **Inner reduction**: reduction dimension is the last. Assign one block (or warp) per output element. Tile the reduction dimension across threads.
+
+We can also handle arbitrary dimensions (e.g., transpose) by reading strides.
+
+But for the benchmark (dim=1), variant 1 suffices. However, we need generic correctness. Let&#x27;s implement both.
+
+Actually, we can also handle dim=2 by variant 2. For dim=0, variant 1 works.
+
+Let&#x27;s formalize for contiguous 3D tensor (but we can pass strides to handle non-contiguous too, though not required). We will write a kernel for each case.
+
+Case A (rdim != ndim-1, i.e., rdim=0 or 1):
+- Output shape: two dims.
+- We identify the last dimension as the tiled dimension.
+- Map: blockIdx.x -&gt; coordinate of the first non-rdim, non-last dim (call it dimA). blockIdx.y -&gt; tile of last dim. threadIdx.x -&gt; index in last dim.
+- Loop over rdim.
+- This works because for each step, threads read contiguous elements along last dim.
+
+Case B (rdim == ndim-1, i.e., rdim=2):
+- Output shape: two dims.
+- Map: blockIdx.x -&gt; coordinate of dimA (first non-rdim). blockIdx.y -&gt; tile of dimB (second non-rdim). Or linearize output into blocks.
+- Within block, threads cooperate to reduce over the last dim (contiguous).
+- For each output element, we can have a warp reduce a chunk of the reduction dim. But to maximize occupancy, we can have a block handle multiple output elements. For simplicity, each block handles a tile of output elements, and each warp handles one output element, or each thread handles a chunk of the reduction dimension for one output element and then does warp reduction.
+- Simpler: Each thread handles one output element and loops over the reduction dimension contiguously. Since each thread&#x27;s accesses are contiguous, it benefits from cache line reuse (each thread uses 100% of each 128B line). The downside is that within a warp, the accesses are strided. However, the memory controller can handle multiple concurrent threads. But effective bandwidth will be lower due to non-coalescing. Is it acceptable? For dim=2, the reduction dimension is 4095, which is small. Each thread reads 4095 floats = ~16KB. With 128*4096 = 524288 output elements. Total reads = 8GB. If effective bandwidth is say 1/4 of peak due to non-coalescing, it&#x27;d be ~4x slower. But PyTorch&#x27;s kernel may also suffer from this.
+
+Alternatively, we can do warp-level reduction for dim=2: assign one warp per output element (b,d). The 32 threads in the warp read consecutive s values. Offsets: base + s0 + lane. Since base differs per warp, but within a warp, addresses are contiguous. This is perfectly coalesced. Each warp reduces over s in chunks of 32. Then uses warp shuffles to find the max across the warp. After processing all s, the warp writes the result. This is very efficient.
+- Block size: 128 threads = 4 warps. Each block handles 4 output elements.
+- Grid: total output elements = batch * dim1 = 128 * 4096 = 524288. Number of warps needed = 524288. Number of blocks = 524288 / 4 = 131072. That&#x27;s a lot of blocks, but each block does little work (reads 4095*4 floats = 64KB). The overhead of launching 131k blocks might be non-trivial but still okay on H100. Alternatively, we can increase block size to 256 (8 warps) to reduce block count to 65536. Or 512 (16 warps) -&gt; 32768. Block size 256 is good. 256 threads per block, 8 warps. Each block handles 8 output elements. Total blocks = 524288 / 8 = 65536. Each warp reads 4095 floats (16KB). Memory read per block = 128KB. 65536 blocks. This is fine.
+- This kernel will be very efficient for dim=2.
+
+But for the benchmark, dim=1 is the target. Let&#x27;s focus on writing a high-performance kernel for dim=1 (Case A). But we must also handle other dims. We can dispatch at runtime:
+- If dim == ndim - 1: use warp-per-output kernel.
+- Else: use tile-last-dim kernel.
+
+Let&#x27;s write the tile-last-dim kernel for dim != last.
+
+For convenience, we can assume input is 3D (since reference is 3D) but support general dims? The reference uses 3D inputs. The `forward` takes x of arbitrary rank. But `get_inputs` returns 3D. The `Model` docstring says &quot;specified dimension&quot;. Our `ModelNew` must work for any tensor rank? Actually `torch.argmax` works for any rank, but we can restrict to the test case. However, for correctness, we should support arbitrary rank if possible. But we can also assume 3D since that&#x27;s the only test case. Let&#x27;s write for general rank but with a generic kernel that handles up to some dimensions.
+
+Simpler: Write a generic kernel that works for any dim and any contiguous tensor up to 4D or so. But we can also just fall back to PyTorch for unsupported cases (e.g., if dim is not in {0,1,2} for a 3D tensor). However, we must not use try/except fallback in a way that counts as reward hacking. The rules say &quot;Do not use try/except fallbacks to the reference&quot;. But we can do an if-check and call the reference? That would still be a fallback to reference. Better to implement generically.
+
+Since the test only uses dim=1 on a 3D tensor, we can implement a specialized kernel for that case and fallback to torch.argmax for everything else. But is that allowed? The static checker might flag fallback to reference. It says: &quot;detects reward-hacking patterns (try/except fallbacks to the reference, timing-function patches, lazy-tensor tricks, threading injection, etc.)&quot;. It specifically mentions try/except fallbacks. An if-branch calling torch.argmax might not be flagged, but it&#x27;s still a fallback. However, for unsupported cases, it might be okay if the benchmark only tests the supported case. But for safety, let&#x27;s implement generic support.
+
+Generic support with strides:
+We have an input tensor `x`. We can get its ndim, shape, strides, and dim. In the host wrapper, we compute:
+- `rdim = dim` if dim &gt;= 0 else dim + ndim.
+- We need to launch a kernel.
+
+Since the kernel must be compiled with fixed signatures, we can pass a pointer, ndim, shape array, stride array, rdim. But dynamic shape arrays in CUDA require passing as fixed-size arrays or using constant memory. We can pass up to say 8 dims as separate ints or arrays. Simpler: we can write a kernel that takes `int64_t* shape`, `int64_t* stride`, `int ndim`, `int rdim`. This is possible but the indexing overhead might be high.
+
+Alternative: In Python, we can compute the linear index for each output element and then call a kernel that operates on flattened input and output with appropriate strides. But the coalescing pattern depends on which dimension is the contiguous one.
+
+Given the simplicity of the reference test (3D, dim=1), I think it&#x27;s acceptable to write a kernel optimized for the 3D case and handle any dim for 3D tensors. For higher dimensions, we can fallback to torch.argmax only after checking ndim &gt; 3. But the static checker may not object to that. However, I want to avoid any fallback to reference.
+
+Better approach: Write a generic kernel that works for any contiguous tensor and any dim, using pointer arithmetic computed from strides on the host. But since we need two different access patterns depending on whether rdim is the last dim, we can branch inside the kernel or have two kernels.
+
+Let&#x27;s write two kernels:
+1. `argmax_outer_kernel`: for rdim != last_dim. Threads tile the last dimension.
+2. `argmax_inner_kernel`: for rdim == last_dim. Warps tile the reduction dimension.
+
+Both kernels work for arbitrary ndim? The outer kernel needs to know the shape of the last dim and rdim. The inner kernel needs to know the shape of rdim and the output shape.
+
+If we flatten the tensor: For a contiguous tensor, the strides are determined by shape. For an arbitrary-rank tensor, we can compute the `batch_size` (product of dimensions before rdim) and `inner_size` (product of dimensions after rdim). Then the tensor can be viewed as 3D: [batch_size, reduce_size, inner_size]. Where:
+- batch_size = product of shape[0:rdim]
+- reduce_size = shape[rdim]
+- inner_size = product of shape[rdim+1:]
+
+This is a very useful trick! Any tensor reduction over `dim` can be reshaped (logically) into a 3D tensor [B, R, I], where B is the product of outer dimensions, R is the reduction dimension size, and I is the product of inner dimensions. Since the tensor is contiguous, the memory layout is exactly B blocks of R*I elements, each block being R rows of I contiguous elements. Specifically:
+- The original strides are such that inner dimensions are contiguous.
+- After flattening, the memory is still contiguous: offset = (b * R + r) * I + i.
+
+Wait, is that always true for a contiguous tensor? Let&#x27;s verify with an example: shape [A, B, C, D], rdim=1. Then B = A, R = B, I = C*D. The offset of element (a,b,c,d) is ((a * B + b) * C + c) * D + d = (a*B + b)*C*D + c*D + d = (a*B + b)*I + i where i = c*D + d. Yes. So the flattened 3D view is exactly contiguous with形状 (B, R, I). However, note that for rdim=0, B = 1? Actually B = product of shape before rdim = empty product = 1. R = shape[0]. I = product of shape[1:]. The offset of element (r, ...) is r * I + i. So it&#x27;s a 2D tensor of shape [R, I] but we treat B=1. That&#x27;s fine.
+
+For rdim=last_dim (e.g., shape [A,B,C], rdim=2), B = A*B, R = C, I = 1. The offset is (b * R + r) * 1 + i, but i=0 always. So it&#x27;s basically a 2D tensor [B, R].
+
+Thus, we can always reshape any contiguous tensor into a 3D [B, R, I] and apply our kernels. Great! This simplifies everything.
+
+So the host wrapper can compute:
+- batch = product of sizes before dim.
+- reduce = size[dim]
+- inner = product of sizes after dim.
+- Pass these to the kernel.
+
+Now, for the two kernels:
+
+**argmax_outer_kernel** (used when I &gt; 1, i.e., there is at least one inner dimension after rdim; note that if rdim is last dim, I=1, but we can also treat I=1 in this kernel, but then the contiguous dimension across threads has size 1, which means we have only 1 thread per block doing all the work, which is terrible. So we need the inner kernel when I is small and R is large, specifically when I=1 or maybe small. Actually the outer kernel works when we tile across I. If I is large, we have many threads. If I=1, we have 1 thread per output, which is okay but not coalesced across the warp. So we should switch to the inner kernel when I is small. The threshold could be I == 1. But consider I=2: blockDim.x=256, only 2 threads active per block (since each thread handles a different i), 254 idle. That&#x27;s bad. We should use the inner kernel when I &lt; some threshold (e.g., 32). Actually, we can I think use the inner kernel whenever we want to tile across the reduction dimension (R). The inner kernel is specifically designed for coalescing by having threads read contiguous elements along R (since R is contiguous in memory when I=1? Wait, in the flattened view [B, R, I], when I &gt; 1, elements in R are separated by stride = I. For a given (b, i), elements r and r+1 are at offset base + r*I + i and base + (r+1)*I + i. Stride = I. If I &gt; 1, the reduction dimension is strided. The contiguous dimension is I. So tiling across I is coalesced. If I = 1, the reduction dimension has stride 1 (contiguous). Then tiling across R is coalesced. So the switch should be based on whether I == 1 (rdim is last dim) or I &gt; 1.
+
+But what if the tensor is non-contiguous? Then the flattened 3D view may not have simple strides. However, we only guarantee correctness; performance is for the benchmark. We&#x27;ll assume contiguous and compute using the flattened 3D view with multipliers.
+
+Wait, if the input is not contiguous but has e.g., a transpose, the flattened 3D view [B, R, I] still describes the logical grouping, but the physical memory layout may be such that the inner dimension I is not physically contiguous. However, for a PyTorch tensor, dimensions after rdim may not be contiguous as a group if there are intervening dimensions with stride not monotonic. But for the benchmark, inputs are contiguous.
+
+To be safe, we can compute the actual strides for the flattened dimensions:
+- stride_batch = x.stride(0) if rdim &gt; 0 else product of something? Actually for contiguous, stride of the outermost flattened dimension is the product of all inner sizes. But for non-contiguous, we need the actual stride of the first outer dimension, and the product of sizes between that and rdim? This gets complicated.
+
+Simpler: Just use `x.stride(dim)` for the reduction dimension and `x.stride(ndim-1)` for the innermost dimension. If `x.stride(ndim-1) == 1`, then the innermost dimension is contiguous. If additionally `dim != ndim-1`, then there is at least one inner dimension that is contiguous; we can tile across that inner dimension (which may have size &gt;1). This works if the tensor is contiguous in the last dimension. For arbitrary strides, we could fallback to torch.argmax. But again, the benchmark uses contiguous.
+
+So let&#x27;s assume contiguous and use the flattened [B, R, I] view with simple offset = ((b * R) + r) * I + i.
+
+Let&#x27;s define host wrapper in C++:
+
+```cpp
+torch::Tensor argmax_cuda(torch::Tensor x, int64_t dim) {
+    auto ndim = x.dim();
+    dim = dim &lt; 0 ? dim + ndim : dim;
+    auto sizes = x.sizes();
+    int64_t batch = 1, reduce = sizes[dim], inner = 1;
+    for (int i = 0; i &lt; dim; ++i) batch *= sizes[i];
+    for (int i = dim+1; i &lt; ndim; ++i) inner *= sizes[i];
+    
+    auto out_sizes = sizes.vec();
+    out_sizes.erase(out_sizes.begin() + dim);
+    auto out = torch::empty(out_sizes, torch::dtype(torch::kInt64).device(x.device()));
+    
+    const float* x_ptr = x.data_ptr&lt;float&gt;();
+    int64_t* out_ptr = out.data_ptr&lt;int64_t&gt;();
+    
+    if (inner &gt; 1) {
+        // use outer kernel
+        const int threads = 256;
+        int blocks_y = (inner + threads - 1) / threads;
+        dim3 grid(batch, blocks_y);
+        argmax_outer_kernel&lt;&lt;&lt;grid, threads&gt;&gt;&gt;(x_ptr, out_ptr, batch, reduce, inner);
+    } else {
+        // use inner kernel
+        // each warp handles one output element (b).
+        // block size = 256, each block handles 8 outputs.
+        const int threads = 256;
+        int total_outputs = batch; // since inner=1
+        int blocks = (total_outputs + threads/32 - 1) / (threads/32);
+        argmax_inner_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(x_ptr, out_ptr, batch, reduce);
+    }
+    return out;
+}
+```
+
+Now, implement the kernels.
+
+**argmax_outer_kernel**:
+```
+__global__ void argmax_outer_kernel(const float* __restrict__ x, int64_t* __restrict__ out,
+                                    int64_t batch, int64_t reduce, int64_t inner) {
+    int64_t b = blockIdx.x;
+    int64_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (b &gt;= batch || i &gt;= inner) return;
+    
+    int64_t base = (b * reduce) * inner + i;
+    float max_val = x[base];
+    int64_t max_idx = 0;
+    
+    for (int64_t r = 1; r &lt; reduce; ++r) {
+        float val = x[base + r * inner];
+        if (val &gt; max_val) {
+            max_val = val;
+            max_idx = r;
+        }
+    }
+    // compute output index
+    int64_t out_idx = b * inner + i;
+    out[out_idx] = max_idx;
+}
+```
+
+Wait, `base + r * inner` because offset = ((b * reduce) + r) * inner + i = b*reduce*inner + r*inner + i. Since `base = b*reduce*inner + i`, then `base + r*inner` is correct.
+
+Memory access pattern: For fixed b and r, threads with varying i read `base + r*inner + i`. Since i is contiguous, this is coalesced. For a warp of 32 threads, i differs by 1, so addresses differ by 1 float. Perfect.
+
+**argmax_inner_kernel**:
+When inner == 1, output shape is [batch] (1D). Each output element corresponds to one b. We want warps to read contiguous elements along r (since inner=1, x[b, r] are contiguous). Wait, offset = ((b * reduce) + r) * 1 + 0 = b*reduce + r. Yes, contiguous in r.
+
+So each warp handles one b. Warp size = 32. Each thread in warp reads a chunk of r values, tracking local max. Then warp-level reduction (shfl) to find global max. Finally thread 0 writes.
+
+But if reduce = 4096, each warp reads 4096 floats. With 32 threads, each thread reads 128 floats. That&#x27;s okay. But we can also have each block handle multiple b&#x27;s to amortize block overhead.
+
+Let&#x27;s design:
+- Block size: 256 threads = 8 warps.
+- Each warp handles one b.
+- So each block handles 8 b&#x27;s.
+- Grid: (batch + 8 - 1) / 8.
+
+Within a warp:
+- lane = threadIdx.x % 32
+- warp_id = threadIdx.x / 32
+- b = blockIdx.x * 8 + warp_id
+- base = b * reduce
+- Each thread loops over r = lane; r &lt; reduce; r += 32:
+    val = x[base + r]
+    update local max.
+- Then warp reduce using shuffle to find warp-wide max and its index.
+- Thread 0 writes out[b] = max_idx.
+
+This is nicely coalesced: within each iteration of r, warp reads 32 contiguous floats.
+
+But what if batch = 128 and reduce = 4096? Total outputs = 128. Blocks = 16. Each block 256 threads, 8 warps. 16*8 = 128 warps. Total warps = 128. That&#x27;s very few warps! Occupancy would be terrible. Wait, batch = 128, reduce = 4096. With 8 warps per block, 128/8 = 16 blocks. Only 16 blocks. On an H100 with 132 SMs, each SM can run 1 block, so many SMs idle. That&#x27;s bad. We need more parallelism.
+
+We can increase the number of outputs per block? That reduces block count further. No, we need more blocks, which means fewer warps per block or more warps per output? We could assign one thread per output, not one warp. But then coalescing across warp is bad. However, we can assign a block to one b, and threads in the block read contiguous r values. Block size 256, each block handles one b. Threads read x[b, r] where r = threadIdx.x, threadIdx.x + blockDim.x, etc. For a given chunk, threads read contiguous r. This is coalesced. After reading all r, the block does a block-level reduction (shared memory) to find the max and index. Then thread 0 writes.
+- Block size 256.
+- Number of blocks = batch = 128.
+- Each block 256 threads, 8 warps. 128 blocks. Total threads = 32768. Total warps = 1024. That&#x27;s okay. Occupancy: 128 blocks on 132 SMs, good.
+- Each block reads 4096 floats. With 256 threads, each thread reads 16 floats (4096/256=16). Loop of 16 iterations.
+- After reading, reduction in shared memory: 256 elements -&gt; 128 -&gt; 64 -&gt; 32 -&gt; warp shuffle -&gt; 1.
+- This is efficient.
+
+Let&#x27;s write this version. It also works for any reduce size.
+
+```
+__global__ void argmax_inner_kernel(const float* __restrict__ x, int64_t* __restrict__ out,
+                                    int64_t batch, int64_t reduce) {
+    int64_t b = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    
+    extern __shared__ float svals[];
+    int64_t* sidxs = (int64_t*)(svals + blockSize);
+    
+    float max_val = -1e30f;
+    int64_t max_idx = 0;
+    
+    for (int64_t r = tid; r &lt; reduce; r += blockSize) {
+        float val = x[b * reduce + r];
+        if (val &gt; max_val) {
+            max_val = val;
+            max_idx = r;
+        }
+    }
+    
+    svals[tid] = max_val;
+    sidxs[tid] = max_idx;
+    __syncthreads();
+    
+    // block reduction
+    for (int s = blockSize/2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            if (svals[tid + s] &gt; svals[tid]) {
+                svals[tid] = svals[tid + s];
+                sidxs[tid] = sidxs[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        out[b] = sidxs[0];
+    }
+}
+```
+
+Shared memory size: for blockSize=256, need 256 floats + 256 int64 = 1024 + 2048 = 3072 bytes. Very small.
+
+But wait, if `batch = 128`, `blockSize = 256`, grid = 128 blocks. Each block uses 3072 bytes of smem. Total smem = 128*3KB = 384KB, well within limits.
+
+However, we need to be careful: if `batch &gt; 2^31-1`, blockIdx.x is int, but gridDim.x is limited. For our case it&#x27;s fine.
+
+But what about when inner &gt; 1 but small, like inner = 2 or 4? The outer kernel would launch with blockDim.x=256, but only 2 or 4 threads do work. That is inefficient. We should perhaps branch such that:
+- If inner &gt;= 256: use outer kernel with block size 256.
+- If inner &lt; 256 but &gt; 1: we can still use outer kernel with block size = inner (or next power of 2). But block size can vary.
+- If inner == 1: use inner kernel.
+
+But for simplicity, we can set block size to `min(inner, 256)` for the outer kernel. However, `blockDim.x` must be compile-time constant for shared memory? No, we can pass dynamic shared memory. But our outer kernel does not use shared memory.
+
+Wait, the outer kernel is very simple; each thread works independently. So we can use a fixed block size like 256 or 512. If inner &lt; block size, many threads are idle. That&#x27;s okay but not ideal. For inner=2, we&#x27;d have 2 active threads per block. With grid(batch, 1), total active threads = batch*2 = 256. With batch=128, that&#x27;s very few threads. We could improve by having each thread handle multiple i values (coarsening). But the benchmark likely has inner=4095, so it&#x27;s fine.
+
+Given the test case inner=4095 (dim1=4096, dim2=4095, dim=1, so inner=4095), we are good.
+
+Let&#x27;s think about the outer kernel for our benchmark:
+- batch = 128
+- reduce = 4096
+- inner = 4095
+- block size = 256
+- grid = (128, ceil(4095/256)=16)
+- Each thread loops over reduce=4096. Loads are coalesced.
+- Total threads = 128*16*256 = 524,288 threads. This matches the number of output elements (128*4095=524,160). So almost one thread per output. A few threads in last block are idle.
+- Each thread does 4096 scalar loads + 4096 comparisons.
+- Total loads = 524,160 * 4096 ≈ 2.147e9 loads. Each load 4 bytes.
+- Since loads are coalesced, memory bandwidth should be high.
+
+Can we make this faster by vectorizing loads? For the outer kernel, each thread loads `x[base + r * inner + i]`. For a given r, threads in a warp have consecutive i. So a warp reads 32 consecutive floats. We can replace this with a float4 load if we have each thread load 4 consecutive i&#x27;s. Let&#x27;s design a vectorized outer kernel.
+
+Vectorized outer kernel:
+- Each thread handles 4 consecutive i values.
+- blockDim.x = 64 (or 128). If blockDim.x=64, each block covers 64*4=256 i values.
+- grid.y = ceil(inner / 256) = ceil(4095/256) = 16.
+- Total blocks = 128*16 = 2048. Each block 64 threads.
+- Total warps = 2048*2 = 4096 warps.
+- Each thread loops over r from 0 to reduce-1, and for each r loads 4 floats: `x[base + r*inner + i0]`, `x[base + r*inner + i0+1]`, etc.
+- However, `base + r*inner + i0` for thread `tid` is `b*reduce*inner + r*inner + (block_start + tid*4)`. If we load `float4` from `x + base + r*inner + block_start + tid*4`, the addresses are aligned if `block_start + tid*4` is multiple of 4. `block_start = blockIdx.y * 256`, which is multiple of 4. So yes, aligned. Then threads in a warp (tid=0..31) load float4s covering 128 consecutive floats. That is extremely coalesced. The memory controller can fetch 128 bytes per transaction? Actually float4 is 16 bytes; 32 threads load 512 bytes. H100&#x27;s L1 cache line is 128 bytes, so that&#x27;s 4 cache lines. Perfect.
+
+This should reduce instruction count and improve throughput. We should consider doing this. But there is a subtlety: the last tile may have fewer than 256 elements, and the last thread&#x27;s float4 may go past the end. For tile=15 (blockIdx.y=15), block_start = 15*256 = 3840. tid ranges 0..63. i0 = 3840 + tid*4. For tid=63, i0=3840+252=4092. The float4 covers i=4092,4093,4094,4095. But inner=4095, so i=4095 is out of bounds. We need to avoid reading out of bounds. We can either use a conditional check per element or per float4. For the last tile, we can just check before loading the float4: if `i0+3 &lt; inner`, load float4; else load individual floats with checks. Or we can pad the input tensor? We cannot.
+
+Simpler: we can use a scalar outer kernel and see if it&#x27;s fast enough. The overhead of scalar loads may be negligible compared to memory bandwidth.
+
+But let&#x27;s think about instruction overhead. Each thread in scalar kernel does 4096 loads. With 524,160 threads active, total load instructions = 2.147e9. H100 can issue many instructions per cycle. But memory latency is the bottleneck. Vectorizing won&#x27;t change the total bytes moved, but might improve effective bandwidth by using fewer memory transactions? Actually, scalar loads of 32 contiguous floats by a warp already coalesce into a few 128-byte cache lines. So the number of transactions is similar. Vectorizing just groups the loads into fewer instructions. Since memory unit is separate, instruction throughput might not limit performance. So scalar may be fine.
+
+However, there is another optimization: using `__ldg` for loads. This can help. Let&#x27;s use `const float* __restrict__ x` and load with `__ldg(x + offset)`. `__ldg` goes through the read-only data cache (texture cache) and might have slightly different behavior. For coalesced loads, it&#x27;s usually fine but sometimes not beneficial. We can try both.
+
+Another optimization: We can unroll the loop partially with `#pragma unroll 4` to help the compiler schedule loads. But the compiler is smart.
+
+Another idea: Since reduce=4096, we can load the first value, then unroll the loop in a way that processes 2 or 4 elements per iteration. But again, memory bound.
+
+Let&#x27;s consider the inner kernel for completeness, but for benchmark we only need outer.
+
+Actually, let&#x27;s think about PyTorch&#x27;s performance. On H100, `torch.argmax` on a [128, 4096, 4095] tensor dim=1. How fast is it? Torch&#x27;s reduction uses CUB or custom kernels. For strided reduction (dim=1, stride=4095), CUB may be used. But CUB&#x27;s device reduce arguably works on contiguous segments. For strided, it might be less efficient. I suspect our kernel can be 2-3x faster.
+
+We should also consider using int32 for indices internally and converting to int64 at the end. This is fine.
+
+Let&#x27;s write the code.
+
+We need to write a complete Python file with `ModelNew`. Use `torch.utils.cpp_extension.load_inline` to compile the C++/CUDA code. The compile may take some time, but it&#x27;s okay.
+
+Let&#x27;s draft the code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+template &lt;typename scalar_t&gt;
+__global__ void argmax_outer_kernel(const scalar_t* __restrict__ x, long* __restrict__ out,
+                                    int64_t batch, int64_t reduce, int64_t inner) {
+    int64_t b = blockIdx.x;
+    int64_t i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (b &gt;= batch || i &gt;= inner) return;
+    
+    int64_t base = (b * reduce) * inner + i;
+    scalar_t max_val = __ldg(x + base);
+    int64_t max_idx = 0;
+    
+    #pragma unroll 4
+    for (int64_t r = 1; r &lt; reduce; ++r) {
+        scalar_t val = __ldg(x + base + r * inner);
+        if (val &gt; max_val) {
+            max_val = val;
+            max_idx = r;
+        }
+    }
+    out[b * inner + i] = max_idx;
+}
+
+template &lt;typename scalar_t&gt;
+__global__ void argmax_inner_kernel(const scalar_t* __restrict__ x, long* __restrict__ out,
+                                    int64_t batch, int64_t reduce) {
+    int64_t b = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    
+    extern __shared__ char smem[];
+    scalar_t* svals = reinterpret_cast&lt;scalar_t*&gt;(smem);
+    int64_t* sidxs = reinterpret_cast&lt;int64_t*&gt;(smem + blockSize * sizeof(scalar_t));
+    
+    scalar_t max_val = -1e30; // assume finite inputs
+    int64_t max_idx = 0;
+    
+    #pragma unroll 4
+    for (int64_t r = tid; r &lt; reduce; r += blockSize) {
+        scalar_t val = __ldg(x + b * reduce + r);
+        if (val &gt; max_val) {
+            max_val = val;
+            max_idx = r;
+        }
+    }
+    
+    svals[tid] = max_val;
+    sidxs[tid] = max_idx;
+    __syncthreads();
+    
+    for (int s = blockSize/2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            if (svals[tid + s] &gt; svals[tid]) {
+                svals[tid] = svals[tid + s];
+                sidxs[tid] = sidxs[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        out[b] = sidxs[0];
+    }
+}
+
+torch::Tensor argmax_cuda(torch::Tensor x, int64_t dim) {
+    int64_t ndim = x.dim();
+    if (dim &lt; 0) dim += ndim;
+    int64_t batch = 1, reduce = x.size(dim), inner = 1;
+    for (int i = 0; i &lt; dim; ++i) batch *= x.size(i);
+    for (int i = dim + 1; i &lt; ndim; ++i) inner *= x.size(i);
+    
+    std::vector&lt;int64_t&gt; out_sizes;
+    for (int i = 0; i &lt; ndim; ++i) {
+        if (i != dim) out_sizes.push_back(x.size(i));
+    }
+    auto out = torch::empty(out_sizes, x.options().dtype(torch::kInt64));
+    
+    const float* x_ptr = x.data_ptr&lt;float&gt;();
+    long* out_ptr = out.data_ptr&lt;long&gt;();
+    
+    if (inner &gt; 1) {
+        const int threads = 256;
+        int blocks_y = (inner + threads - 1) / threads;
+        argmax_outer_kernel&lt;float&gt;&lt;&lt;&lt;dim3(batch, blocks_y), threads&gt;&gt;&gt;(
+            x_ptr, out_ptr, batch, reduce, inner);
+    } else {
+        const int threads = 256;
+        int blocks = (batch + (threads/32) - 1) / (threads/32); // not used now
+        // Actually each block handles one b with threads=256
+        argmax_inner_kernel&lt;float&gt;&lt;&lt;&lt;batch, threads, threads * sizeof(float) + threads * sizeof(int64_t)&gt;&gt;&gt;(
+            x_ptr, out_ptr, batch, reduce);
+    }
+    return out;
+}
+&quot;&quot;&quot;
+
+# compile
+argmax_ext = load_inline(
+    name=&quot;argmax_ext&quot;,
+    cpp_sources=cpp_source,
+    functions=[&quot;argmax_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return argmax_ext.argmax_cuda(x, self.dim)
+```
+
+Wait, there may be issues:
+1. `__ldg` is only for `const` pointers with 4/8-byte types. `float` is fine. But we need to ensure the pointer is `const float* __restrict__`. Yes.
+2. `-1e30` as scalar_t may cause conversion warnings. Use `scalar_t(-1e30)` or better `std::numeric_limits&lt;scalar_t&gt;::lowest()`. Since we assume finite inputs, we could initialize with the first element. But in the inner kernel, we already loop from `tid`. However, if `tid &gt;= reduce`, the loop doesn&#x27;t execute, and `max_val` stays at lowest. Then in reduction, it might pick that. But if `blockSize &gt; reduce` (e.g., reduce=10, blockSize=256), many threads will have `max_val` = -inf. That&#x27;s okay as long as some thread has a real value, because `-inf &lt; real`. So we should initialize `max_val` to `-FLT_MAX` or `-1e30` (since fp32 random uniform [0,1) is well above -1e30). Better to initialize with `x[b*reduce + tid]` if tid &lt; reduce, else `ScalarType` lowest. But we can just compute the first value in the loop. Let&#x27;s restructure the inner kernel:
+
+```
+scalar_t max_val;
+int64_t max_idx;
+if (tid &lt; reduce) {
+    max_val = __ldg(x + b*reduce + tid);
+    max_idx = tid;
+} else {
+    max_val = -std::numeric_limits&lt;scalar_t&gt;::infinity();
+    max_idx = 0;
+}
+for (int64_t r = tid + blockSize; r &lt; reduce; r += blockSize) {
+    scalar_t val = __ldg(x + b*reduce + r);
+    if (val &gt; max_val) {
+        max_val = val;
+        max_idx = r;
+    }
+}
+```
+
+This avoids loading `r=0` separately and handles `reduce &lt; blockSize`.
+
+Similarly for outer kernel, we can restructure to not assume `reduce &gt;= 1`:
+
+```
+int64_t base = b * reduce * inner + i;
+scalar_t max_val = __ldg(x + base);
+int64_t max_idx = 0;
+for (int64_t r = 1; r &lt; reduce; ++r) ...
+```
+
+If reduce could be 0, torch.argmax throws error. We don&#x27;t need to handle it.
+
+For the outer kernel, using `__ldg` on strided addresses? The `base + r*inner` address for a fixed thread is strided by `inner`. `__ldg` works fine with any address.
+
+Now, about correctness with `float` and `__ldg`: `__ldg` is read-only and bypasses L1 for global loads? Actually it goes through the read-only data cache (texture/L1). It should be fine.
+
+Potential issue: The C++ code uses `long` for the output pointer. On Windows, `long` is 32-bit. In PyTorch CUDA, `long` is often 64-bit on Linux. To be safe, we should use `int64_t` instead of `long`. But the function signature for pybind may need to match. In the kernel, we can use `int64_t*`. In the host function, `out.data_ptr&lt;int64_t&gt;()` returns `int64_t*`. That&#x27;s fine. However, `out.data_ptr&lt;long&gt;()` may be same. I&#x27;ll use `int64_t`.
+
+Wait, in the C++ source, we have `long* __restrict__ out` in the kernel signature. Let&#x27;s change to `int64_t*`. If we compile with nvcc, `int64_t` is fine.
+
+Let&#x27;s also consider using `float` specifically, not template. The input is fp32. We can just write `const float*`. That simplifies.
+
+Also, `torch::Tensor argmax_cuda(torch::Tensor x, int64_t dim)`: We need to ensure `x` is on CUDA and contiguous? The reference `x` is CPU in `get_inputs` but likely moved to CUDA during benchmarking. The `forward` will be called with x on the model&#x27;s device. Our `ModelNew` doesn&#x27;t move x. The host wrapper doesn&#x27;t check device. We can assume it&#x27;s on CUDA.
+
+What if x is not contiguous? Our flattened view [B,R,I] assumes contiguous. If x is non-contiguous, `x.stride(ndim-1)` may not be 1, and our offset formula `b * reduce * inner + r * inner + i` would be wrong. We can handle this by checking `x.is_contiguous()`. If not contiguous, call `x.contiguous()`. But that creates a copy, which adds overhead. However, the benchmark input is contiguous. We can add `.contiguous()` to be safe. But if the input is already contiguous, `.contiguous()` is a no-op (returns itself).
+
+Alternatively, we can compute the actual strides. But for simplicity and safety, we can do:
+```
+if (!x.is_contiguous()) x = x.contiguous();
+```
+This ensures our kernel works. The copy overhead for non-contiguous is acceptable for correctness. But if the benchmark passes contiguous, it&#x27;s zero cost.
+
+Wait, `x = x.contiguous()` creates a new tensor; if x requires grad? It shouldn&#x27;t matter in forward.
+
+Let&#x27;s include `x = x.contiguous();` in the host wrapper. Actually, we can do it in Python before calling the C++ function. But in `ModelNew.forward`, we can do `x = x.contiguous()`. However, that might add a tiny overhead. Better to keep it in C++.
+
+Actually, the benchmark likely calls `model(x)` where x is already contiguous. So `x.is_contiguous()` is true.
+
+Let&#x27;s refine the C++ code to be robust.
+
+We also need to consider that the input may be fp16 or bf16? The problem says &quot;Produce numerically equivalent outputs at fp32 precision.&quot; The reference `torch.argmax` on fp32 input returns int64. The benchmark input is `torch.rand` which is fp32. So we only need fp32.
+
+Let&#x27;s write the complete code.
+
+One more optimization: In the outer kernel, each thread loops 4096 times. This is a long loop. We can use `#pragma unroll` with a factor. But the compiler can handle it.
+
+We should also consider using `__builtin_assume` or `__builtin_expect` to hint that `inner &gt; 1`, but not needed.
+
+Another idea: For the outer kernel, we can increase work per thread by having each thread process a chunk of `i` values (coarsening) rather than just one. But that would reduce the total number of threads. With `inner=4095`, block size 256, grid_y=16, total threads = 524,288. That&#x27;s already one thread per output element. Coarsening would reduce threads, potentially hurting occupancy. With 524k threads, occupancy is good. So one thread per output is fine.
+
+Let&#x27;s verify the grid dimensions:
+- batch = 128
+- inner = 4095
+- threads = 256
+- blocks_y = ceil(4095 / 256) = 16 (15.996 -&gt; 16)
+- grid = (128, 16)
+- Total active threads per block = 256, but in the last block (blockIdx.y=15), i ranges from 15*256=3840 to 3840+255=4095. Since inner=4095, i=4095 is out of bounds. So only 255 threads in that block are active (i=3840..4094). So total active threads = (15 blocks * 256) + 255 = 4095 threads per batch? Wait per batch: blocks_y=16, each has up to 256 threads. All 16 blocks are active, but last block has 255 active threads. Total per batch = 15*256 + 255 = 4095. For 128 batches: 128*4095 = 524,160 active threads. That&#x27;s exactly the number of output elements. So the design is perfect.
+
+One more thing: `blocks_y` is an `int`. `dim3` expects `unsigned int`. `batch` is also `int64_t`. If batch &gt; 2^31-1, `blockIdx.x` overflows. But batch=128, fine. We&#x27;ll cast to `int` for grid dims.
+
+Now, compile and test.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cfloat&gt;\n#include &lt;limits&gt;\n\n__global__ void argmax_outer_kernel(const float* __restrict__ x, int64_t* __restrict__ out,\n                                    int64_t batch, int64_t reduce, int64_t inner) {\n    int64_t b = blockIdx.x;\n    int64_t i = blockIdx.y * blockDim.x + threadIdx.x;\n    if (b &gt;= batch || i &gt;= inner) return;\n\n    int64_t base = (b * reduce) * inner + i;\n    float max_val = __ldg(x + base);\n    int64_t max_idx = 0;\n\n    #pragma unroll 4\n    for (int64_t r = 1; r &lt; reduce; ++r) {\n        float val = __ldg(x + base + r * inner);\n        if (val &gt; max_val) {\n            max_val = val;\n            max_idx = r;\n        }\n    }\n    out[b * inner + i] = max_idx;\n}\n\n__global__ void argmax_inner_kernel(const float* __restrict__ x, int64_t* __restrict__ out,\n                                    int64_t batch, int64_t reduce) {\n    int64_t b = blockIdx.x;\n    int tid = threadIdx.x;\n    int blockSize = blockDim.x;\n\n    extern __shared__ char smem[];\n    float* svals = reinterpret_cast&lt;float*&gt;(smem);\n    int64_t* sidxs = reinterpret_cast&lt;int64_t*&gt;(smem + blockSize * sizeof(float));\n\n    float max_val;\n    int64_t max_idx;\n    if (tid &lt; reduce) {\n        max_val = __ldg(x + b * reduce + tid);\n        max_idx = tid;\n    } else {\n        max_val = -std::numeric_limits&lt;float&gt;::infinity();\n        max_idx = 0;\n    }\n\n    #pragma unroll 4\n    for (int64_t r = tid + blockSize; r &lt; reduce; r += blockSize) {\n        float val = __ldg(x + b * reduce + r);\n        if (val &gt; max_val) {\n            max_val = val;\n            max_idx = r;\n        }\n    }\n\n    svals[tid] = max_val;\n    sidxs[tid] = max_idx;\n    __syncthreads();\n\n    for (int s = blockSize / 2; s &gt; 0; s &gt;&gt;= 1) {\n        if (tid &lt; s) {\n            if (svals[tid + s] &gt; svals[tid]) {\n                svals[tid] = svals[tid + s];\n                sidxs[tid] = sidxs[tid + s];\n            }\n        }\n        __syncthreads();\n    }\n\n    if (tid == 0) {\n        out[b] = sidxs[0];\n    }\n}\n\ntorch::Tensor argmax_cuda(torch::Tensor x, int64_t dim) {\n    if (!x.is_contiguous()) {\n        x = x.contiguous();\n    }\n    int64_t ndim = x.dim();\n    if (dim &lt; 0) dim += ndim;\n    int64_t batch = 1, reduce = x.size(dim), inner = 1;\n    for (int i = 0; i &lt; dim; ++i) batch *= x.size(i);\n    for (int i = dim + 1; i &lt; ndim; ++i) inner *= x.size(i);\n\n    std::vector&lt;int64_t&gt; out_sizes;\n    for (int i = 0; i &lt; ndim; ++i) {\n        if (i != dim) out_sizes.push_back(x.size(i));\n    }\n    auto out = torch::empty(out_sizes, x.options().dtype(torch::kInt64));\n\n    const float* x_ptr = x.data_ptr&lt;float&gt;();\n    int64_t* out_ptr = out.data_ptr&lt;int64_t&gt;();\n\n    if (inner &gt; 1) {\n        const int threads = 256;\n        int blocks_y = static_cast&lt;int&gt;((inner + threads - 1) / threads);\n        argmax_outer_kernel&lt;&lt;&lt;dim3(static_cast&lt;int&gt;(batch), blocks_y), threads&gt;&gt;&gt;(\n            x_ptr, out_ptr, batch, reduce, inner);\n    } else {\n        const int threads = 256;\n        argmax_inner_kernel&lt;&lt;&lt;static_cast&lt;int&gt;(batch), threads,\n                              threads * sizeof(float) + threads * sizeof(int64_t)&gt;&gt;&gt;(\n            x_ptr, out_ptr, batch, reduce);\n    }\n    return out;\n}\n\&quot;\&quot;\&quot;\n\nargmax_ext = load_inline(\n    name=\&quot;argmax_ext\&quot;,\n    cpp_sources=cpp_source,\n    functions=[\&quot;argmax_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int):\n        super().__init__()\n        self.dim = dim\n\n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        return argmax_ext.argmax_cuda(x.contiguous(), self.dim)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;argmax_ext&#x27;: [1/2] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=argmax_ext -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_51_cache/k_23de5bcb84e3/argmax_ext/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=argmax_ext -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_51_cache/k_23de5bcb84e3/argmax_ext/main.cpp -o main.o 
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_51_cache/k_23de5bcb84e3/argmax_ext/main.cpp:4:10: fatal error: cuda_runtime.h: No such file or directory
+    4 | #include &lt;cuda_runtime.h&gt;
+      |          ^~~~~~~~~~~~~~~~
+compilation terminated.
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
