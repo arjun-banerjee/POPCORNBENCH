@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 47</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:04:55 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 47</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:10:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">47_virtual_all_gather_concat_linear.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -92,5 +92,1136 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 303.2s · 56,335 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 303.2s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the problem:
+
+1. We have R=4 tensors of shape (B, H) = (12, 32)
+2. They get concatenated on the last dim to form (B, R*H) = (12, 128)
+3. Then a Linear layer: (B, 128) -&gt; (B, 56) with bias
+
+So effectively, this is a small matrix multiplication: 12x128 @ 128x56 + bias.
+
+The reference does:
+1. Indexing x[i] for i in range(4) - 4 slice operations
+2. torch.cat on dim=-1
+3. Linear projection
+
+For such a small matrix (12x128 @ 128x56), this is likely memory-bound. But with the concatenation overhead, a fused kernel could help.
+
+Let me think about approaches:
+- We could fuse the gather + matmul + bias into a single kernel
+- Or we could just do the matmul directly without explicit concat
+
+Actually, the simplest approach: we can just reshape x from (R, B, H) to (B, R*H) and then do the linear. That&#x27;s what torch.cat does anyway.
+
+But wait, the reference weights are from nn.Linear(R*H, K), so weight shape is (K, R*H) = (56, 128).
+
+For such small sizes, a custom kernel might not be faster than cuBLAS unless we can fuse operations. Let me think about what cuBLAS would do with (12, 128) @ (128, 56) - it&#x27;s very small.
+
+Actually, let me look at the problem more carefully:
+- We can avoid the concat entirely by viewing
+- The matmul is tiny: M=12, K=128, N=56
+
+For tiny matmuls like this, a custom kernel that loads the weights and does the reduction might actually be competitive or better, especially if we can:
+1. Load weights into shared memory (they&#x27;re tiny: 56*128*4 = ~28KB)
+2. Stream through the input and compute outputs
+
+But actually我们也可以尝试更简单的方案: 直接从(R, B, H)通过view到(B, R*H)然后torch.nn.functional.linear。这样避免了concat。
+
+However, for maximum speedup, a fully fused kernel that:
+1. Reads x[R][B][H] from global memory
+2. Computes each output element as sum of x * weight + bias
+3. Writes result
+
+Let me start with a simple approach and measure.
+
+For the fused kernel approach:
+- Grid: Each block handles some output rows (B dimension)
+- Threads: Each thread handles some output columns (K dimension)
+- Total output is (B, K) = (12, 56)
+
+Since B=12 and K=56, we might use:
+- Block dim: (K elements per block threads)
+- Or 2D blocks
+
+A simple approach: 
+- One block per row (B=12 blocks)
+- 56 threads per block (one per output element)
+- Each thread computes one output element: dot product of 128 input elements with corresponding weight column
+
+Weights: 56x128, bias: 56
+
+Wait, Linear is y = x @ W^T + b. W is (K, R*H) = (56, 128).
+So x row vector (128,) dot with W^T column (128,) -&gt; scalar.
+
+For 56 threads per block:
+- Each thread loads bias[threadIdx.x]
+- Then iterates over 128 elements of input and weight
+- Input elements are x[j] where j in [0, 128), we can load them from the R, B, H layout
+- Weight elements are W[threadIdx.x][j]
+
+If we put the weight in shared memory: 56*128 = 7168 floats = 28.7KB. That&#x27;s plenty for shared memory on H100 (228KB per SM).
+
+Actually, 28.7KB per block might limit occupancy but for 12 blocks total that&#x27;s fine.
+
+But there&#x27;s another consideration: we can also load the entire input row into shared memory too (128 floats = 512 bytes).
+
+Let me write a kernel:
+- grid: (B, 1, 1) = 12 blocks, or maybe launch with rounded-up grid
+- block: (64, 1, 1) or (128, 1, 1). Since K=56, maybe (64, 1, 1) with 56 active threads and 8 idle.
+
+Actually, we could also use vectorized loads for the input since H=32, R=4, so reading from (R, B, H) layout.
+
+Let me think about the memory layout of x: (R, B, H) = (4, 12, 32), so x[r][b][h].
+For a given b, the concatenated elements are:
+x[0][b][0..31], x[1][b][0..31], x[2][b][0..31], x[3][b][0..31]
+
+In memory, x is contiguous in H, then B, then R.
+So x[r][b][h] is at offset (r * B * H + b * H + h).
+
+For reading a full row b, we could read:
+- x[0][b][0..7] as float4
+- x[0][b][8..15] as float4
+- etc.
+
+And weights W[k][j] where k in [0, 56), j in [0, 128).
+W is stored as (out_features, in_features) in PyTorch, so W[k][j] is contiguous in j.
+Actually wait, nn.Linear stores weight as (out_features, in_features) = (56, 128) in PyTorch, and it&#x27;s row-major.
+So W[k][j] for fixed k is contiguous. 
+
+Hmm, but if each thread processes one k, then each thread reads W[k][0..127] which is contiguous! This is great.
+And all threads read the same input x[b][0..127] but different weight rows.
+
+So:
+- Block b handles output row b
+- Thread k (0 &lt;= k &lt; 56) computes output[b][k]
+- All threads in the block read the same input elements but different weight columns... wait, no.
+
+Actually, W is (K, R*H) = (56, 128) in row-major (PyTorch default).
+Thread k reads W[k][0], W[k][1], ..., W[k][127] - this is contiguous (stride 1).
+Thread k+1 reads W[k+1][0], W[k+1][1], etc - this is also contiguous.
+But when threads k and k+1 read W[k][j] and W[k+1][j] simultaneously, these are separated by 128 floats = 512 bytes.
+
+This is not coalesced! For coalesced reads, adjacent threads should read adjacent memory.
+So if thread k reads W[k][j], we want thread k+1 to read W[k+1][j] for coalescing? No, wait.
+
+For coalesced memory access:
+- Thread 0 reads addr A
+- Thread 1 reads addr A + 4
+- Thread 2 reads addr A + 8
+etc.
+
+If W is (56, 128) row-major laid out in memory as:
+W[0][0], W[0][1], ..., W[0][127], W[1][0], W[1][1], ...
+
+Then if thread k reads W[k][j] = base + k * 128 + j
+Thread k+1 reads W[k+1][j] = base + (k+1) * 128 + j
+Difference = 128 floats = 512 bytes.
+
+For a cache line of 128 bytes, this means each thread loads from a different cache line. Not coalesced.
+
+To coalesce, we should have thread k read W[k][j] where j varies with k, or transpose the weight matrix.
+
+Actually, for a Linear layer, if we think about it as x @ W^T:
+- x is (1, 128)
+- W^T is (128, 56)
+- Result is (1, 56)
+
+If we store W^T as (128, 56) in column-major, or load W in transposed form... In CUDA, a common trick is to load W as if it were transposed, but we need to be careful.
+
+Actually, we can re-interpret the problem: y[b][k] = sum_j x[b][j] * W[k][j]
+For a fixed j, threads 0..55 read W[0][j], W[1][j], ..., W[55][j]
+These are separated by 128 elements. Not coalesced.
+
+But if we launch threads to read W^T: for fixed k, threads read W[k][0], W[k][1]... which is contiguous. But all threads in the block read contiguous weight rows, just different rows. The issue is adjacent threads don&#x27;t read adjacent memory.
+
+Wait, actually, coalescing for global memory loads on H100:
+A warp of 32 threads issues load instructions. For maximum bandwidth, threads should access contiguous 128-byte segments.
+If thread k accesses W[k][j], then thread 0 accesses base+j, thread 1 accesses base+128+j. These are 512 bytes apart. This would be 32 different 128-byte cache lines for 32 threads. Very bad.
+
+If instead thread k accesses W[k][j] but j = threadIdx.x:
+Wait no, each thread needs to access all j from 0 to 127. We need a different strategy.
+
+Strategy 1: Load weights into shared memory in a coalesced manner.
+Have threads 0..55 (first warp) load W[0..55][0], W[0..55][1], etc in some pattern.
+Or better: use more threads. With 128 threads per block:
+Thread j loads x[b][j] (contiguous) and also loads some weights.
+
+Actually, consider:
+- 128 threads per block
+- Thread j participates in computing all output elements by loading x[b][j] and broadcasting it, then each thread has a local accumulator for its assigned output elements.
+
+For 128 threads and 56 outputs:
+Option A: Each thread computes 56 outputs? No, 128 threads &gt; 56 outputs.
+Option B: 56 threads computing 1 output each, 72 threads idle.
+Option C: Each thread computes a subset. For example, thread j where j &lt; 56 computes output j. Threads 56..127 load input and broadcast it.
+
+Actually, a much simpler layout:
+- 64 or 128 threads per block
+- Thread tid computes output channel tid % 56. Some threads are redundant or we can pad.
+- But let&#x27;s think about warp-level cooperation.
+
+Standard matmul kernel approach for this tiny size:
+```
+__global__ void kernel(float* out, float* x, float* W, float* bias) {
+    int b = blockIdx.x;  // row
+    int tid = threadIdx.x;
+    float sum = bias[tid];
+    for (int j = 0; j &lt; R*H; j++) {
+        sum += x[b * R * H + j] * W[tid * (R*H) + j];
+    }
+    out[b * K + tid] = sum;
+}
+```
+With 56 threads per block, thread 0 reads W[0][0..127], thread 1 reads W[1][0..127], etc. This has bad coalescing.
+
+To fix coalescing, let&#x27;s transpose W in shared memory or use a different access pattern.
+
+Actually, we can restructure so threads collaborate:
+```
+__shared__ float sW[128][56];  // or sW[56][128]
+
+// Load W into shared memory in transposed form
+for (int j = tid; j &lt; 128; j += blockDim.x) {
+    for (int k = 0; k &lt; 56; k += ...) {
+        sW[j][k] = W[k * 128 + j];  // transposed
+    }
+}
+```
+This is complicated.
+
+Alternative: Instead of storing W in shared memory, just stream through x and W with different thread organization.
+
+Actually, think about vectorized loads for x and W.
+For thread k (0..55): when it loads W[k][j..j+3] as float4, it&#x27;s contiguous and doesn&#x27;t need coalescing with other threads. The loads from different threads happen at different times in the instruction stream (since each thread loops independently). 
+
+Wait, on modern GPUs (H100), adjacent threads don&#x27;t need to access adjacent memory for good performance if each access is wide and aligned. Actually, the memory controller still benefits from coalescing, but with vectorized loads (float4), each thread pulls 16 bytes. If 32 threads each pull 16 bytes from different locations, that&#x27;s 32 separate transactions. Very bad.
+
+So we want coalescing. Let me think of a kernel design where adjacent threads read adjacent memory.
+
+Design: 
+- blockDim.x = 128 (or some power of 2)
+- gridDim.x = B = 12
+- Each block handles one output row b
+- 128 threads cooperate to compute 56 outputs
+
+Algorithm:
+1. Load x[b][0..127] into shared memory (128 floats). Each thread j loads x[b][j]. Coalesced access.
+2. Load W into shared memory as W^T: shape (128, 56). Total 7168 floats.
+   - We can load this in transpose: thread j loads W[k][j] for all k. But this isn&#x27;t coalesced as discussed.
+   - Or: thread j loads W[j / 128][j % 128]... no.
+
+Actually, to load W[k][j] in coalesced manner, thread tid should load memory at offset tid, tid+blockDim, etc.
+W is stored as: W[0][0], W[0][1], ..., W[0][127], W[1][0], ...
+So if thread tid loads W[0][tid], thread tid+1 loads W[0][tid+1] - coalesced!
+Then we transpose into shared memory: sW[j][0] = W[0][j]. Then each k is loaded similarly.
+
+But this requires 56 passes to load all rows of W.
+
+Actually, we can do this:
+```
+for (int k = 0; k &lt; 56; k++) {
+    float w = W[k * 128 + tid];
+    sW[tid][k] = w;  // shared memory is (128, 56)
+}
+```
+If we have 128 threads, thread tid loads W[0][tid], W[1][tid], ..., W[55][tid] - that&#x27;s 56 separate loads per thread, each coalesced across the warp.
+No wait, thread tid reads W[k * 128 + tid]. For fixed k, thread tid reads W[k][tid] - contiguous. Yes! Coalesced.
+But this loads W in a column-major fashion into shared memory. Then sW[tid][k] = W[k][tid].
+After this, to compute output k: sum_j x[j] * W[k][j] = sum_j x[j] * sW[j][k].
+
+Then in step 2, each thread k (0..55) computes:
+```
+float sum = bias[k];
+for (j = 0; j &lt; 128; j++) {
+    sum += s_x[j] * sW[j][k];
+}
+```
+Since s_x[j] is broadcast (same for all threads, or loaded into registers), and sW[j][k] is read by thread k. But adjacent threads k and k+1 read sW[j][k] and sW[j][k+1] - adjacent in memory. Good for shared memory (no bank conflicts if 56 is not a multiple of 32... actually on H100, bank width is 4 bytes, 32 banks. If threads read sW[j][0], sW[j][1], ..., these are at offsets 0, 4, 8, ... which hit banks 0, 1, 2, ..., no conflicts!).
+
+Wait, sW is (128, 56). sW[j][k] offset = j * 56 + k.
+Thread k reads sW[j][k] = j*56 + k. For j fixed, threads 0..31 read offsets k, k+1, ..., k+31. Bank = offset % 32.
+If k=0: banks 0,1,2,...,31 - no conflicts.
+If k=32: banks 0,1,2,...,31 - no conflicts.
+Actually for any k, threads 0..31 read sW[j][k+tid] = j*56 + k + tid. Banks = (j*56 + k + tid) % 32 = (j*56 + k) % 32 + tid % 32. Since tid ranges 0..31, banks are all different. No bank conflicts!
+
+Then thread k writes to out[b][k]. Threads 0..55 write to contiguous memory. Coalesced.
+
+This is a great design! Let&#x27;s detail it:
+
+Kernel:
+```
+__global__ void fused_gather_linear(..., float* out, float* x, float* W, float* bias) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    __shared__ float s_x[128];
+    __shared__ float s_W[128][56];
+    
+    // Load x for this block (one row)
+    if (tid &lt; 128) {
+        // x is (R, B, H) = (4, 12, 32)
+        // Row b consists of x[0][b][0..31], x[1][b][0..31], x[2][b][0..31], x[3][b][0..31]
+        // Offset: r * (B*H) + b * H + h
+        // tid = r * 32 + h, where r = tid / 32, h = tid % 32
+        int r = tid / 32;
+        int h = tid % 32;
+        s_x[tid] = x[r * (B*H) + b * H + h];
+    }
+    
+    // Load W into shared memory (transposed)
+    // W is (56, 128), we want s_W[j][k] = W[k][j]
+    // Each thread tid loads W[k][tid] for k = 0..55
+    // But we have 128 threads, only need 56.
+    // Actually, let&#x27;s do: for each j in 0..127, threads load one column of W
+    if (tid &lt; 56) {
+        for (int j = 0; j &lt; 128; j++) {
+            // W[tid * 128 + j] is W[tid][j]
+            s_W[j][tid] = W[tid * 128 + j];
+        }
+    }
+    __syncthreads();
+    
+    // Compute output
+    if (tid &lt; 56) {
+        float sum = bias[tid];
+        for (int j = 0; j &lt; 128; j++) {
+            sum += s_x[j] * s_W[j][tid];
+        }
+        out[b * 56 + tid] = sum;
+    }
+}
+```
+
+Wait, the W loading: if tid=0 loads W[0][0..127] sequentially into s_W[0..127][0]. This is contiguous reads for thread 0. But what about coalescing across threads?
+Actually thread 0 reads W[0][0], W[0][1], etc. Thread 1 reads W[1][0], W[1][1], etc. These happen somewhat in parallel. The memory access from thread 0 is W+0 to W+127. Thread 1 is W+128 to W+255. These are 512 bytes apart, so not coalesced across the warp.
+
+But actually since each thread is doing a loop of 128 loads, and the loads are contiguous within each thread, the memory system might still be somewhat efficient because each thread&#x27;s loads can hit the cache. However, for first-time loads from global memory, having 32 threads in a warp load 32 different cache lines simultaneously means 32 memory transactions per warp.
+
+A better approach for loading W:
+```
+for (int k = 0; k &lt; 56; k++) {
+    int idx = k * 128 + tid;
+    if (tid &lt; 128) {
+        s_W[tid][k] = W[idx];  // W[k][tid]
+    }
+}
+```
+Here, all 128 threads load contiguous memory: W[0][tid] at offset 0+tid. This is fully coalesced!
+Then W[1][tid] at offset 128+tid. Also fully coalesced.
+We need 56 iterations. But each iteration loads 128 floats (512 bytes) in one or two coalesced transactions.
+
+Wait, but we have 128 threads and only 56 iterations? Actually:
+```
+for (int k = 0; k &lt; 56; k++) {
+    if (tid &lt; 128) {
+        s_W[tid][k] = W[k * 128 + tid];
+    }
+}
+```
+Each iteration, all 128 threads load one float each, contiguous. Perfect coalescing.
+Total: 56 iterations * 128 loads = 7168 loads. 
+
+But this might be slow due to loop overhead. Can we unroll? 56 is not huge. The compiler might unroll partially.
+
+Alternatively, we could have each thread load multiple floats:
+```
+if (tid &lt; 128) {
+    for (int k = 0; k &lt; 56; k++) {
+        s_W[tid][k] = W[k * 128 + tid];
+    }
+}
+```
+This is the same but each thread loops through k. Still the warp executes W[k*128+tid] for all k sequentially, and for each k, the access is coalesced.
+
+Actually, a even better approach: vectorized loads.
+Each thread can load float4. For W[k][0..127], we can load 32 float4s per warp.
+```
+for (int k = 0; k &lt; 56; k++) {
+    float4 w = *(float4*)(W + k * 128 + tid * 4);  // if tid &lt; 32
+    s_W[tid*4+0][k] = w.x;
+    // ...
+}
+```
+But this requires transposing the data and writing to shared memory, which might have bank conflicts.
+
+Let me reconsider. Maybe we don&#x27;t need to load W into shared memory at all. We could just have each thread keep its weight in registers or load directly from global memory. Since each thread only needs 128 floats and there are only 56 threads, total weight reads = 56 * 128 = 7168 floats. With cache, these might stay in L1.
+
+If we use L1/L2 cache effectively, and the weights are small (28KB), they might fit in cache. But first load still requires global memory.
+
+Actually, let me think about this differently. For such a small problem:
+- The explicit concat in reference is unnecessary overhead, but even without it, doing a simple reshape + linear via PyTorch should be fast because cuBLAS handles (12, 128) @ (128, 56).
+
+Let me first try the simplest thing: just reshape x from (4, 12, 32) to (12, 128) and call F.linear. This avoids the Python loop and cat. The matmul will go through cuBLAS which is heavily optimized.
+
+Maybe that&#x27;s already enough to beat the reference because the reference has loop overhead, cat overhead, and then cuBLAS.
+
+Let me write both versions and test.
+
+Actually, I realize the simplest high-performance approach might be:
+```python
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(R * H, K, bias=True)
+    
+    def forward(self, x):
+        # x: (R, B, H)
+        # Reshape to (B, R*H) and apply linear
+        x = x.permute(1, 0, 2).reshape(B, R * H)
+        return self.proj(x)
+```
+Or even:
+```python
+x = x.transpose(0, 1).reshape(B, R * H)
+```
+
+But wait - does the reference guarantee anything about x layout? Actually `get_inputs()` creates `randn(R, B, H)` which is contiguous in H. permute(1, 0, 2) would make it non-contiguous, and reshape on non-contiguous might not work. We need contiguous first or use a different method.
+
+`x.transpose(0, 1).contiguous().reshape(B, R*H)` - but contiguous() creates a copy, which is overhead.
+
+Actually, for (4, 12, 32) -&gt; permute to (12, 4, 32), the innermost dimension H=32 is still contiguous, and 4 is the next dimension. Is there a way to view it?
+
+`x.view(B, R * H)` won&#x27;t work on the original (4, 12, 32) because it&#x27;s not contiguous in that way. Wait, actually `(4, 12, 32)` stored as r-major: for r in 0..3, for b in 0..11, for h in 0..31.
+A view as (12, 128) would be: for b in 0..11, for j in 0..127.
+This corresponds to b first, then r, then h. But memory is r, b, h. So view would NOT work correctly.
+
+We need to permute. `x.permute(1, 0, 2).reshape(B, -1)` - permute creates a view with strides (H, R*H, 1) = (32, 128, 1). Reshape to (12, 128) works if the total elements match, and since the last dim (32) is contiguous and the product of remaining dims is 128 which equals stride[0], reshape works! Wait, let me check.
+
+x shape: (4, 12, 32), strides: (384, 32, 1) since contiguous.
+x.permute(1, 0, 2) shape: (12, 4, 32), strides: (32, 384, 1).
+Now reshape to (12, 128): is this valid? The total size is 12*128=1536. For reshape, the condition is that the strides allow viewing as the new shape. With strides (32, 384, 1), and shape (12, 4, 32), reshape to (12, 128) means combining dims 1 and 2. Since dim 2 has size 32 and stride 1, and dim 1 has size 4 and stride 384, combining them gives size 128 but stride for the combined dim? Actually, the stride of dim 1 in the reshaped tensor would be... The combined dimension (4,32) needs to be &quot;contiguous&quot; in some sense. Since 384 != 32 * 32 = 1024, wait. Actually, dim 1 stride is 384 and dim 2 size is 32. If they were contiguous in memory, dim 1 stride would be dim 2 size * dim 2 stride = 32 * 1 = 32. But it&#x27;s 384. So reshape will fail because it&#x27;s not a valid view.
+
+Hmm, let me recalculate. For x.permute(1,0,2) with shape (12,4,32):
+- Element (b, r, h): offset = b * 32 + r * 384 + h * 1
+For a flattened view (12, 128):
+- Element (b, j) where j = r * 32 + h: offset = b * 128_stride + j * 1
+But actual offset = b * 32 + r * 384 + h. For h=0: offset = b*32 + r*384. For h=1: offset = b*32 + r*384 + 1. 
+If we think of row b starting at b*32, then within the row, offsets are 0, 1, 2, ..., 31, then 384, 385, ..., 415, then 768, ..., 799, then 1152, ..., 1183. These are NOT contiguous! There are huge gaps (384 - 32 = 352 elements gap) between r groups.
+
+So `reshape` after `permute` won&#x27;t work as a view. We either need `contiguous()` after permute, or a kernel that does the gathering.
+
+OK so a fused kernel makes more sense. Let me design a proper fused kernel.
+
+Actually, if we can&#x27;t avoid the gather, then:
+1. A custom kernel that does gather+matmul+bias
+2. Or `x.permute(1,0,2).contiguous().view(B, -1)` followed by F.linear
+
+Option 2 involves a kernel for permute+contiguous (or copy) and then a cuBLAS matmul. That&#x27;s two separate kernel launches. A fused kernel might be better.
+
+For the fused kernel, I need to think about optimal thread organization.
+
+H100 specs:
+- 3.35 TB/s memory bandwidth
+- 1979 TFLOPS BF16 tensor core
+
+But our problem is tiny: 12 * 128 input reads + 56 * 128 weight reads + 12 * 56 output writes + 56 bias reads.
+Total flops: 12 * 56 * 128 * 2 = 172,032 multiply-adds = 344K FLOPS.
+At 3.35 TB/s, assuming we read all data once: total bytes read = 12*128*4 + 56*128*4 + 56*4 + 12*56*4 = 6144 + 28672 + 224 + 2688 = ~37KB. At 3.35 TB/s, reading 37KB takes ~11 nanoseconds. Writing 12*56*4=2688 bytes also negligible.
+
+This is EXTREMELY memory-bound and extremely small. The reference&#x27;s overhead (Python loop, list creation, cat) is likely the main cost, not the actual computation.
+
+So even `x.permute(1,0,2).contiguous().view(12,128)` followed by `self.proj` should be much faster than the reference because it avoids the Python loop and list.
+
+But let me see if a fully fused kernel is even faster.
+
+Given the tiny size, launch overhead itself might be significant. A single fused kernel should be roughly one kernel launch vs two for the permute+contiguous+matmul approach.
+
+Let me design the kernel more carefully.
+
+For the kernel, I&#x27;ll use the approach I described earlier:
+- grid: 12 blocks (one per output row)
+- threads: 64 or 128 per block
+- Shared memory: store input row (128 floats) and weights (128 x 56 floats = 7168 floats = 28.7KB)
+- Total shared memory: ~30KB per block. Still well within 227KB limit.
+- But H100 can have multiple blocks per SM depending on shared memory. 228KB / 30KB = ~7 blocks per SM max.
+
+Actually for 12 total blocks and 132 SMs on H100 (I think H100 has 132 or 144 SMs), at most 12 SMs will be used, each with 1 block. This is fine since the problem is tiny.
+
+Wait, how many SMs on H100 SXM? 132 SMs. So we&#x27;re using a tiny fraction.
+
+Let me write a cleaner kernel:
+
+```cuda
+__global__ void fused_gather_linear(
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int R, int B, int H, int K
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    const int RH = R * H;  // 128
+    
+    __shared__ float s_x[128];
+    __shared__ float s_W[128 * 56];  // We&#x27;ll index as s_W[j * 56 + k]
+    
+    // Load x row b into shared memory
+    // x[r][b][h] at x[r * B * H + b * H + h]
+    // We can use all threads
+    #pragma unroll
+    for (int idx = tid; idx &lt; RH; idx += blockDim.x) {
+        int r = idx / H;
+        int h = idx % H;
+        s_x[idx] = x[r * B * H + b * H + h];
+    }
+    
+    // Load W (K, RH) into shared memory in transposed form
+    // W[k][j] -&gt; s_W[j * K + k]
+    // Each iteration k, threads 0..RH-1 load W[k][tid] if tid &lt; RH
+    // But we have K=56 rows to load
+    #pragma unroll
+    for (int k = 0; k &lt; K; k++) {
+        for (int j = tid; j &lt; RH; j += blockDim.x) {
+            s_W[j * K + k] = W[k * RH + j];
+        }
+    }
+    __syncthreads();
+    
+    // Compute output
+    if (tid &lt; K) {
+        float sum = bias[tid];
+        #pragma unroll
+        for (int j = 0; j &lt; RH; j++) {
+            sum += s_x[j] * s_W[j * K + tid];
+        }
+        out[b * K + tid] = sum;
+    }
+}
+```
+
+With blockDim.x = 128:
+- Loading x: 128 threads, each loads 1 float. One coalesced load.
+- Loading W: For k=0, threads 0..127 load W[0][0..127] - coalesced. For k=1, same. 56 iterations. Each iteration 1 coalesced load.
+- Computing: 56 active threads, each does 128 multiply-adds.
+
+Wait, the W loading loop might be slow because of loop overhead. But since K=56 is small, and `#pragma unroll` might help.
+
+Actually, we can do better with W loading. If blockDim.x = 128, and there are K x RH = 56 x 128 = 7168 weight elements, each thread could load 7168 / 128 = 56 elements. So in one loop:
+```
+for (int idx = tid; idx &lt; K * RH; idx += blockDim.x) {
+    int k = idx / RH;  // 0..55
+    int j = idx % RH;  // 0..127
+    s_W[j * K + k] = W[idx];  // W is row-major: W[k][j] = W[k*RH + j]
+}
+```
+Here, thread tid loads W[tid], W[tid+128], W[tid+256], etc.
+W[idx] for idx = tid, tid+128, tid+256, ...
+Since these are spaced by 128 floats (512 bytes), consecutive threads load consecutive cache lines? No.
+Thread 0: W[0], W[128], W[256], ...
+Thread 1: W[1], W[129], W[257], ...
+Thread 0 and thread 1 read W[0] and W[1], which ARE adjacent. So within the warp, the first load is coalesced!
+Second load: thread 0 reads W[128], thread 1 reads W[129]. Also adjacent! Each &quot;iteration&quot; of idx += 128 gives a coalesced load.
+So this loop also gives coalesced loads, with 56 iterations. Same as before but only one loop instead of nested loops.
+
+And `#pragma unroll` might unroll some of this.
+
+For computation, 56 threads computing 128 MACs each. 7168 MACs per block. At 67 TFLOPS FP32, that&#x27;s ~0.1 microseconds of compute. Memory bandwidth bound.
+
+Let me also think about whether we can avoid shared memory for W by using registers.
+56 threads * 128 floats = 7168 floats in registers. That&#x27;s a lot! 28KB of register space. A thread can have at most 255 registers. 128 floats = 128 registers. That&#x27;s too many! 128 &gt; 255? No, 128 &lt; 255. Actually each float is 1 register. So 128 registers per thread is fine. But 56 threads * 128 registers = 7168 registers per block. H100 has 64K registers per SM, so this is fine. But if each thread holds 128 floats in registers, yes that&#x27;s 128 registers, under the 255 limit.
+
+Actually, wait. If thread tid holds W[tid][0..127] in registers (128 regs), plus the accumulator (1 reg), plus loop counter, that&#x27;s ~130 registers. Still under 255.
+
+Then we don&#x27;t need shared memory for W at all! We only need shared memory for x (128 floats).
+
+But how does each thread load its W row? Thread tid loads W[tid][0..127] from global memory. These are contiguous within the thread, but thread 0 loads W[0][0..127], thread 1 loads W[1][0..127]. Not coalesced across threads.
+
+However, with 56 threads and each doing 128 loads, the memory system handles 32 threads per warp. Warp 0 has threads 0..31. Each thread loads 128 floats from address base + tid * 512 (since each row is 512 bytes). Not coalesced at all.
+
+Could we restructure so each warp loads a chunk of W in coalesced manner and then redistributes? That&#x27;s basically what shared memory is for.
+
+Another option: each thread computes one output element but the weights are loaded cooperatively into shared memory. I think using shared memory for W is fine.
+
+Wait, another idea: what if we use a single warp per block? With 32 threads:
+- Compute 56 outputs: each thread handles 2 outputs (some handle 1)
+- Load x into shared memory
+- Load W in coalesced manner: e.g., each thread loads a float4, etc.
+
+But I think 128 threads with shared memory for W is good.
+
+Actually, 30KB shared memory per block might be the limiting factor for occupancy. But with only 12 blocks total, occupancy doesn&#x27;t matter. We just want each block to be fast.
+
+Let me also consider L1 cache. The H100 has L1 cache. If all threads in a warp read the same shared memory, that&#x27;s broadcast. If threads read strided shared memory, as long as there are no bank conflicts it&#x27;s fine.
+
+Another optimization: Instead of storing W in shared memory as (128, 56), store as (56, 128) and transpose during load? Wait no, we need sW[j][k] = W[k][j] so that threads read adjacent memory when iterating j.
+
+Another idea: Use vectorized math for the dot product.
+```
+float4 sum = make_float4(0,0,0,0);
+#pragma unroll
+for (int j = 0; j &lt; 128; j += 4) {
+    float4 x4 = *(float4*)&amp;s_x[j];
+    float4 w4_0 = *(float4*)&amp;s_W[j * 56 + k];
+    // wait, s_W[j*56+k] for k=0 is not contiguous in k
+}
+```
+Actually, if each thread handles one k, then s_W[j * 56 + k] for j=0,1,2,3 are at offsets k, 56+k, 112+k, 168+k. These are 56 floats = 224 bytes apart. Not contiguous. So float4 loads won&#x27;t work for s_W this way.
+
+If we store W as (56, 128) in shared memory (i.e., s_W[k][j] = W[k][j]), then for fixed k, s_W[k][j] is contiguous in j. But then adjacent threads k and k+1 read s_W[k][0] and s_W[k+1][0], which are 128 floats apart. Bank conflicts!
+
+Actually in (56, 128) layout, s_W[k][j] offset = k * 128 + j.
+Thread k reads s_W[k][0..127]. Thread k+1 reads s_W[k+1][0..127]. Bank = offset % 32.
+For j=0: thread k accesses bank k%32, thread k+1 accesses bank (k+1)%32. No bank conflicts!
+Wait, for a fixed j, threads k=0..31 read offsets 0*128+j, 1*128+j, ..., 31*128+j.
+128 mod 32 = 0. So offsets are j, 128+j, 256+j, ... = j mod 32 for all of them!
+ALL threads in warp 0 hit the SAME bank! Massive bank conflicts!
+
+So (56, 128) layout is terrible for bank conflicts if thread k works on row k.
+And (128, 56) layout: s_W[j][k] offset = j * 56 + k.
+For fixed j, thread k reads j*56+k. Bank = (j*56+k) % 32 = (j*24 + k) % 32 since 56%32=24.
+For j=0: banks are k%32, all different. No conflicts!
+For j=1: banks are (24+k)%32 = (k-8)%32, all different. No conflicts!
+Great! (128, 56) layout has no bank conflicts.
+
+So s_W should be (128, 56) and each thread accesses one column.
+
+Back to vectorization: if each thread handles one k, then for j loop:
+```
+for (int j = 0; j &lt; 128; j++) {
+    sum += s_x[j] * s_W[j * 56 + k];
+}
+```
+s_W[j * 56 + k] for j and j+1 are 56 floats apart. Cannot use float4.
+
+Can we vectorize s_x? No, s_x[j] is just one float.
+
+What if we use half-float? No, problem says fp32 precision.
+
+Maybe we can have each thread handle 2 or 4 k values:
+```
+if (tid &lt; 28) {
+    float sum0 = bias[tid * 2];
+    float sum1 = bias[tid * 2 + 1];
+    for (int j = 0; j &lt; 128; j++) {
+        float xj = s_x[j];
+        sum0 += xj * s_W[j * 56 + tid * 2];
+        sum1 += xj * s_W[j * 56 + tid * 2 + 1];
+    }
+    out[b * 56 + tid * 2] = sum0;
+    out[b * 56 + tid * 2 + 1] = sum1;
+}
+```
+This halves the number of active threads (28 instead of 56), and each thread does twice the work. But does it matter? With 128 threads per block, 56 active is more than enough. The unroll benefit might help.
+
+Actually, the compiler might automatically unroll the j loop partially. With 128 iterations and each being a FMA, that&#x27;s fine.
+
+Let me write the kernel and compile it.
+
+Actually, I should consider using cooperative loading of W into shared memory where each thread loads a float4. For 128 threads * float4 = 512 floats per load. For 7168 floats, need 14 iterations. And for each iteration, consecutive threads load consecutive float4s: coalesced.
+
+Wait: if W is stored as (56, 128), and we want s_W to be (128, 56), we need to transpose. A thread loading float4 from W needs to write 4 floats to 4 different columns in s_W. That&#x27;s complex.
+
+Let me just use one float per thread for W loading. With 128 threads and 7168 elements, 56 iterations. Each iteration loads coalesced. This should be fast enough.
+
+Actually wait, can I use a block size of 64? Then 64 threads, 7168 elements / 64 = 112 elements per thread. With float4, that&#x27;s 28 vector loads per thread. 
+
+But to keep it simple, let me start with 128 threads and simple scalar loads.
+
+One more thing: do we really need shared memory for x? If all threads read s_x[j] for the same j in lockstep (within an iteration of the j loop), then all threads are broadcasting the same shared memory address. On H100, broadcast from shared memory is very fast.
+
+OK let me write the full code. I&#x27;ll use a kernel and then call it from Python.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define R 4
+#define B 12
+#define H 32
+#define K 56
+#define RH (R * H)
+
+__global__ void fused_gather_linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ bias,
+    float* __restrict__ out
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    __shared__ float s_x[RH];
+    __shared__ float s_W[RH * K];
+    
+    // Load x for row b
+    // x[r][b][h] -&gt; offset = r*B*H + b*H + h
+    #pragma unroll
+    for (int idx = tid; idx &lt; RH; idx += blockDim.x) {
+        int r = idx / H;
+        int h = idx % H;
+        s_x[idx] = x[r * B * H + b * H + h];
+    }
+    
+    // Load W (K, RH) into shared memory transposed: s_W[j*K + k] = W[k*RH + j]
+    #pragma unroll
+    for (int idx = tid; idx &lt; K * RH; idx += blockDim.x) {
+        int k = idx / RH;
+        int j = idx % RH;
+        s_W[j * K + k] = W[idx];
+    }
+    
+    __syncthreads();
+    
+    // Compute output
+    if (tid &lt; K) {
+        float sum = bias[tid];
+        #pragma unroll 16
+        for (int j = 0; j &lt; RH; j++) {
+            sum += s_x[j] * s_W[j * K + tid];
+        }
+        out[b * K + tid] = sum;
+    }
+}
+
+torch::Tensor fused_gather_linear(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor bias
+) {
+    auto out = torch::empty({B, K}, x.options());
+    
+    fused_gather_linear_kernel&lt;&lt;&lt;B, 128&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        W.data_ptr&lt;float&gt;(),
+        bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;()
+    );
+    
+    return out;
+}
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&quot;fused_gather_linear&quot;,
+    cpp_sources=&quot;torch::Tensor fused_gather_linear(torch::Tensor x, torch::Tensor W, torch::Tensor bias);&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;fused_gather_linear&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+)
+```
+
+Wait, the cpp_sources should just be the declaration, and cuda_sources should have the implementation. But `load_inline` requires cpp_sources and cuda_sources. When using load_inline, the functions argument should list the names of functions that will be auto-bound.
+
+Actually, looking at the load_inline signature:
+```python
+load_inline(
+    name,
+    cpp_sources,
+    cuda_sources,
+    functions,
+    ...
+)
+```
+
+functions should be a list of function names that are declared in the C++ sources and will be exposed to Python.
+
+I need to be careful about the syntax. Let me write it properly.
+
+Actually, I just realized: can I use `x.permute(1, 0, 2).reshape(B, R*H)`? As I calculated, the permute changes the memory layout such that reshape is not valid without contiguous(). But `permute(1, 0, 2).contiguous().reshape(B, R*H)` should work.
+
+However, the MOST important thing is to actually write a simple version first and test for correctness, then optimize.
+
+Let me start with a simple version using the custom kernel and test correctness. If it&#x27;s correct but not fast enough, I can optimize.
+
+Actually, for such a small operation, the overhead of the Python operations in the reference might dominate. But let me first write a clean kernel.
+
+Wait, I also want to check: is x guaranteed to be contiguous with shape (R, B, H)? The get_inputs() uses `torch.randn(R, B, H, device=dev, generator=g)` which IS contiguous. Good.
+
+So in the kernel, x[r][b][h] offset = r * (B*H) + b * H + h. Since it&#x27;s contiguous.
+
+Now let me think about whether there&#x27;s an even simpler approach. Since we know all dimensions are fixed at compile time, we can hardcode them in the kernel.
+
+But there&#x27;s another consideration: PyTorch&#x27;s nn.Linear uses weight of shape (K, RH) in row-major. So W[k][j] is at W[k * RH + j].
+
+For bias, it&#x27;s just a 1D tensor of size K.
+
+Let me write the code more carefully.
+
+Actually, I realize that a pure PyTorch implementation might be competitive:
+```python
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(K, R * H))
+        self.bias = nn.Parameter(torch.empty(K))
+        # Initialize same as nn.Linear would
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in &gt; 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+    
+    def forward(self, x):
+        # x: (R, B, H)
+        x_gathered = x.permute(1, 0, 2).contiguous().reshape(B, R * H)
+        return torch.nn.functional.linear(x_gathered, self.weight, self.bias)
+```
+
+Wait, we need to copy weights from the Model. The problem says ModelNew must accept the same constructor arguments. But actually, looking at Model.__init__, it takes no arguments. So ModelNew can also take no arguments.
+
+But we need to match the weight initialization? No, in the evaluation, they&#x27;ll instantiate Model and ModelNew separately, but we need the same numerical outputs for the same inputs. If the weights are randomly initialized differently, the outputs would differ. 
+
+Wait, looking at the evaluation setup: they probably copy the state_dict from Model to ModelNew, or initialize both the same way. Looking at how kernelbench typically works: they instantiate both models and compare outputs for the same inputs, with weights initialized deterministically or copied.
+
+Actually, let me re-read the problem. It says &quot;Replace the forward computation... with a custom CUDA kernel. Your ModelNew class must accept the same constructor arguments as Model.&quot;
+
+So I should use `nn.Linear(R * H, K, bias=True)` in ModelNew as well, to ensure matching parameters. But then forward uses the custom kernel with the weight and bias from self.proj.
+
+Let me check: the weight in nn.Linear is stored as `self.proj.weight` of shape (K, RH) and `self.proj.bias` of shape (K,).
+
+So the custom kernel should use `self.proj.weight` and `self.proj.bias`.
+
+Now, let me write the code.
+
+One concern: the `#pragma unroll` on the W loading loop. K*RH = 7168. With 128 threads, 56 iterations. `#pragma unroll` with 56 iterations might cause code bloat. I&#x27;ll use `#pragma unroll 8` or just let the compiler decide.
+
+For the main compute loop, `#pragma unroll 16` on a loop of 128 iterations means 8 unrolled chunks. That should be fine.
+
+Also, I want to check: will the compiler optimize away the `if (tid &lt; K)` branch? Since K=56 and blockDim.x=128, half the threads are idle during compute. Does this cause divergence? Yes, warp 0 (threads 0-31) is fully active, warp 1 (32-63) is fully active, warp 2 (64-95) partially active? Wait, K=56, so threads 0-55 are active, 56-127 are idle.
+Warp 0: 0-31 all active
+Warp 1: 32-55 active, 56-63 idle (divergence)
+Warp 2: 64-95 all idle
+Warp 3: 96-127 all idle
+So only 2 warps execute the compute with partial divergence in warp 1. That&#x27;s fine.
+
+Can we reduce divergence by using exactly 56 threads? Or 64 threads?
+With 64 threads: warp 0 (0-31) active, warp 1 (32-55 active, 56-63 idle) - same issue.
+No real way around this unless we pad to a multiple of 32.
+
+But the compute is tiny. Divergence doesn&#x27;t matter much here.
+
+Actually, what if we use 32 threads and each handles multiple outputs?
+```
+int num_k_per_thread = (K + 31) / 32;  // ceil(56/32) = 2
+int k_start = tid * num_k_per_thread;
+int k_end = min(k_start + num_k_per_thread, K);
+
+for (int k = k_start; k &lt; k_end; k++) {
+    float sum = bias[k];
+    for (int j = 0; j &lt; RH; j++) {
+        sum += s_x[j] * s_W[j * K + k];
+    }
+    out[b * K + k] = sum;
+}
+```
+With 32 threads: warp 0 has 32 threads, each handling 1 or 2 outputs (28 threads handle 2, 4 threads handle 1? No.
+Actually if we just do `for (int k = tid; k &lt; K; k += blockDim.x)`, with 32 threads:
+Thread 0: k=0, 32
+Thread 1: k=1, 33
+...
+Thread 23: k=23, 55
+Thread 24: k=24
+...
+Thread 31: k=31
+
+So threads 0-23 handle 2 outputs, threads 24-31 handle 1 output. All threads are active, no divergence. 
+
+But now each thread does independent loops. Threads in the same warp may finish at different times. Thread 0 does twice as much work as thread 31. This is fine if they&#x27;re balanced enough.
+
+For 32 threads, bank conflicts when reading s_W:
+Thread 0 reads s_W[j*K+0] and s_W[j*K+32]
+Thread 1 reads s_W[j*K+1] and s_W[j*K+33]
+For j fixed: threads read s_W[j*K+0], s_W[j*K+1], ..., s_W[j*K+31].
+Offsets are j*56, j*56+1, ..., j*56+31. Banks = (j*56 + tid) % 32.
+Since 56%32=24, banks = (j*24 + tid) % 32.
+For any fixed j, as tid goes 0..31, banks are all different because we&#x27;re adding tid to a constant. No bank conflicts!
+
+So 32 threads works well. But 32 threads means we only use 1 warp per block, so the block loads x and W slower. With 128 threads, we load x in 1 iteration and W in 56. With 32 threads, x loads in 4 iterations and W in 224 iterations. Slower loading.
+
+So we need a balance. 128 threads gives faster loading but some divergence. Since loading dominates (weights are 28KB), 128 threads is better.
+
+Wait, does it? H100 has very high memory bandwidth. 28KB loaded in 56 coalesced transactions. Even with 32 threads, it&#x27;s 224 coalesced transactions. Both are fast.
+
+Actually, for such tiny data, memory latency might matter more than throughput. Having fewer threads means fewer memory-level parallelism.
+
+I think 128 threads is a safe choice. The divergence is only 1 warp out of 4, and the compute time is tiny compared to the overall kernel time.
+
+But let me reconsider: is there any way to have all 128 threads participate in compute?
+Yes! Tile the output. For example, process 4 output rows per block, and each of the 128 threads handles 1 or more outputs. But we only have B=12 rows, so 12 blocks. It doesn&#x27;t help.
+
+Another idea: process multiple B rows per block.
+```
+__global__ void kernel(...) {
+    for (int b = blockIdx.x; b &lt; B; b += gridDim.x) {
+        // load x for row b
+        // compute all K outputs
+    }
+}
+```
+If we launch fewer blocks (e.g., 1 or 2 blocks), each block does more work. This might reduce kernel launch overhead and improve utilization. But for 12 rows, it might not matter.
+
+Actually, with 12 blocks total, and H100 having ~132 SMs, most SMs are idle. This is unavoidable for a tiny problem. But if we use 1 block per SM or something... no, gridDim.x is just the number of blocks.
+
+Wait, I have an idea. What if we process the entire output in a single block? Then we have only 1 kernel launch.
+```
+__global__ void kernel(...) {
+    int tid = threadIdx.x;
+    
+    // Load all x (12 * 128 floats = 6144 floats = 24KB)
+    __shared__ float s_x[B][RH];
+    __shared__ float s_W[RH][K];
+    
+    // Load all x
+    for (int idx = tid; idx &lt; B * RH; idx += blockDim.x) { ... }
+    
+    // Load all W
+    for (int idx = tid; idx &lt; K * RH; idx += blockDim.x) { ... }
+    
+    __syncthreads();
+    
+    // Compute
+    for (int b = 0; b &lt; B; b++) {
+        if (tid &lt; K) { ... }
+        __syncthreads();
+    }
+}
+```
+With 128 threads, we load all data, then each block iteration computes one row. But the __syncthreads() inside the b loop requires all threads to reach it. If tid &gt;= K, they still participate in the loop. Actually we can structure it as:
+```
+for (int b = 0; b &lt; B; b++) {
+    float sum = bias[tid];
+    for (int j = 0; j &lt; RH; j++) {
+        sum += s_x[b][j] * s_W[j][tid];
+    }
+    out[b * K + tid] = sum;
+}
+```
+But this requires all 128 threads to have tid &lt; K, so we need K &gt;= blockDim.x, which is 56 &lt; 128. Not possible.
+
+But we could have tid loop:
+```
+for (int idx = tid; idx &lt; B * K; idx += blockDim.x) {
+    int b = idx / K;
+    int k = idx % K;
+    float sum = bias[k];
+    for (int j = 0; j &lt; RH; j++) {
+        sum += s_x[b][j] * s_W[j * K + k];
+    }
+    out[b * K + k] = sum;
+}
+```
+With 128 threads and B*K=672 elements, each thread handles 672/128 = 5.25 elements on average.
+All threads are active! No divergence.
+And we only need 1 block.
+
+But this single block can&#x27;t utilize multiple SMs. Still, on H100, 1 block can run on 1 SM. For such tiny work, that might be faster than 12 blocks because of reduced launch overhead.
+
+Actually, 12 blocks might have more launch overhead, but since they&#x27;re independent, the GPU can schedule them in parallel across SMs. Wait, only 12 blocks, so at most 12 SMs used. The other 120 SMs are idle. But 12 SMs running 1 block each is more parallel than 1 SM running 1 block.
+
+Hmm, but the total work is so small that 1 block might finish before all 12 blocks even get scheduled.
+
+Let me think about what&#x27;s faster:
+- 12 blocks of 128 threads each: 12 warps running in parallel across up to 12 SMs
+- 1 block of 128 threads: 4 warps running on 1 SM
+
+With 12 blocks, total warps = 48. On an SM that can hold many warps, there&#x27;s limited benefit.
+
+I think 12 blocks (one per row) is fine. But let me also consider another factor: with 12 blocks, each block loads only 128 floats of x. With 1 block, it loads 1536 floats. The total memory traffic is the same.
+
+Actually, let&#x27;s just try the simplest approach and see what profiling says.
+
+Let me also think about whether I can use tensor cores. For 12x128 @ 128x56, tensor cores need the dimensions to be multiples of 8 (or 16) for MMA operations. 12 is not a multiple of 8. Also the size is way too small for tensor cores to be effective. So manual FP32 computation is better.
+
+Let me write the kernel and test. I&#x27;ll start with the 12 blocks, 128 threads per block design. Then I&#x27;ll profile and optimize.
+
+Actually wait, looking more carefully at the problem: x comes into forward with shape (R, B, H), not (B, R, H). So in the reference:
+```python
+r, b, h = x.shape  # R, B, H
+parts = [x[i] for i in range(R)]
+gathered = torch.cat(parts, dim=-1)
+# gathered shape: (B, R*H)
+```
+
+Yes, x[i] has shape (B, H). Concatenating on dim=-1 gives (B, R*H).
+
+And x is contiguous with shape (R, B, H). 
+x[i] = x[i, :, :] which has strides (H, 1) but is NOT contiguous in the batch dimension? Actually, x contiguous shape (4, 12, 32). x[0] shape (12, 32) with offset 0 and strides (32, 1). x[1] shape (12, 32) with offset 384 and strides (32, 1). So x[i] are contiguous slices.
+
+Anyway, the kernel should directly read x as (R, B, H).
+
+Let me write the full Python module code for testing.
+
+I also want to test if a pure PyTorch no-custom-kernel approach is faster. I can write:
+```python
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(R * H, K, bias=True)
+    
+    def forward(self, x):
+        return self.proj(x.transpose(0, 1).contiguous().view(B, R * H))
+```
+
+Wait, `x.transpose(0, 1)` shape is (B, R, H), strides are (H, B*H, 1) for original strides (B*H, H, 1). So transpose(0,1) has strides (32, 384, 1). Then `.view(B, R*H)` needs contiguous strides. The last dim H=32 is contiguous, and the product of remaining dims inside the view is R*H=128. But the stride of dim 1 in transposed tensor is 384. For view to work, we&#x27;d need it to be contiguous, i.e., the next row starts 128 elements after. But it starts 384 elements after. So view fails.
+
+We need `.contiguous()`:
+```python
+x.transpose(0, 1).contiguous().view(B, R * H)
+```
+This creates a copy, which is a kernel launch, then the matmul is another kernel launch.
+
+Alternatively:
+```python
+x.permute(1, 0, 2).contiguous().view(B, R * H)
+```
+Same thing.
+
+Actually, can we use `einsum` or something? `torch.einsum(&#x27;rbh-&gt;brh&#x27;, x)` is a permute. No way around the memory reorganization.
+
+So custom kernel that fuses gather+matmul makes sense.
+
+Let me write the code now.
+
+One more thought: can I use `torch.matmul` with a batched view?
+x has shape (4, 12, 32) and weight has shape (56, 128).
+If I do x.view(4, 12, 32) and want to matmul with W... not straightforward.
+
+Another approach: Treat this as a series of convolutions or grouped operations. But no, it&#x27;s a simple linear.
+
+OK let me finalize the kernel. I&#x27;ll aim for something clean and correct first.
+
+Wait, I want to check one thing about load_inline. When using load_inline with `functions`, I should NOT define pybind11 module manually.
+
+Let me write a test kernel code.
+
+```python
+kernel_code = &quot;&quot;&quot;
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define R 4
+#define B 12
+#define H 32
+#define K 56
+#define RH (R * H)
+
+__global__ void fused_gather_linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ bias,
+    float* __restrict__ out
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    __shared__ float s_x[RH];
+    __shared__ float s_W[RH * K];
+    
+    #pragma unroll
+    for (int idx = tid; idx &lt; RH; idx += blockDim.x) {
+        int r = idx / H;
+        int h = idx % H;
+        s_x[idx] = x[r * B * H + b * H + h];
+    }
+    
+    #pragma unroll
+    for (int idx = tid; idx &lt; K * RH; idx += blockDim.x) {
+        int k = idx / RH;
+        int j = idx % RH;
+        s_W[j * K + k] = W[idx];
+    }
+    
+    __syncthreads();
+    
+    if (tid &lt; K) {
+        float sum = bias[tid];
+        #pragma unroll 16
+        for (int j = 0; j &lt; RH; j++) {
+            sum += s_x[j] * s_W[j * K + tid];
+        }
+        out[b * K + tid] = sum;
+    }
+}
+
+torch::Tensor fused_gather_linear(
+    torch::Tensor x,
+    torch::Tensor W,
+    torch::Tensor bias
+) {
+    auto out = torch::empty({B, K}, x.options());
+    fused_gather_linear_kernel&lt;&lt;&lt;B, 128&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        W.data_ptr&lt;float&gt;(),
+        bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;()
+    );
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+module = load_inline(
+    name=&#x27;fused_gather_linear&#x27;,
+    cpp_sources=&#x27;torch::Tensor fused_gather_linear(torch::Tensor x, torch::Tensor W, torch::Tensor bias);&#x27;,
+    cuda_sources=cuda_source,
+    functions=[&#x27;fused_gather_linear&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(R * H, K, bias=True)
+    
+    def forward(self, x):
+        return module.fused_gather_linear(x, self.proj.weight, self.proj.bias)
+&quot;&quot;&quot;
+```
+
+Wait, `module` is the loaded inline module. But I need to make sure it compiles first.
+
+Actually, there&#x27;s a problem: I used `#pragma unroll` on loops where the iteration count isn&#x27;t known at compile time for the `idx` loops if blockDim.x is a runtime variable. But blockDim.x is 128, a literal constant passed at launch. The compiler might know this, or might not unroll. For the W loading loop: `idx` runs from tid to K*RH step blockDim.x. With blockDim.x=128, and K*RH=7168, each thread does exactly 56 iterations if tid &lt; 128. So `#pragma unroll` might try to unroll 56 iterations which is fine.
+
+But wait, `tid &lt; K` branch - with blockDim.x=128, only half the threads participate. This is fine.
+
+Let me also think about whether I should pass the constant R, B, H, K as template parameters or just hardcode. Hardcoding should allow more optimization.
+
+Let me just compile and test this.
+
+One thing: in the `fused_gather_linear` function, I used `x.options()` to create the output. That should preserve dtype and device.
+
+But I need to make sure the tensors are on CUDA and float.
+
+Let me compile it with compile_kernel.
+
+Actually, let me make sure the code is correct. The x offset:
+x shape (R, B, H) = (4, 12, 32)
+x[r][b][h] offset = r * (B * H) + b * H + h.
+r from 0..3, b from 0..11, h from 0..31.
+This is correct for contiguous tensor.
+
+W shape (K, RH) = (56, 128)
+W[k][j] offset = k * RH + j.
+This is correct for contiguous float tensor.
+
+out shape (B, K) = (12, 56)
+out[b][k] offset = b * K + k.
+
+Loading W[idx] where idx = k * RH + j, and storing to s_W[j * K + k]. So s_W[j][k] = W[k][j], i.e., transpose. Correct.
+
+Then computation: sum_j s_x[j] * s_W[j][k] = sum_j x[b][j] * W[k][j] = (x[b] dot W[k]). Correct.
+
+Adding bias[k]. Correct.
+
+I think this should work. Let me compile and test.
+
+Wait, one more thing: in the forward method, I wrote `return module.fused_gather_linear(x, self.proj.weight, self.proj.bias)`. But `module` is defined at module load time. If there&#x27;s a compilation error, it will fail at import time.
+
+Let me write the code carefully and use compile_kernel first.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\nimport math\n\nR = 4\nB = 12\nH = 32\nK = 56\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n#define R 4\n#define B 12\n#define H 32\n#define K 56\n#define RH (R * H)\n\n__global__ void fused_gather_linear_kernel(\n    const float* __restrict__ x,\n    const float* __restrict__ W,\n    const float* __restrict__ bias,\n    float* __restrict__ out\n) {\n    int b = blockIdx.x;\n    int tid = threadIdx.x;\n    \n    __shared__ float s_x[RH];\n    __shared__ float s_W[RH * K];\n    \n    // Load x for row b\n    #pragma unroll\n    for (int idx = tid; idx &lt; RH; idx += blockDim.x) {\n        int r = idx / H;\n        int h = idx % H;\n        s_x[idx] = x[r * B * H + b * H + h];\n    }\n    \n    // Load W (K, RH) into shared memory transposed: s_W[j*K + k] = W[k*RH + j]\n    #pragma unroll\n    for (int idx = tid; idx &lt; K * RH; idx += blockDim.x) {\n        int k = idx / RH;\n        int j = idx % RH;\n        s_W[j * K + k] = W[idx];\n    }\n    \n    __syncthreads();\n    \n    if (tid &lt; K) {\n        float sum = bias[tid];\n        #pragma unroll 16\n        for (int j = 0; j &lt; RH; j++) {\n            sum += s_x[j] * s_W[j * K + tid];\n        }\n        out[b * K + tid] = sum;\n    }\n}\n\ntorch::Tensor fused_gather_linear(\n    torch::Tensor x,\n    torch::Tensor W,\n    torch::Tensor bias\n) {\n    auto out = torch::empty({B, K}, x.options());\n    fused_gather_linear_kernel&lt;&lt;&lt;B, 128&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        W.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;()\n    );\n    return out;\n}\n\&quot;\&quot;\&quot;\n\nmodule = load_inline(\n    name=&#x27;fused_gather_linear_v1&#x27;,\n    cpp_sources=&#x27;torch::Tensor fused_gather_linear(torch::Tensor x, torch::Tensor W, torch::Tensor bias);&#x27;,\n    cuda_sources=cuda_source,\n    functions=[&#x27;fused_gather_linear&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.proj = nn.Linear(R * H, K, bias=True)\n    \n    def forward(self, x):\n        return module.fused_gather_linear(x, self.proj.weight, self.proj.bias)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ImportError.
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15&#x27; not found (required by /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_47_cache/k_b994a0bb6ab9/fused_gather_linear_v1/fused_gather_linear_v1.so)</div></details></div></details></div>
 </body></html>

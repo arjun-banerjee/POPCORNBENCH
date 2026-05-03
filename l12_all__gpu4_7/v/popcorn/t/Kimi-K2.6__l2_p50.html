@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 50</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:04:55 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 50</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:10:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">50_HiddenMarkovForward.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -89,5 +89,1517 @@ def get_inputs():
 
 def get_init_inputs():
     return [num_states, num_obs]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 290.5s · 115,905 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 290.5s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to write a custom CUDA kernel that computes the HMM forward algorithm (log space) faster than the PyTorch reference.
+
+The reference:
+- num_states = 16
+- num_obs = 64
+- seq_len = 128
+- batch_size = 64
+
+Observations are integer indices (B, T).
+
+Inside forward:
+1. Normalize log_init, log_trans, log_emit. This is just logsumexp subtraction. Could do in CUDA or in Python with PyTorch (fast enough). But we can also incorporate normalization into the kernel or compute on CPU/GPU before calling kernel. Since parameters are small (16, 16, 64), normalization is trivial. We can just compute them in Python and pass to kernel. However, to match the reference, we need to compute normalized versions. But note: the reference returns log likelihood; the normalization of parameters is part of the model. Since parameters are fixed per forward call (though they are nn.Parameter and could be updated), we can precompute normalized versions if we want, but must be careful: the reference recomputes normalization each forward call. However, since parameters are small, doing it in Python is fine.
+
+The main heavy part is the loop over t from 1 to T:
+- For each t:
+  - log_alpha = log_alpha.unsqueeze(-1) + log_A.unsqueeze(0) -&gt; shape (B, S, S)
+  - log_alpha = torch.logsumexp(log_alpha, dim=1) -&gt; shape (B, S)
+  - emit_t = log_B[:, observations[:, t]].t() -&gt; shape (B, S)
+  - log_alpha = log_alpha + emit_t
+
+This is a classic matrix operation: for each batch b and state j at time t:
+  log_alpha[b, j] = logsumexp_i( log_alpha_prev[b, i] + log_A[i, j] ) + log_B[j, obs[b, t]]
+
+Since S=16, B=64, T=128, this is a small state space but many time steps and batch size.
+
+The PyTorch implementation uses broadcasting and logsumexp over dim=1. This materializes a (B, S, S) tensor each step. For B=64, S=16, that&#x27;s 64*16*16=16384 floats, which is small. But doing it T=128 times might have kernel launch overhead and memory bandwidth issues.
+
+A fused CUDA kernel could:
+- Load log_A (S, S) into shared memory.
+- For each batch element, maintain log_alpha vector (size S) in registers or shared memory.
+- Iterate over t from 0 to T-1:
+  - For t=0: log_alpha[b, j] = log_pi[j] + log_B[j, obs[b, 0]]
+  - For t&gt;0: compute new log_alpha[b, j] = logsumexp_i(old_log_alpha[b, i] + log_A[i, j]) + log_B[j, obs[b, t]]
+- After loop, compute log_lik[b] = logsumexp_j(log_alpha[b, j])
+
+Since S=16 is very small, we can process each batch element with one warp (32 threads) or one thread block. But to get good occupancy, we might want each thread block to handle multiple batch elements.
+
+Let&#x27;s think about efficient mapping:
+Option 1: Each thread block handles one batch element, with S threads (16 threads). But warp size is 32, so half warp is wasted. However, we can have each warp handle one batch element, with 32 threads but only 16 do work? Or we can have each thread handle 2 states.
+Option 2: Each thread block handles multiple batch elements, e.g., block size = 128 threads, each thread processes one state of one batch element, so block processes 128/16 = 8 batch elements per time step. But we need to loop over T and synchronize within the block.
+
+Because S=16 is small, register usage per thread is low. We can store the alpha vector for one batch element in registers (16 floats per thread). If we have each thread compute one state j, then for each j, we need to compute logsumexp over i of alpha[i] + A[i][j]. This is a reduction over i. With one thread per j, each thread would loop over i and compute the logsumexp. That means each thread does S iterations (16) and some math. This is fine! We don&#x27;t need shared memory for alpha, we can keep alpha in registers or shared memory. Actually, if each thread computes one j, it needs to read all alpha[i] values. If alpha is stored in shared memory, all threads can read it. If stored in registers, threads would need to exchange data (via shfl) or each thread would have its own copy. But since S=16, we can have each thread store the entire alpha vector in registers (16 floats). Then each thread computes the new alpha for its assigned j? Wait, if each thread stores the entire 16-float alpha vector, then we have redundancy (blockDim.x copies). But if block size is small (e.g., 16 threads per batch element), it&#x27;s okay. Register pressure: 16 floats = 16 registers per thread, which is fine.
+
+Alternatively, we can have each thread compute the entire alpha vector for one batch element. Then we need blockDim.x = number of batch elements processed in parallel. Since B=64, we could launch 64 blocks of 1 thread each, or 64 warps of 1 thread? A block of 1 thread is bad for occupancy. Better to have more threads per block.
+
+Let&#x27;s consider: one warp (32 threads) handles 2 batch elements (each batch element can be handled by 16 threads). Or one warp handles 1 batch element using 32 threads where threads 0-15 compute j=0..15 and threads 16-31 are idle or compute another batch element. Actually, we can pack 2 batch elements per warp: threads 0-15 for batch b, threads 16-31 for batch b+1. That uses all 32 threads. Then each warp maintains two alpha vectors (one for each batch element) in registers. But each thread only needs the alpha vector for its batch element. Since each batch element has 16 states, and each thread group (16 threads) shares the same batch element, they could share alpha via shared memory? But registers are faster. However, with 16 threads per batch element, each thread can hold its own copy of alpha (16 floats) and compute one j. Wait, if each thread holds the entire alpha vector for its batch element, then threads 0-15 all hold the same alpha vector (redundant). That&#x27;s okay but uses 16*16=256 registers per batch element. If we have 2 batch elements per warp, that&#x27;s 512 registers per warp, which is fine (max 255 per thread? Actually per thread limit is 255 registers). Each thread holds 16 floats = 16 registers. That&#x27;s very low. Wait, each thread holds 16 floats for its own batch element. So threads 0-15 hold batch 0 alpha, threads 16-31 hold batch 1 alpha. Each thread computes one j? Or each thread could compute all j&#x27;s? Let&#x27;s see.
+
+If each thread computes one j (so 16 threads compute the 16 states for one batch element), then each thread needs to compute logsumexp_i(alpha[i] + A[i][j]). To do this, each thread can loop over i=0..15 and accumulate. Since each thread has its own copy of alpha in registers, it can read alpha[i] directly. It also needs A[i][j]. A is shared across all batch elements. We can load A into shared memory (16x16 floats = 256 floats = 1KB). Or we can load it into registers if each thread holds a column j of A (i.e., A[i][j] for all i). Since j is fixed per thread, each thread can load the column j into registers (16 floats). Then total registers per thread = 16 (alpha) + 16 (A_col) + some temporaries = ~35 registers. Still fine.
+
+But we have 2 batch elements per warp. Actually, we can have each thread compute the entire new alpha vector for one batch element. Then each thread block of 128 threads can process 128 batch elements at once? But B is only 64. So we could launch 64 threads total. But warps are 32 threads, so 64 threads = 2 warps. That might not saturate the GPU. However, the work per batch element includes T=128 steps, each step doing a 16x16 logsumexp. That&#x27;s 128 * 16 * 16 = 32768 operations (adds, exp, logs) per batch element. For B=64, total is about 2M operations. GPU has many SMs, so 64 threads might be underutilized.
+
+Better to have each thread handle one batch element and compute all states. Then we can launch 64 blocks of, say, 128 threads each? No, if each thread handles one batch element, we only need 64 threads. But we can have each block contain multiple threads each handling one batch element. So block size = min(64, 256) etc. Let&#x27;s say we launch 64 threads in one block? That would be 2 warps, occupancy low but maybe okay because each thread does a lot of work. But GPU likes many warps to hide latency. However, since each thread loops over T and does many arithmetic operations, latency might be hidden by instruction-level parallelism.
+
+Alternatively, we can have each warp (32 threads) handle one batch element, with each thread computing one state j (j = threadIdx.x % 16). Then we need 64 warps total (one per batch element). That is 64 * 32 = 2048 threads. That gives good occupancy. We can arrange them as 64 warps per block (2048 threads) or split across blocks. Max threads per block is 1024 on most GPUs, so we&#x27;d need at least 2 blocks. Let&#x27;s say block size = 1024 threads (32 warps) -&gt; handles 32 batch elements. Then we need 2 blocks to cover B=64. That seems good.
+
+In this scheme:
+- Warp size = 32.
+- Each warp processes one batch element.
+- Threads 0..15 in the warp compute states 0..15.
+- Threads 16..31 are idle? Or we can have them compute states 0..15 for a second batch element? But then we need 2 alpha vectors per warp. We can pair batch elements: warp 0 handles batch 0 and batch 1. Threads 0-15 for batch 0, threads 16-31 for batch 1.
+- Then we have 32 warps per block -&gt; 64 batch elements per block. So we can launch a single block of 1024 threads to handle all B=64. That&#x27;s great! One block means we don&#x27;t need grid synchronization. But does a single block of 1024 threads saturate the GPU? It runs on one SM (since one block runs on one SM). But B=64 is small; maybe one SM is enough. However, if the kernel is compute-bound, other SMs will be idle. We could also launch 2 blocks of 512 threads each (16 warps per block, 32 batch elements per block) to use 2 SMs. Or 4 blocks of 256 threads. But the overhead of multiple blocks is small. Let&#x27;s consider occupancy: a block of 1024 threads uses a lot of registers/shared memory per SM, potentially limiting occupancy. But since each thread uses few registers, it might be okay. However, the kernel might be memory bound loading observations.
+
+Wait, observations are (B, T) = 64*128 = 8192 integers. That&#x27;s tiny. Parameters are tiny. So the kernel is compute-bound? Actually, it&#x27;s dominated by log/exp operations.
+
+Let&#x27;s think about arithmetic intensity:
+For each (b, t), we compute for each j: logsumexp_i(alpha[i] + A[i][j]).
+logsumexp over 16 elements:
+  max_val = max_i(x_i)
+  sum_exp = sum_i(exp(x_i - max_val))
+  result = max_val + log(sum_exp)
+This involves: 16 loads, 16 adds/subtracts, 16 exp, 15 max reductions, 1 log, 1 final add. So maybe ~50 FLOPs per (b, t, j). With S=16, that&#x27;s 800 FLOPs per (b, t). For B=64, T=128, total FLOPs = 64*128*800 ≈ 6.5M FLOPs. That&#x27;s tiny. GPUs do TFLOPs, so this will be memory-bound or latency-bound. Actually, it&#x27;s so small that kernel launch overhead and memory bandwidth for loading alpha and A might dominate.
+
+But PyTorch&#x27;s implementation launches many kernels (one per time step: unsqueeze, add, logsumexp, indexing, add). That&#x27;s 5*128 = 640 kernel launches for the loop alone, plus initial and final ops. That&#x27;s a lot of kernel launch overhead. Our fused kernel will be much faster just by fusing the loop, even if not perfectly optimized.
+
+So the strategy: write a fused CUDA kernel that loops over t inside the kernel.
+
+Implementation details:
+- Host code: normalize log_init, log_trans, log_emit using PyTorch (or inside CUDA). Pass observations (int64 or int32) and the three parameter tensors to the kernel. Since observations are integer indices, we need to index into log_emit.
+- On device: each thread block processes a set of batch elements. Let&#x27;s design a mapping that is flexible.
+
+Simplify: use one thread per batch element. Since B=64, we can launch 64 threads per block, and maybe multiple blocks (though only one block needed). But occupancy with 64 threads per block is low (2 warps). However, each thread does a lot of work (128 iterations). But with 2 warps, the SM might not be fully utilized. We could launch 64 threads in one block and rely on the fact that there are many SMs? No, one block uses one SM. If we have 64 threads, they occupy one SM. If the GPU has 80 SMs, 79 are idle. But the work is so small that one SM might finish quickly. However, we might as well use more threads to process states in parallel.
+
+Let&#x27;s do a per-warp processing:
+- One warp = 32 threads.
+- Each warp processes one batch element.
+- Within a warp, thread j computes state j (for j &lt; S). But S=16, so first 16 threads compute states 0..15, last 16 threads are idle (or compute duplicate). To avoid divergence, we can make each warp process 2 batch elements: first 16 threads for batch b, next 16 threads for batch b+1.
+- Let&#x27;s define:
+  - batch_per_warp = 2 (since S=16 and warp_size=32)
+  - warp_id = threadIdx.x / 32
+  - lane_id = threadIdx.x % 32
+  - batch_idx = blockIdx.x * (blockDim.x / 32 * batch_per_warp) + warp_id * batch_per_warp + (lane_id / 16)
+  - state_idx = lane_id % 16
+- Then each thread computes the recurrence for its assigned (batch_idx, state_idx).
+- We need to compute logsumexp_i(alpha[i] + A[i][state_idx]).
+- How to compute logsumexp across i=0..15 with threads in the warp?
+  - Each thread has its own copy of alpha vector (size 16) in registers. It can compute x_i = alpha[i] + A[i][state_idx] for each i, keeping track of max and sum. That&#x27;s fine, no need for warp reduction. Since S=16, each thread does 16 iterations.
+  - So each thread computes independently. No shfl needed. This is simple and efficient enough.
+  - Each warp handles 2 batch elements in parallel (16 threads each). Since threads are independent, divergence is minimal: all 32 threads execute the same instructions, just on different data. The only divergence might be if lane_id &gt;= 16 and lane_id &lt; 16 have different data, but since they execute same code paths, that&#x27;s fine.
+
+Wait, but lane_id / 16 gives 0 or 1. So threads 0-15 and 16-31 have different batch_idx. But they all execute the same code. The only potential divergence is when we load A[i][state_idx]. Since state_idx = lane_id % 16, threads 0-15 have state_idx 0..15, threads 16-31 also have state_idx 0..15. So threads 0 and 16 both read A[i][0], etc. That&#x27;s fine. They all execute same path.
+
+But what about the final log_lik per batch element? Each batch element has 16 alpha values at time T, computed by 16 threads. We need to compute logsumexp over those 16 values. We can either have one of the 16 threads compute it (reading all 16 values from other threads via shfl) or just have each of the 16 threads redundantly compute the same logsumexp using their own copy of alpha. Since each thread has the full alpha vector in registers, each thread can compute the final logsumexp independently. So threads 0-15 for a batch element all compute the same final log_lik and write it. That&#x27;s redundant but okay. However, we need to avoid race conditions: they all write to the same output location. We can have just one thread per batch element write. So if (lane_id % 16 == 0) thread writes output.
+
+Alternatively, we can have each thread compute the entire alpha vector for one batch element (not just one state). Then we need 64 threads total. We could launch 64 blocks of 1 thread? No. Launch 64 threads in one block? That&#x27;s 2 warps. Each thread does all 16 states per time step. That&#x27;s 16*16 = 256 inner loop iterations per time step. That&#x27;s also fine. But 64 threads only occupy one SM partially.
+
+Comparing the two:
+- Option A (one thread per batch element, all states): 64 threads total. Each thread uses ~16 registers for alpha + maybe 16 for A column. But since it computes all states, it might just loop j=0..15 and i=0..15. That&#x27;s 256 operations per time step. With 64 threads, total parallel work = 64 threads. On a GPU with say 128 cores per SM, one SM could handle this. But other SMs are idle. Might still be fast enough because total work is small and kernel launch overhead is saved.
+- Option B (one thread per state, 2 batch elements per warp): 1024 threads total (32 warps). This uses all SMs? If one block of 1024 threads, it occupies one SM (max 1024 threads per SM on Ampere, but register/shared mem might allow only a few blocks). Actually, a block of 1024 threads uses one SM only. But if we launch 2 blocks of 512 threads, they can run on 2 SMs. 4 blocks of 256 -&gt; 4 SMs. This might help if the kernel is memory/latency bound.
+- Option C (one thread per state, one batch element per block): 16 threads per block, 64 blocks. 64 blocks can be distributed across all SMs. But blocks of 16 threads -&gt; half warp only. Warps within a block: one warp with 16 active threads, 16 inactive. Divergence? If we launch 16 threads, they are in one warp, but only lanes 0-15 have threads. Lanes 16-31 are inactive? Actually, a warp is always 32 threads. If block size is 16, the warp has 16 active threads and 16 inactive. The hardware handles this fine (no divergence penalty if they all follow same path? Actually, if some lanes are disabled, it&#x27;s still okay). But occupancy: 16 threads per block is very low. But 64 blocks total might be okay. However, each block has a small amount of work: one batch element, 16 threads, each computes a logsumexp. But the overhead of 64 blocks might be non-negligible.
+
+Given that the PyTorch reference&#x27;s slowness is due to 640 kernel launches and repeated global memory traffic, even a moderately optimized fused kernel will be much faster. Let&#x27;s aim for simplicity and correctness first, then optimize if needed.
+
+Simpler design: one thread per batch element, compute all states.
+- blockDim.x = 128 (or 256).
+- gridDim.x = (B + blockDim.x - 1) / blockDim.x.
+- Each thread loads its observations sequence (T integers) into local memory? No, T=128, we can read from global memory each step.
+- Each thread maintains float alpha[16] in registers.
+- At t=0:
+  - obs = observations[b, 0]
+  - for j=0..15: alpha[j] = log_init[j] + log_emit[j, obs]
+- For t=1..T-1:
+  - obs = observations[b, t]
+  - for j=0..15:
+    - compute max over i of alpha[i] + log_trans[i][j]
+    - sum exp
+    - alpha[j] = max + log(sum) + log_emit[j][obs]
+- After loop, compute logsumexp over alpha[0..15] to get output[b].
+
+This is straightforward.
+
+But we need to think about memory access patterns:
+- observations: (B, T) int64 or int32. Each thread reads T consecutive elements with stride B. This is strided access but since each thread reads its own row, it&#x27;s coalesced only if threads in a warp read adjacent rows? Actually, thread b and b+1 read observations[b, t] and observations[b+1, t]. If observations is row-major (B, T), then observations[b, t] and observations[b+1, t] are separated by T elements. So they are not adjacent in memory. So access is not coalesced; each warp reads scattered memory. But B=64, T=128, the total observation matrix is 8192 elements ~ 32KB. This fits in L2 cache easily. So memory access is not a bottleneck.
+- log_emit: (S, num_obs) = 16x64. We index by [j, obs]. obs is per thread, so threads in a warp will read different obs values, leading to scattered reads. But again, 16x64 floats = 4KB, fits in cache.
+- log_trans: (S, S) = 16x16 = 256 floats = 1KB, fits in constant memory or shared memory or cache.
+- log_init: 16 floats.
+
+Given the small size, caching is excellent.
+
+We need to consider numerical stability. We want to match PyTorch&#x27;s logsumexp within tolerance 1e-4. The standard logsumexp algorithm:
+  max_val = -INFINITY
+  for i: max_val = max(max_val, x[i])
+  sum = 0
+  for i: sum += exp(x[i] - max_val)
+  result = max_val + log(sum)
+
+Using float (fp32). This is stable and should match PyTorch.
+
+Potential issues:
+- PyTorch&#x27;s logsumexp uses a high-precision accumulation (maybe pairwise or chunk-wise). But for 16 elements, the naive approach should be very close.
+- We need to ensure we use the same normalization as the reference. The reference calls _normalize_log which computes x - logsumexp(x, dim=-1, keepdim=True). So log_init, log_trans, log_emit are normalized on the fly. Since these are small, we can compute them in PyTorch before passing to the kernel, or inside the kernel. Computing in PyTorch is easiest. But we need to make sure we pass the normalized tensors to the kernel.
+
+Wait: the reference does:
+  log_pi = self._normalize_log(self.log_init)
+  log_A = self._normalize_log(self.log_trans, dim=-1)
+  log_B = self._normalize_log(self.log_emit, dim=-1)
+Then uses these. So we can do the same in Python and pass normalized tensors. This is correct.
+
+One subtlety: the reference&#x27;s log_init is shape (num_states,), log_trans (num_states, num_states), log_emit (num_states, num_obs). The CUDA kernel will accept these as float* and observations as long*.
+
+Let&#x27;s implement the kernel with `torch.utils.cpp_extension.load_inline`.
+
+Kernel code:
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+// We&#x27;ll use block sizes like 128 or 256.
+// S = num_states is known at runtime but small (&lt;=16 maybe up to some limit). We can pass it as a constant or dynamic.
+// However, for dynamic shared memory and register arrays, we need compile-time size for static arrays.
+// We can allocate a max size, e.g., 32 or 64, and pass actual num_states.
+#define MAX_STATES 32
+
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b &gt;= B) return;
+
+    // pointers to this batch&#x27;s observations
+    const int64_t* obs_ptr = observations + b * T;
+
+    float alpha[MAX_STATES];
+    float new_alpha[MAX_STATES];
+
+    // t = 0
+    int64_t obs0 = obs_ptr[0];
+    for (int j = 0; j &lt; S; ++j) {
+        alpha[j] = log_init[j] + log_emit[j * num_obs + obs0];
+    }
+
+    // recurrence
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t obs_t = obs_ptr[t];
+        for (int j = 0; j &lt; S; ++j) {
+            // logsumexp_i(alpha[i] + log_trans[i, j])
+            float max_val = -INFINITY;
+            for (int i = 0; i &lt; S; ++i) {
+                float val = alpha[i] + log_trans[i * S + j];
+                if (val &gt; max_val) max_val = val;
+            }
+            float sum_exp = 0.0f;
+            for (int i = 0; i &lt; S; ++i) {
+                sum_exp += expf(alpha[i] + log_trans[i * S + j] - max_val);
+            }
+            new_alpha[j] = max_val + logf(sum_exp) + log_emit[j * num_obs + obs_t];
+        }
+        // swap
+        for (int j = 0; j &lt; S; ++j) {
+            alpha[j] = new_alpha[j];
+        }
+    }
+
+    // final logsumexp
+    float max_val = -INFINITY;
+    for (int j = 0; j &lt; S; ++j) {
+        if (alpha[j] &gt; max_val) max_val = alpha[j];
+    }
+    float sum_exp = 0.0f;
+    for (int j = 0; j &lt; S; ++j) {
+        sum_exp += expf(alpha[j] - max_val);
+    }
+    output[b] = max_val + logf(sum_exp);
+}
+```
+
+But wait: log_trans is stored as (num_states, num_states), row-major in PyTorch. So log_trans[i, j] is at i * S + j. That&#x27;s correct.
+
+Potential performance issues:
+- The inner loops (i and j) are unrollable? With S up to 16, the compiler may unroll them if we use static size. But we are passing S as an arguments. The loops have dynamic bound. However, if we template the kernel on S, we can unroll. Since S is known at runtime but fixed per model (num_states=16), we could compile kernels for a few sizes or just pass S as template parameter? But with load_inline, we can&#x27;t easily compile for runtime values without if/else dispatch. But S is passed to constructor. In the reference, S is a constructor argument. So in ModelNew, we know S at module load time? Actually, `get_init_inputs()` returns [num_states, num_obs]. These are fixed for the task. But ModelNew must accept same constructor args. We can compile a kernel that handles arbitrary S with loops. Given S is small, the compiler may not unroll but the overhead is minor.
+
+Another issue: the loops above have float operations and expf/logf. With 64 threads, each thread does S*S*(T-1) ~ 16*16*127 = 32,512 iterations of adding and expf. `expf` is relatively expensive. 64 threads * 32k = 2M expfs. A GPU core can do maybe ~10-20B expfs per second? So this might take ~0.1 ms. The PyTorch reference does 640 kernel launches, each with some overhead (~5-10 us) = 3-6 ms + actual compute. So a fused kernel should be 10x faster.
+
+But we can improve by using more threads. Let&#x27;s consider using a warp to process one batch element. With 16 threads per batch element (computing one j each), we reduce per-thread work: each thread does S=16 iterations for the logsumexp instead of S*S=256. But we need 16 threads active. Since a warp is 32, we can process 2 batch elements per warp. That gives 64 batch elements total using 32 warps = 1024 threads. This uses more parallelism.
+
+However, with independent threads, we also need to synchronize? No, because each thread maintains its own alpha vector. But we need to handle the fact that after computing new_alpha[j], the warp needs to proceed to next time step. Since there is no data sharing between threads, no __syncthreads needed within a warp. But the warp naturally executes in lockstep. Even if threads are independent, the loop over t is the same for all threads in the warp. So divergence is not an issue.
+
+Wait, but threads 0-15 belong to batch b, threads 16-31 belong to batch b+1. They both execute the t loop. So the warp runs for both batches simultaneously. That&#x27;s fine.
+
+So let&#x27;s design the kernel with:
+- `batch_per_warp = 2` (since S=16 and warp_size=32).
+- `warps_per_block` chosen to fill block size up to 256 or 512.
+- `blockDim.x` = `warps_per_block * 32`.
+- Each thread computes one state j for one batch element.
+
+Implementation:
+```cpp
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int batch_per_warp = (32 / S); // assumes S divides 32
+    int local_batch = lane / S;
+    int state = lane % S;
+
+    int warp_id_in_grid = blockIdx.x * (blockDim.x / 32) + warp;
+    int batch_id = warp_id_in_grid * batch_per_warp + local_batch;
+
+    if (batch_id &gt;= B) return;
+
+    const int64_t* obs_ptr = observations + batch_id * T;
+
+    // Each thread holds alpha vector for its batch element.
+    float alpha[MAX_STATES];
+    // Load init and emit 0
+    int64_t obs0 = obs_ptr[0];
+    for (int i = 0; i &lt; S; ++i) {
+        alpha[i] = log_init[i] + log_emit[i * num_obs + obs0];
+    }
+
+    // Need log_trans column j = state: log_trans[i*S + state]
+    // But we need all i for alpha[i] + trans[i][state].
+    // We&#x27;ll compute logsumexp over i.
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t obs_t = obs_ptr[t];
+        float max_val = -INFINITY;
+        for (int i = 0; i &lt; S; ++i) {
+            float val = alpha[i] + log_trans[i * S + state];
+            if (val &gt; max_val) max_val = val;
+        }
+        float sum_exp = 0.0f;
+        for (int i = 0; i &lt; S; ++i) {
+            sum_exp += expf(alpha[i] + log_trans[i * S + state] - max_val);
+        }
+        alpha[state] = max_val + logf(sum_exp) + log_emit[state * num_obs + obs_t];
+        // Wait! Other threads in the same warp (but different state) also update alpha[state] for their state.
+        // But the next iteration requires the full alpha vector for all states.
+        // Since each thread only updates alpha[state], we need to make the updated alpha available to other threads.
+        // Without __syncwarp() or __syncthreads(), threads within a warp execute in lockstep but registers are private.
+        // Actually, the next iteration is after the assignment. Since all threads in the warp execute the same instruction, after the assignment to alpha[state], each thread has its own alpha[state] updated. But the other entries alpha[k] (k != state) are stale (from previous iteration).
+        // Since each thread only needs its own alpha vector to compute the next state&#x27;s logsumexp, and each thread has the full alpha vector in registers (we loaded all S entries), the issue is that after t=1, thread for state 0 has updated alpha[0], but thread for state 1 still has old alpha[1] (from t=0) in its registers? Actually, each thread maintains its own copy of the entire alpha vector. So thread for state 0 updates alpha[0] in its own copy. Thread for state 1 updates alpha[1] in its own copy. For the next iteration (t=2), thread for state 0 needs alpha[i] for all i. But alpha[1] in thread 0&#x27;s copy is from t=0, not updated! That&#x27;s a problem.
+        // We need to share the updated alpha values across threads.
+    }
+}
+```
+
+Right! I missed that. If each thread has its own copy of alpha, and only updates one element, the other elements become stale. We need to either:
+1. Have each thread compute the entire alpha vector (so it doesn&#x27;t need other threads&#x27; data).
+2. Use warp shuffles to exchange updated alpha values after each time step.
+3. Use shared memory to store alpha for each batch element, so threads can read all alpha entries.
+
+Let&#x27;s go with option 1 (one thread per batch element, compute all states). It&#x27;s simpler and avoids synchronization. The downside is less parallelism (64 threads). But as argued, the total workload is tiny, and the main win is fusing the loop.
+
+Alternatively, we can do option 3: store alpha in shared memory. For batch_per_block batch elements, each has S floats. So shared memory size = batch_per_block * S * sizeof(float). If block handles, say, 8 batch elements (256 threads, 8 warps, 16 batch elements? Wait, 256 threads = 8 warps. Each warp handles 2 batch elements -&gt; 16 batch elements per block. Shared memory = 16 * 16 * 4 = 1024 bytes. Very small.). Then each thread can write its computed alpha[state] to shared memory, then read all alpha[i] for the next step. But we need to synchronize within the warp or block. Since the warp executes in lockstep, a __syncwarp() after writing to shared memory is sufficient (but __syncthreads is safer). However, since each thread in the warp writes to a different location in shared memory, and then reads from other locations, we need to ensure writes are visible. A __syncwarp() (for threads in the same warp) or __syncthreads() (for all threads in block) is needed.
+
+But using shared memory and warp-level parallelism adds complexity. Given the problem size, the simpler per-thread approach is likely faster than PyTorch and good enough. Let&#x27;s prototype it and measure.
+
+Wait, but we can also vectorize or process multiple batch elements per thread to increase occupancy. For example, each thread handles 2 batch elements. Then we need 32 threads total. That&#x27;s even fewer threads. Better to have each thread handle 1 batch element.
+
+We could also have each block handle multiple batch elements sequentially: a block of 256 threads handles 256 batch elements, but B is only 64. So we could have each thread handle 1 batch element, launch 64 threads in one block, and also have each thread process a small chunk. But 64 threads is fine.
+
+Wait, we can increase block size and grid size by splitting the batch dimension. For B=64, we could have blockDim.x = 256, but then only first 64 threads do work. That&#x27;s fine but still only 64 threads total. To use more SMs, we need more blocks. But B is small.
+
+What if we process the time dimension in parallel? Not possible due to recurrence.
+
+Could we process the batch dimension across multiple blocks by having each block process a subset of batch elements? Yes, but total threads remain 64. One block with 64 threads, or two blocks with 32 threads each, etc. The total number of warps is 2. That might limit throughput but kernel launch overhead is the main target.
+
+Alternatively, we could use batched matrix multiplication optimizations. The recurrence is essentially a matrix-vector product in log-space (log-matrix-log-vector product). For small S=16, we could implement it using warp-level matrix multiply. But maybe overkill.
+
+Let&#x27;s do the simple kernel first, then profile and see.
+
+But wait: there might be instruction-level parallelism issues if each thread does a long loop. But the GPU can hide latency with many warps. With only 2 warps, might be slow. However, each iteration has 16 expf calls. The compiler might interleave instructions. Let&#x27;s try.
+
+Actually, we can increase parallelism by having each thread handle a portion of the states, then use shared memory for alpha. Let&#x27;s design that properly.
+
+Warp-level approach with shared memory:
+- batch_per_warp = 2 (S=16).
+- warps_per_block = 8 -&gt; block size = 256 threads -&gt; 16 batch elements per block.
+- Total blocks = (B + batch_per_block - 1) / batch_per_block. For B=64, batch_per_block=16 -&gt; 4 blocks.
+- This uses 4 SMs. Better.
+
+Shared memory layout:
+- For each batch element in block, allocate float alpha[16].
+- Shared memory size = batch_per_block * S * sizeof(float). With 16 batch elements -&gt; 1024 bytes.
+- In the kernel:
+  - Determine warp and lane.
+  - local_batch = lane / S; state = lane % S.
+  - batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch.
+  - if batch_id &gt;= B: return.
+  - smem_offset = (warp * batch_per_warp + local_batch) * S.
+  - Load observations for this batch element.
+  - Initialize alpha: for i=0..S-1: smem[smem_offset + i] = log_init[i] + log_emit[i*num_obs + obs0].
+  - __syncwarp(); // ensure init is visible.
+  - For t=1..T-1:
+    - Read obs_t.
+    - Read alpha_i = smem[smem_offset + i] for i=0..S-1 into registers (or read on the fly).
+    - Compute logsumexp_i(alpha_i + trans[i][state]).
+    - Write result to smem[smem_offset + state].
+    - __syncwarp(); // ensure all threads in warp have written before next iteration.
+  - After loop, compute final logsumexp from smem[smem_offset + i].
+  - If state == 0, write output[batch_id] = result.
+
+Wait, __syncwarp() is a new thing (CUDA 9+). It synchronizes all threads in the warp. Since we only need to sync the threads that belong to the same warp (and same batch element group), and each warp handles 2 batch elements, we need to sync the whole warp? Actually, threads 0-15 and 16-31 belong to two different batch elements. But they are in the same warp. __syncwarp() synchronizes all threads in the warp. That&#x27;s fine; they reach the sync at the same time. However, we must ensure all threads in the warp take the same path (no divergence). Since batch_id may be out of bounds for some lanes if B is not a multiple of batch_per_warp*warps_per_block*gridDim.x. For boundary cases, some threads might return early, causing divergence. To avoid this, we can pad B or handle boundaries carefully. Since B=64 and batch_per_block=16, gridDim.x=4, each block handles exactly 16 batch elements. Each warp handles 2 batch elements, and all warps are full. No boundary issues. But to be general, we should handle batch_id &gt;= B. If some lanes in a warp are out of bounds and return, the warp will be incomplete. That can cause hangs with __syncwarp(). So we need to be careful.
+
+Simpler: ensure block size and grid are such that all warps are fully utilized. We can set batch_per_warp = 1 (i.e., 32 threads per batch element, but only 16 active). Then half the threads in the warp are inactive. That&#x27;s okay if they are disabled for the entire kernel (e.g., `if (lane &gt;= S) return;`). But then __syncwarp() would hang because some threads returned. So we cannot use __syncwarp() if some threads return. We could have inactive threads still participate but do nothing. That is, `if (lane &lt; S) { do work }` inside loops. But then the active threads and inactive threads diverge. However, if the inactive threads just skip the computation, the active threads will still run. At sync points, we need all threads in the warp to reach __syncwarp(). So inactive threads would need to reach it too. That&#x27;s fine if they are in the same warp but skip the work. But divergence might hurt a bit.
+
+Actually, warp divergence: threads with lane &lt; S execute the code, lane &gt;= S skip it. At __syncwarp(), all threads must reach it. For inactive threads, they just reach it without doing work. That&#x27;s okay.
+
+But we can avoid divergence entirely by setting batch_per_warp = 2 as before, so all 32 threads are active.
+
+General boundary handling: We can compute `int num_batches_in_block = min(batch_per_block, B - blockIdx.x * batch_per_block);` But warps are still full. We can just launch exactly enough blocks to cover B, and ensure B is a multiple of batch_per_warp. For general B, we might need to handle remainder. But since the task uses B=64, we could just assert or handle with batch_per_warp=2 and blockDim=256 and grid=ceil(B/(batch_per_warp*warps_per_block)). With 64, it&#x27;s exact. But for correctness with arbitrary inputs, we need to handle any B.
+
+To handle arbitrary B safely with __syncwarp():
+- We can process batches in chunks of batch_per_warp inside the block, and for each warp, check if its first batch is within bounds. But if the warp has one valid and one invalid batch (when B is odd), then some lanes are active and some inactive, but they still need to reach __syncwarp(). The inactive lanes can just not write to shared memory and not read observations. That&#x27;s okay. Let&#x27;s handle it.
+
+However, the simplest safe approach is to not use __syncwarp() and instead have each thread compute the full alpha vector. This avoids any inter-thread communication and boundary issues. Given that the workload is small and the main win is fusing, this should be sufficient. Let&#x27;s implement the simple version and test.
+
+But I worry about performance with only 64 threads. Let&#x27;s calculate: each thread does ~ (T-1)*S*S ≈ 127*256 = 32512 iterations of inner loop. Each iteration does an add, a compare, and later an exp, add. The second loop over i for sum_exp does another add, sub, exp, add. So per (b,t,j), there are 2*S=32 operations plus exp/log. For S=16, it&#x27;s manageable. On a GPU, a thread can do maybe 10-20 FLOP per cycle. 32512 iterations might take ~3000 cycles. At 1 GHz, that&#x27;s 3 microseconds per thread. 64 threads in 2 warps. The SM can execute these 2 warps. 3 microseconds total? That seems extremely fast. Even if it&#x27;s 30 microseconds, it&#x27;s still way faster than PyTorch&#x27;s many kernel launches.
+
+Let&#x27;s also consider using smaller loops: for t loop, we have two inner loops over i. We can combine them into one loop to reduce memory reads of alpha[i] and trans[i][j]. Actually, we can compute max first, then sum. That&#x27;s two passes. But we can compute max and sum in one pass using the &quot;online&quot; logsumexp algorithm:
+  max = -inf
+  sum = 0
+  for i:
+    if val &gt; max:
+      sum = sum * exp(max - val) + 1
+      max = val
+    else:
+      sum += exp(val - max)
+  result = max + log(sum)
+
+This is slightly different but should be numerically equivalent within tolerance? Let&#x27;s check. The standard online logsumexp algorithm:
+  max_val = -inf
+  sum_exp = 0
+  for each val:
+    if val &gt; max_val:
+      sum_exp = sum_exp * exp(max_val - val) + 1.0f
+      max_val = val
+    else:
+      sum_exp += exp(val - max_val)
+  return max_val + log(sum_exp)
+
+This is mathematically equivalent to max + log(sum exp(val - max)). It uses one pass instead of two. This reduces the number of loads from alpha and trans by half. With S=16, this is minor, but still good. However, we need to ensure numerical stability and match PyTorch. For 16 elements, the two-pass version is very standard and likely to match PyTorch exactly. PyTorch&#x27;s logsumexp also effectively does a two-pass (find max, then sum). It might use a custom kernel that does it in one pass or two. Let&#x27;s stick to two-pass for simplicity and accuracy.
+
+But we can prefetch alpha[i] + trans[i][j] into a small local array `vals[16]` to avoid re-computing the sum. That costs 16 registers but saves the add in the second loop. Actually, we can compute `vals[i] = alpha[i] + trans[i][j];` in the first loop while finding max, then in the second loop use `vals[i]`. This means we need an array of size S per thread. Since S=16, that&#x27;s fine.
+
+Let&#x27;s optimize the simple kernel a bit:
+```cpp
+#define MAX_STATES 32
+
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b &gt;= B) return;
+
+    const int64_t* obs = observations + b * T;
+    float alpha[MAX_STATES];
+    float vals[MAX_STATES];
+
+    int64_t o0 = obs[0];
+    #pragma unroll
+    for (int j = 0; j &lt; S; ++j) {
+        alpha[j] = log_init[j] + log_emit[j * num_obs + o0];
+    }
+
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = obs[t];
+        #pragma unroll
+        for (int j = 0; j &lt; S; ++j) {
+            float max_val = -1e20f; // -INFINITY
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                vals[i] = alpha[i] + log_trans[i * S + j];
+                if (vals[i] &gt; max_val) max_val = vals[i];
+            }
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                sum += expf(vals[i] - max_val);
+            }
+            alpha[j] = max_val + logf(sum) + log_emit[j * num_obs + ot];
+        }
+    }
+
+    float max_val = -1e20f;
+    for (int j = 0; j &lt; S; ++j) {
+        if (alpha[j] &gt; max_val) max_val = alpha[j];
+    }
+    float sum = 0.0f;
+    for (int j = 0; j &lt; S; ++j) {
+        sum += expf(alpha[j] - max_val);
+    }
+    output[b] = max_val + logf(sum);
+}
+```
+
+Note: using -1e20f instead of -INFINITY to avoid issues with `logf(0)`? Actually, if alpha[i] + trans[i][j] is -inf for all i, max_val stays -inf, sum is 0, log(0) is -inf. In the reference, _normalize_log ensures that log_trans has rows that sum to 1 in prob space, so log_trans is finite unless there are zeros. log_init is normalized. log_emit is normalized. PyTorch&#x27;s nn.Parameter is initialized to zeros, so after normalization, they become -log(S), finite. So we don&#x27;t have -inf. Using -1e20f is safe, but to be accurate we can use a large negative constant or -INFINITY. `expf(-INFINITY)` returns 0, `logf(0)` returns -inf. That&#x27;s okay. But we need to avoid `vals[i] - max_val` being NaN if both are -inf. `(-inf) - (-inf)` is NaN. But as said, values are finite. So safe.
+
+Actually, `log_emit` is normalized, so elements are finite. `log_init` finite. `log_trans` finite. So no infinities. We can initialize max_val to `-1e20f` or just compute max by first setting max_val = vals[0] and then looping i=1..S-1. That avoids the issue entirely. Since S &gt;= 1.
+
+Let&#x27;s change max finding to:
+```cpp
+float max_val = vals[0];
+for (int i = 1; i &lt; S; ++i) {
+    if (vals[i] &gt; max_val) max_val = vals[i];
+}
+```
+Similarly for final logsumexp.
+
+This is slightly faster.
+
+But the compiler may not unroll loops with dynamic bound S. Since S is passed as an argument, loops have dynamic trip count. We can template the kernel on S_max and pass S as an argument. But we cannot template on actual S at runtime without dispatch. However, we know the actual S is 16 for this benchmark, but it could be any value from constructor args.
+
+We can use `constexpr` if we pass S as template parameter. But since S is a runtime variable, we&#x27;d need a switch statement. That&#x27;s possible: `switch(num_states) { case 1: kernel&lt;1&gt;&lt;&lt;&lt;...&gt;&gt;&gt;; break; ... case 32: kernel&lt;32&gt;&lt;&lt;&lt;...&gt;&gt;&gt;; break; default: kernel&lt;0&gt;&lt;&lt;&lt;...&gt;&gt;&gt;; }` where kernel&lt;0&gt; handles generic case with dynamic loops. But writing a switch for up to say 64 is tedious but can be done with a helper macro. However, for this specific task, num_states = 16, so we could create a kernel specialized for 16? But ModelNew accepts constructor args, so we need to support arbitrary num_states. We could compile a generic kernel and rely on compiler optimization. Since S is small and constant within the loop, the compiler might not fully unroll but will still generate efficient code.
+
+Wait, in CUDA, if we pass S as a function argument, loops bounded by S are not unrolled unless the compiler can determine it&#x27;s constant. But even without unrolling, the overhead of loop branches for 16 iterations is negligible compared to expf.
+
+Another optimization: `log_emit[j * num_obs + ot]` is constant for a given j and t across all i loops. We can precompute it before the i loops.
+
+So for each j:
+```cpp
+float emit = log_emit[j * num_obs + ot];
+float max_val = alpha[0] + log_trans[0 * S + j];
+vals[0] = max_val;
+for (int i = 1; i &lt; S; ++i) {
+    float v = alpha[i] + log_trans[i * S + j];
+    vals[i] = v;
+    if (v &gt; max_val) max_val = v;
+}
+float sum = 0.0f;
+for (int i = 0; i &lt; S; ++i) {
+    sum += expf(vals[i] - max_val);
+}
+alpha[j] = max_val + logf(sum) + emit;
+```
+
+This avoids loading emit inside the inner loop.
+
+Similarly, log_trans can be loaded via pointer. Since S is small, cache is fine.
+
+Potential performance improvement: use `__ldg` (load global through read-only cache) for log_trans, log_emit, observations. `__ldg` can help but is optional.
+
+Another thought: we could process the time loop in chunks and keep alpha in registers. That&#x27;s already the case.
+
+Let&#x27;s estimate register usage: alpha[16] + vals[16] + a few temporaries = ~38 floats = 38 registers. That&#x27;s well below 255. So we can have many blocks per SM if needed.
+
+If we launch 64 threads in one block, occupancy is limited by block size. With 64 threads, we can have many blocks per SM if SM supports 2048 threads. So 32 blocks per SM. But we only have 1 block. So only 64 threads on one SM.
+
+If we launch 2 blocks of 32 threads each, each block has 1 warp. We can have up to 32 blocks per SM (64 warps). But total is only 2 blocks, so they can run on 2 SMs. Still, the total number of warps is 2. The GPU can run 2 warps on one SM. Latency hiding might be poor.
+
+To get more warps, we need more threads. Let&#x27;s increase block size to 256, but still only 64 threads are active. No, that&#x27;s worse: 256 threads, 64 active, 192 idle. But total warps = 8. Idle threads still consume resources.
+
+Better to have each thread handle multiple batch elements. For example, each thread handles `batch_per_thread` batch elements in a loop. Then with blockDim.x=256, total batch elements processed = 256 * batch_per_thread. For B=64, batch_per_thread = 1, total threads = 64. If we set blockDim.x=256 and have each thread process 1 batch element, we launch 1 block but only 64 threads are &lt;= B. The other 192 threads return. That&#x27;s okay but still only 64 active threads.
+
+Wait, we want more active threads. If B=64, max active threads is 64 if one thread per batch. So we can&#x27;t have more active threads unless we parallelize over states or time. Time cannot be parallelized. States can.
+
+So let&#x27;s parallelize over states but avoid the sync issue by having each warp handle one batch element and use warp shuffle to exchange alpha values, or use shared memory. Since S=16, we can have each warp process one batch element with 16 threads (half warp). But half-warp execution is okay. Let&#x27;s design a warp-level kernel where each warp handles one batch element, 16 threads active (lane 0-15), lanes 16-31 are inactive but do not return; they just skip work and participate in __syncwarp() if needed.
+
+But __syncwarp() requires all threads in the warp to execute it. Lanes 16-31 can just reach it. However, there is no divergence if we do:
+```cpp
+bool active = (lane &lt; S);
+if (active) {
+    // do work
+}
+__syncwarp();
+```
+The `if (active)` creates divergence: lanes 0-15 execute the body, lanes 16-31 skip it. After the body, all threads hit __syncwarp(). That&#x27;s allowed. The hardware handles divergence. Performance wise, since S=16 and warp is 32, half the warp is idle. The kernel would be 2x slower than a fully utilized warp for the compute part. But maybe still fast enough.
+
+But we can pack 2 batch elements per warp: lane 0-15 for batch b, lane 16-31 for batch b+1. Then all threads are active. The issue is exchanging alpha values between lanes that belong to the same batch element but different state index.
+
+We can use warp shuffles. For example, after computing new_alpha for each state, each thread holds new_alpha for its state. To broadcast it to other threads in the same sub-warp (batch element), we can do shfl_sync. For 16 threads, we need to exchange 16 floats. Each thread needs all 16 floats. We can do a butterfly shuffle or just loop over k=0..15:
+  shfl(new_alpha, k, 0xFFFF)
+But we need to restrict to the sub-group of 16 threads. warp shfl takes a mask. We can use `__shfl_sync(mask, var, srcLane)`. For threads 0-15 (mask 0x0000FFFF) and 16-31 (mask 0xFFFF0000). Actually, each half-warp is a contiguous group of 16 lanes. The `srcLane` is relative to the warp? __shfl_sync takes `srcLane` as absolute lane ID within the warp. So for thread group 0-15, to get lane k&#x27;s value, we call `__shfl_sync(0x0000FFFF, my_new_alpha, k)`. For group 16-31, we call `__shfl_sync(0xFFFF0000, my_new_alpha, 16 + k)`.
+
+Alternatively, we can use shared memory: each thread writes new_alpha to a shared memory slot indexed by (warp_id * 2 + local_batch) * S + state. Then __syncwarp(). Then each thread reads all alpha values from that shared memory offset. Shared memory is fast and simple. Since batch_per_warp=2, and warps_per_block say 8, shared mem = 16 * 16 * 4 = 1024 bytes. Very small. This is much simpler than shuffles and avoids sync issues if we sync within each sub-warp? Actually, __syncwarp() syncs the entire warp. Since the two batch elements are in the same warp, after writing to shared memory, a __syncwarp() ensures writes are visible to all threads in the warp. Then each thread can read the shared memory. That&#x27;s safe.
+
+But as noted, __syncwarp() on the entire warp is fine. After __syncwarp(), threads 0-15 read the alpha for batch 0, threads 16-31 read alpha for batch 1.
+
+So the kernel design:
+- `batch_per_warp = 32 / S` (assuming S divides 32). For S=16, it&#x27;s 2.
+- `warps_per_block` chosen to have reasonable block size. Let&#x27;s say 8 warps -&gt; 256 threads, 16 batch elements per block.
+- `batch_per_block = warps_per_block * batch_per_warp`.
+- `num_blocks = (B + batch_per_block - 1) / batch_per_block`.
+- Shared memory: `extern __shared__ float smem[];` size = batch_per_block * S * sizeof(float).
+- Each thread:
+  - `lane = threadIdx.x % 32`
+  - `warp = threadIdx.x / 32`
+  - `local_batch = lane / S`
+  - `state = lane % S`
+  - `batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch`
+  - `smem_idx = (warp * batch_per_warp + local_batch) * S`
+  - if `batch_id &gt;= B`: still need to participate in __syncwarp() to avoid deadlock.
+    - We can handle boundaries by having inactive threads not do work but still reach syncs.
+    - Actually, if some threads in a warp are out of bounds and some are in bounds, the in-bounds threads will do work and write to smem, then call __syncwarp(). The out-of-bounds threads must also call __syncwarp(). But if they just skip everything and reach __syncwarp(), it&#x27;s fine.
+    - To avoid reading/writing smem out of bounds for out-of-bounds threads, we can clamp smem_idx or just let them write to a safe location? Better to just have them not read/write but still call __syncwarp(). We can set a flag `bool active = (batch_id &lt; B);`.
+    - However, if active threads read from smem that inactive threads should have written (but didn&#x27;t), the data is garbage. But inactive threads correspond to batch_id &gt;= B, so no valid batch. Active threads only read from smem indices belonging to their own batch. Since all threads in the same sub-group (same batch) are either all active or all inactive? Not necessarily. If B is odd, warp 0 local_batch=0 is active, local_batch=1 is inactive. Then threads 0-15 would read smem for batch 0, which was written by threads 0-15. Threads 16-31 are inactive and do not write to smem for batch 1. But threads 0-15 don&#x27;t read batch 1&#x27;s smem. So that&#x27;s fine! The only risk is that __syncwarp() requires all threads in the warp to reach it. The inactive threads 16-31 will reach it. But they must reach the same __syncwarp() call as the active threads. If we branch `if (active) { ... __syncwarp(); } else { __syncwarp(); }`, then the syncs are in different divergent paths. Actually, that&#x27;s not allowed: __syncwarp() inside divergent code can deadlock if not all threads in the warp take the branch. The recommended pattern is:
+```cpp
+if (active) {
+    // do work and write to smem
+}
+__syncwarp();
+if (active) {
+    // read from smem and continue
+}
+```
+As long as the __syncwarp() is outside the branch, all threads in the warp reach it. The conditional writes: inactive threads don&#x27;t write. That&#x27;s fine because active threads don&#x27;t read those locations. The question is: does the __syncwarp() guarantee that writes from active threads are visible to other active threads in the same warp? Yes, __syncwarp() is a memory barrier for the warp.
+
+But we also need to ensure that inactive threads don&#x27;t cause issues with reading observations or writing output. They just skip those parts.
+
+So the kernel:
+```cpp
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    extern __shared__ float smem[];
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int batch_per_warp = 32 / S;
+    int local_batch = lane / S;
+    int state = lane % S;
+    int batch_per_block = (blockDim.x / 32) * batch_per_warp;
+    int batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch;
+    int smem_offset = (warp * batch_per_warp + local_batch) * S;
+
+    bool active = (batch_id &lt; B);
+
+    const int64_t* obs_ptr = nullptr;
+    if (active) {
+        obs_ptr = observations + batch_id * T;
+    }
+
+    // initialization
+    if (active) {
+        int64_t o0 = obs_ptr[0];
+        float val = log_init[state] + log_emit[state * num_obs + o0];
+        smem[smem_offset + state] = val;
+    }
+    __syncwarp(); // wait for all states to be written
+
+    // recurrence
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = 0;
+        if (active) {
+            ot = obs_ptr[t];
+        }
+        // each active thread computes its state&#x27;s new alpha
+        if (active) {
+            // read alpha vector for this batch from smem into registers
+            float alpha_i[MAX_STATES];
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                alpha_i[i] = smem[smem_offset + i];
+            }
+            // compute logsumexp_i(alpha_i[i] + log_trans[i][state])
+            float max_val = alpha_i[0] + log_trans[0 * S + state];
+            float vals[MAX_STATES];
+            vals[0] = max_val;
+            #pragma unroll
+            for (int i = 1; i &lt; S; ++i) {
+                float v = alpha_i[i] + log_trans[i * S + state];
+                vals[i] = v;
+                if (v &gt; max_val) max_val = v;
+            }
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                sum += expf(vals[i] - max_val);
+            }
+            float result = max_val + logf(sum) + log_emit[state * num_obs + ot];
+            smem[smem_offset + state] = result;
+        }
+        __syncwarp();
+    }
+
+    // final logsumexp
+    if (active &amp;&amp; state == 0) {
+        float max_val = smem[smem_offset + 0];
+        #pragma unroll
+        for (int i = 1; i &lt; S; ++i) {
+            float v = smem[smem_offset + i];
+            if (v &gt; max_val) max_val = v;
+        }
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i &lt; S; ++i) {
+            sum += expf(smem[smem_offset + i] - max_val);
+        }
+        output[batch_id] = max_val + logf(sum);
+    }
+}
+```
+
+Wait, but `__syncwarp()` is inside the loop. The compiler might generate it as a barrier. However, for threads that are inactive, `active = false`, they skip the inner `if(active)` block but still hit `__syncwarp()`. This is correct.
+
+But there is a subtlety: in the initialization, we have `__syncwarp()` after writing to smem. That ensures all 32 threads in the warp have reached it. Since inactive threads don&#x27;t write, but active ones do. Good.
+
+In the recurrence loop, we read `smem[smem_offset + i]` inside the active block. But what if some threads in the warp are inactive? Their `smem_offset` corresponds to an out-of-bounds batch. But we only read from `smem_offset` for active threads. Since active threads&#x27; `smem_offset` corresponds to a batch that was fully written by active threads in the same sub-warp, and the sub-warp is all active (assuming batch_per_warp divides the warp and B is multiple of batch_per_warp). But if B is not a multiple, some sub-warps may be partially active. In that case, active threads in that sub-warp would have written their states, but other threads in the same sub-warp (same batch) might be inactive. Wait, sub-warp is defined by `local_batch`. If batch_id = ... + local_batch. If B is odd, for a warp, local_batch=0 batch might be active, local_batch=1 batch might be inactive. But threads 0-15 (local_batch=0) are active, threads 16-31 (local_batch=1) are inactive. The active threads read `smem[smem_offset + i]` where `smem_offset` is for batch 0. The writes to `smem_offset + state` are done by active threads 0-15. The inactive threads 16-31 do not write to batch 0&#x27;s smem. That&#x27;s fine, because active threads 0-15 wrote all states for batch 0. So reading is safe.
+
+But what about the reverse: a warp where local_batch=0 is inactive and local_batch=1 is active. For example, batch_id starts at block*batch_per_block + warp*batch_per_warp. If that is the last batch (batch_id = B-1), then local_batch=0 is active, local_batch=1 is inactive. In general, because batch_id increases with local_batch, if some are inactive, it&#x27;s the higher local_batch ones that are inactive (since batch_id is monotonic in local_batch). So within a warp, local_batch=0..k-1 are active, local_batch=k..batch_per_warp-1 are inactive. But a sub-warp is 16 threads (for S=16). So local_batch=0 threads (0-15) are active, local_batch=1 threads (16-31) are inactive. The active threads write all states. The inactive threads don&#x27;t need to read or write. So safe.
+
+Now, what if S does not divide 32? Then `batch_per_warp = 32 / S` is not integer. We can use integer division but then some threads would be unused. For general S, it&#x27;s easier to set `batch_per_warp = 1` and have each warp handle one batch element with S active threads. But that wastes 32-S threads. For S=16, we have exactly 2 per warp. If S=10, batch_per_warp = 3 (30 threads active, 2 idle). That might cause some inactive threads in the same sub-warp as active ones. For simplicity in this specific problem, S=16. But to be robust, we could handle arbitrary S with a fallback to the per-thread kernel. Or we can do `batch_per_warp = 32 / S` and `state = lane % S`, `local_batch = lane / S`. If S doesn&#x27;t divide 32, the last few threads in the warp are idle (e.g., S=10, local_batch=0 for lanes 0-9, local_batch=1 for 10-19, local_batch=2 for 20-29, lanes 30-31 idle). The sub-warp of 10 threads is not a hardware unit, but threads in a warp execute in SIMT. Divergence between local_batches is handled by the scheduler. As long as all threads in the warp reach __syncwarp(), it&#x27;s fine. The only issue is that sub-warp barriers aren&#x27;t hardware; __syncwarp() syncs the entire warp. So after writing to smem, a __syncwarp() ensures writes from all active threads are visible. Then active threads can read all states for their batch. Since each batch&#x27;s smem is written by a contiguous group of S threads, and all groups in the warp are active or not monotonically, this works.
+
+However, for S not dividing 32, `lane / S` and `lane % S` works fine. `batch_per_warp = 32 / S` using integer division. The remaining threads (lane &gt;= batch_per_warp * S) are idle. We should mark them inactive. But S=16 is exact.
+
+Let&#x27;s refine the kernel to be robust:
+```cpp
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    extern __shared__ float smem[];
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int threads_per_batch = S; // each batch element uses S threads
+    int batch_per_warp = 32 / threads_per_batch;
+    int local_batch = lane / threads_per_batch;
+    int state = lane % threads_per_batch;
+    int batch_per_block = (blockDim.x / 32) * batch_per_warp;
+    int batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch;
+    int smem_offset = (warp * batch_per_warp + local_batch) * S;
+
+    bool active = (batch_id &lt; B) &amp;&amp; (lane &lt; batch_per_warp * threads_per_batch);
+
+    const int64_t* obs_ptr = nullptr;
+    if (active) {
+        obs_ptr = observations + batch_id * T;
+    }
+
+    if (active) {
+        int64_t o0 = obs_ptr[0];
+        smem[smem_offset + state] = log_init[state] + log_emit[state * num_obs + o0];
+    }
+    __syncwarp();
+
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = 0;
+        if (active) {
+            ot = obs_ptr[t];
+        }
+        if (active) {
+            // load alpha
+            float a0 = smem[smem_offset + 0];
+            float v0 = a0 + log_trans[0 * S + state];
+            float max_val = v0;
+            float vals[MAX_STATES];
+            vals[0] = v0;
+            #pragma unroll
+            for (int i = 1; i &lt; S; ++i) {
+                float ai = smem[smem_offset + i];
+                float vi = ai + log_trans[i * S + state];
+                vals[i] = vi;
+                if (vi &gt; max_val) max_val = vi;
+            }
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                sum += expf(vals[i] - max_val);
+            }
+            smem[smem_offset + state] = max_val + logf(sum) + log_emit[state * num_obs + ot];
+        }
+        __syncwarp();
+    }
+
+    if (active &amp;&amp; state == 0) {
+        float max_val = smem[smem_offset + 0];
+        #pragma unroll
+        for (int i = 1; i &lt; S; ++i) {
+            float v = smem[smem_offset + i];
+            if (v &gt; max_val) max_val = v;
+        }
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i &lt; S; ++i) {
+            sum += expf(smem[smem_offset + i] - max_val);
+        }
+        output[batch_id] = max_val + logf(sum);
+    }
+}
+```
+
+Wait: in the loop, we load `smem[smem_offset + i]` for each i. Since `smem_offset` is the same for all threads in the sub-group, they are reading the same shared memory locations. Bank conflicts? Shared memory banks are 32-way. If multiple threads read the same address, it&#x27;s broadcast (no conflict). If they read different addresses, but addresses are the same across threads? Actually, within a sub-group (batch element), all threads read the same shared memory address for a given i. Since `smem_offset` depends on `local_batch`, threads from different local_batches read different offsets. In a warp, we have `batch_per_warp` groups of threads reading different offsets. For S=16, batch_per_warp=2. Threads 0-15 read offset0, threads 16-31 read offset1. These are different 16-float arrays. Are there bank conflicts? Shared memory banks are 4-byte words, bank = (address/4) % 32. offset0 and offset1 are separated by 16 floats = 64 bytes = 16 banks. So threads reading offset0 access banks 0..15 (for i=0..15). Threads reading offset1 access banks 16..31 and 0..15 (since offset1+0 is bank 16, offset1+15 is bank (16+15)%32 = 31). So for a given i, threads 0-15 read bank i, threads 16-31 read bank (16+i)%32. These are different banks, so no conflict. Great.
+
+But within the inner loop over i, the threads are reading sequentially. Since the warp reads all i for its own batch, there are no conflicts across threads. However, each thread is reading different i. Wait, each thread reads all i sequentially (in a loop). So at any given instruction, all threads in the warp might be reading `smem[smem_offset + i]` with the same i? Since i is a loop counter, all threads have the same i value in the loop. But `smem_offset` differs per sub-warp. So for i=0, threads 0-15 read address A, threads 16-31 read address B. As established, no conflict. For i=1, threads 0-15 read A+4, threads 16-31 read B+4. Again no conflict. So shared memory access is efficient.
+
+One issue: `__syncwarp()` in a loop might be expensive. But T=128, and shared memory is fast. Warp-level sync on modern GPUs is cheap.
+
+But note: `__syncwarp()` with mask 0xFFFFFFFF is implicit if omitted? Actually, for shared memory within a warp, the warp executes in lockstep (except for explicit divergence), so after writing to shared memory, a `__syncwarp()` is not strictly necessary if there is no divergence and the compiler doesn&#x27;t reorder memory operations across threads. But CUDA memory model requires explicit synchronization for intra-warp shared memory visibility unless using warp-level primitives. However, since we have divergence (inactive threads might skip), the sync is needed. Even without divergence, membar is safer. Let&#x27;s keep `__syncwarp()`.
+
+But wait: the inactive threads within a warp are those with `lane &gt;= batch_per_warp * threads_per_batch`. For S=16, batch_per_warp*threads_per_batch = 2*16 = 32, so no inactive threads. Great. So all threads in the warp are active as long as all batch_id in the warp are &lt; B. If B is a multiple of batch_per_warp * warps_per_block * gridDim.x, then all threads are active.
+
+Since the benchmark B=64, and we can choose block/grid to divide evenly, all threads are active. So no divergence. `__syncwarp()` is still needed for memory ordering, but warp execution is implicit. However, CUDA compiler might reorder the write to smem and subsequent reads by other threads. A `__syncwarp()` ensures ordering.
+
+Alternatively, we could avoid __syncwarp() by reading the old alpha values and writing the new alpha to a different shared memory bank, ping-ponging between two buffers. That would allow the compiler to avoid sync. But since warp is lockstep and all threads in the warp write before the next iteration&#x27;s read (assuming no divergence and same control flow), do we need it? In practice, within a warp, threads execute in lockstep, so a thread&#x27;s write to shared memory is visible to other threads in the same warp before the next instruction if there is a memory barrier. Actually, the CUDA programming guide says: &quot;Threads in a warp can communicate via shared memory without explicit synchronization if they are in the same warp and there is no divergence.&quot; But I&#x27;m not entirely sure about memory visibility. In older GPUs (pre-Volta), warps were truly synchronous, so no barrier needed. On Volta and later, independent thread scheduling allows threads in a warp to diverge and reorder, so `__syncwarp()` is recommended. To be safe, we include `__syncwarp()`. The cost is small.
+
+Now, let&#x27;s consider using `float` arrays in registers: `float vals[MAX_STATES];` with MAX_STATES maybe 64. Since S is dynamic, the compiler might allocate MAX_STATES registers. We can use dynamic size but compile-time max: `float vals[MAX_STATES];` but only loop to S. The compiler will likely allocate 64 registers for `vals` and 64 for alpha loading? Wait, in the warp-level version, we load alpha from smem each time, so we don&#x27;t need a static alpha array. We just need `vals`. So `float vals[MAX_STATES];` where MAX_STATES is a compile-time constant (e.g., 64). That&#x27;s fine.
+
+But to reduce register pressure, maybe we can compute sum on the fly without storing vals:
+```cpp
+float max_val = -1e20f;
+for (int i = 0; i &lt; S; ++i) {
+    float v = smem[smem_offset + i] + log_trans[i * S + state];
+    if (v &gt; max_val) max_val = v;
+    vals[i] = v;
+}
+float sum = 0.0f;
+for (int i = 0; i &lt; S; ++i) {
+    sum += expf(vals[i] - max_val);
+}
+```
+Storing vals uses S registers. We could avoid it by recomputing: after finding max, loop again and compute exp(v - max). That&#x27;s another load from smem and another add. Since S=16 and smem is fast, recomputing might be fine and saves registers. Let&#x27;s do that to reduce register pressure and allow higher occupancy (though occupancy is already not a problem).
+
+So:
+```cpp
+if (active) {
+    int64_t ot = obs_ptr[t];
+    float max_val = smem[smem_offset + 0] + log_trans[0 * S + state];
+    for (int i = 1; i &lt; S; ++i) {
+        float v = smem[smem_offset + i] + log_trans[i * S + state];
+        if (v &gt; max_val) max_val = v;
+    }
+    float sum = 0.0f;
+    for (int i = 0; i &lt; S; ++i) {
+        float v = smem[smem_offset + i] + log_trans[i * S + state];
+        sum += expf(v - max_val);
+    }
+    smem[smem_offset + state] = max_val + logf(sum) + log_emit[state * num_obs + ot];
+}
+__syncwarp();
+```
+
+But we load smem[smem_offset + i] twice. Shared memory loads are fast, but it might still be okay. We can store the loaded alpha in registers to avoid reloading:
+```cpp
+float alpha_i[MAX_STATES];
+for (int i = 0; i &lt; S; ++i) alpha_i[i] = smem[smem_offset + i];
+float max_val = alpha_i[0] + log_trans[0 * S + state];
+for (int i = 1; i &lt; S; ++i) {
+    float v = alpha_i[i] + log_trans[i * S + state];
+    if (v &gt; max_val) max_val = v;
+}
+float sum = 0.0f;
+for (int i = 0; i &lt; S; ++i) {
+    sum += expf(alpha_i[i] + log_trans[i * S + state] - max_val);
+}
+smem[smem_offset + state] = max_val + logf(sum) + log_emit[state * num_obs + ot];
+```
+
+This loads smem into registers once (broadcast), then uses registers. `alpha_i` array is S floats. That&#x27;s okay.
+
+But wait, `smem[smem_offset + i]` is loaded by all threads in the warp. Since all threads in a sub-group have same `smem_offset`, and they all load the same i in the loop, the shared memory load is broadcast? Actually, for i=0, all threads in sub-group 0 read address A0, all threads in sub-group 1 read address A1. These are two broadcasts. That&#x27;s efficient.
+
+So storing `alpha_i` is good.
+
+Now, `log_trans[i * S + state]` access pattern: each thread reads a column of trans. `state` varies across threads. So for a fixed i, threads in sub-group 0 read `log_trans[i*S + 0]`, `log_trans[i*S + 1]`, ..., `log_trans[i*S + 15]`. These are contiguous in memory! Great. Threads in sub-group 1 read the same addresses. So we have two reads per address (broadcast from L1). Actually, within a warp, for sub-group 0 and sub-group 1, the addresses are the same set but requested by two sets of threads. The hardware may handle this via broadcasting or caching. It&#x27;s efficient.
+
+Similarly, `log_emit[state * num_obs + ot]`: each thread in a sub-group reads a different row `state` and same column `ot`. So addresses are `log_emit[state*num_obs + ot]` for state=0..15. These are strided by `num_obs` elements. If `num_obs` is 64, then addresses are 64 floats apart = 256 bytes apart. Memory banks? In global memory, these are coalesced only if the warp reads contiguous memory. Here they are strided. So not fully coalesced. However, `log_emit` is tiny (16*64*4 = 4KB). It will be fully cached in L1/L2. So it&#x27;s fine.
+
+Observations: `obs_ptr[t]` is same for all threads in a sub-group (same batch). Different sub-groups read different batches. So within a warp, two reads. Not coalesced but cached.
+
+Overall, this warp-level kernel is decent.
+
+Let&#x27;s also compute how many active threads we get.
+- S=16.
+- batch_per_warp = 2.
+- Let&#x27;s set blockDim.x = 256 threads -&gt; 8 warps.
+- batch_per_block = 16.
+- gridDim.x = (B + 15) / 16 = 4 blocks.
+- Total active threads = 4 blocks * 256 threads = 1024 threads.
+- Warps = 32.
+- This is a good amount of parallelism for a small problem.
+
+Let&#x27;s compare with the simple per-thread kernel:
+- blockDim.x = 64, gridDim.x = 1.
+- 64 threads, 2 warps.
+- The warp-level kernel has 16x more threads. Likely faster.
+
+So I&#x27;ll implement the warp-level kernel.
+
+One more thought: can we use `__expf` (intrinsic, faster but less accurate) or `expf`? The tolerance is 1e-4. `expf` is the standard accurate one. `__expf` might have larger error but maybe still within 1e-4 for typical values? Since these are log-probabilities, values might be around -2 to -10. `__expf` relative error is about 2 ulp. For exp(x) where x is small negative, absolute error might be around 1e-7. Summing 16 of them, then taking log, the error should be small. But to be safe, use `expf` and `logf`. We can also try `__expf` later if profiling suggests it&#x27;s a bottleneck.
+
+Similarly, `logf` can be `__logf`. But let&#x27;s stick to standard.
+
+Now, about constructing `ModelNew`:
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&quot;&quot;&quot;
+... kernel ...
+&quot;&quot;&quot;
+
+cpp_source = r&quot;&quot;&quot;
+torch::Tensor hmm_forward_cuda(
+    torch::Tensor log_init,
+    torch::Tensor log_trans,
+    torch::Tensor log_emit,
+    torch::Tensor observations) {
+    ...
+}
+&quot;&quot;&quot;
+
+hmm_forward = load_inline(
+    name=&quot;hmm_forward&quot;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&quot;hmm_forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+)
+```
+
+Wait, `extra_cuda_cflags` and `extra_cflags` can be passed. `-O3` is good. `--use_fast_math` enables `__expf` etc. It might speed up but reduce accuracy. For tolerance 1e-4, it might be okay. But let&#x27;s first try without `--use_fast_math` to be safe. If slow, we can add it.
+
+Host wrapper:
+- Inputs: log_init (float, S), log_trans (float, S,S), log_emit (float, S, num_obs), observations (int64, B,T).
+- Output: float tensor (B,).
+- We need to ensure tensors are contiguous and on cuda.
+- The kernel expects `int64_t* observations`. We can cast.
+
+Host wrapper code:
+```cpp
+torch::Tensor hmm_forward_cuda(
+    torch::Tensor log_init,
+    torch::Tensor log_trans,
+    torch::Tensor log_emit,
+    torch::Tensor observations)
+{
+    int B = observations.size(0);
+    int T = observations.size(1);
+    int S = log_init.size(0);
+    int num_obs = log_emit.size(1);
+
+    auto output = torch::empty({B}, log_init.options());
+
+    const int threads_per_warp = 32;
+    int batch_per_warp = threads_per_warp / S;
+    if (batch_per_warp &lt; 1) batch_per_warp = 1;
+    int warps_per_block = 8; // 256 threads
+    int batch_per_block = warps_per_block * batch_per_warp;
+    int blocks = (B + batch_per_block - 1) / batch_per_block;
+
+    int shared_mem_size = batch_per_block * S * sizeof(float);
+
+    hmm_forward_kernel&lt;&lt;&lt;blocks, warps_per_block * threads_per_warp, shared_mem_size&gt;&gt;&gt;(
+        log_init.data_ptr&lt;float&gt;(),
+        log_trans.data_ptr&lt;float&gt;(),
+        log_emit.data_ptr&lt;float&gt;(),
+        observations.data_ptr&lt;int64_t&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        B, T, S, num_obs
+    );
+
+    return output;
+}
+```
+
+Wait, if S &gt; 32, then batch_per_warp = 0. We need to handle that. But S=16. We can add an assert or fallback.
+
+Also, `observations` might be `int32` or `int64`. The reference uses `torch.randint` which returns `int64` (LongTensor) by default. So `int64_t` is correct.
+
+Potential issue: the kernel uses `extern __shared__ float smem[];`. The size must be provided at launch. We compute `shared_mem_size`. Good.
+
+Potential issue: warp-level divergent __syncwarp() with mask? Actually, on Volta+, `__syncwarp()` uses default mask 0xFFFFFFFF. If some threads are inactive (returned), it&#x27;s a deadlock. We are not returning early; instead we use `active` flag and skip work but still reach `__syncwarp()`. Since all threads in the warp reach `__syncwarp()`, it&#x27;s fine. Inactive threads have `active=false` and skip the `if (active)` blocks. They still reach `__syncwarp()`. Good.
+
+One more refinement: the loop over t has `__syncwarp()` at the end. For warps where all threads are inactive, `active` is false for all. They skip the `if(active)` body and reach `__syncwarp()`. No problem.
+
+But what about the initialization __syncwarp()? Same.
+
+What about the fact that inactive threads read `obs_ptr`? We set `obs_ptr = nullptr` for inactive. That&#x27;s fine.
+
+Let&#x27;s write the full Python code.
+
+Wait, we need to handle the normalization in Python. In `ModelNew.forward`, we compute:
+```python
+log_pi = self._normalize_log(self.log_init)
+log_A = self._normalize_log(self.log_trans, dim=-1)
+log_B = self._normalize_log(self.log_emit, dim=-1)
+return hmm_forward_cuda(log_pi, log_A, log_B, observations)
+```
+This matches the reference.
+
+But should we move normalization to CUDA? It&#x27;s only a few elements, so Python is fine.
+
+Double-check: the reference returns `log_lik` shape (B,). Our kernel returns shape (B,). Good.
+
+One more thing: the reference&#x27;s `_normalize_log` returns a new tensor. In our ModelNew, we can call the same method. It doesn&#x27;t need to be a CUDA kernel.
+
+Now, let&#x27;s test the kernel with compile and correctness.
+
+I&#x27;ll write the code carefully.
+
+One more thought: using `#pragma unroll` with dynamic loop bound S doesn&#x27;t unroll. We could manually unroll for common sizes up to 32 using a Duff&#x27;s device or a helper macro. But given S is small, the overhead of the loop is minimal compared to expf/logf. The compiler might unroll small loops if the bound is a compile-time constant. Since S is a runtime variable, it won&#x27;t. But again, 16 iterations is tiny.
+
+However, we can use template on S to force unrolling. Since the host wrapper knows S at runtime, we could dispatch with a switch. Given that S is 16, and if it were variable but small, we could template on max possible and pass S as argument. But to get unrolling, we can do something like:
+
+```cpp
+template &lt;int S&gt;
+__global__ void hmm_forward_kernel_t(...) {
+   // loops over i &lt; S, compiler unrolls if S is template param
+}
+```
+
+Then in host wrapper:
+```cpp
+switch (S) {
+  case 1: hmm_forward_kernel_t&lt;1&gt;&lt;&lt;&lt;...&gt;&gt;&gt;; break;
+  case 2: hmm_forward_kernel_t&lt;2&gt;&lt;&lt;&lt;...&gt;&gt;&gt;; break;
+  ...
+  case 32: hmm_forward_kernel_t&lt;32&gt;&lt;&lt;&lt;...&gt;&gt;&gt;; break;
+  default: // generic fallback
+}
+```
+
+But writing a switch up to 32 is tedious but possible with a macro. However, given the problem size and tolerance, the non-templated version is probably sufficient and easier. Let&#x27;s profile if needed.
+
+To be safe, we can implement the generic version and a specialized version for S=16. But that adds complexity. Let&#x27;s stick to generic first. If correctness fails or performance is bad, we switch.
+
+Wait, there is a subtlety about `__syncwarp()` and shared memory. After `__syncwarp()`, are writes to shared memory guaranteed to be visible? Yes, `__syncwarp()` acts as a memory fence for the warp. From CUDA docs: &quot;__syncwarp() will cause the executing thread to wait until all warp lanes named in mask have executed a __syncwarp() with the same mask.&quot; It also implies a memory fence: &quot;Ensures that all memory accesses made by the calling thread prior to the call are visible to all threads in the warp.&quot; So yes, it&#x27;s safe.
+
+But wait, `__syncwarp()` is for threads within the same warp. The shared memory reads after the sync are within the same warp (since each batch element is handled by a sub-warp). But what about across warps in the same block? Different warps use different regions of shared memory, so they don&#x27;t interfere. No need for __syncthreads().
+
+However, there is one issue: `extern __shared__ float smem[];` is sized per block. All warps in the block use disjoint regions. Since we only sync within a warp, there&#x27;s no need to sync across warps. Good.
+
+Now, let&#x27;s write the code.
+
+Wait, `batch_per_warp = 32 / S`. If S=16, it&#x27;s 2. If S=8, it&#x27;s 4, etc. If S=20, it&#x27;s 1 (integer division). For S&gt;32, it&#x27;s 0. We can handle S&gt;32 by falling back to a simpler kernel (e.g., one thread per batch). But for this problem, S=16.
+
+What if S doesn&#x27;t divide 32 evenly? e.g., S=10. Then batch_per_warp = 3, threads used = 30. Lanes 30,31 are idle. `lane &lt; batch_per_warp * S` = 30. So lanes 30,31 are inactive. Within a warp, there are 3 sub-groups of 10 threads. The first two sub-groups handle 2 batches, the third sub-group handles one batch if B is sufficient. The inactive lanes 30,31 are in the fourth sub-group (which doesn&#x27;t exist). Their `local_batch` = 30/10 = 3. `batch_id` = ... + 3. Since `active` checks `lane &lt; 30`, they are inactive. They will skip work and hit __syncwarp(). The active threads write to smem and read from smem. Since the inactive threads don&#x27;t write or read, the active threads are okay. This works for any S &lt;= 32.
+
+If S &gt; 32, we&#x27;d need a different approach. But again, S=16.
+
+Let&#x27;s write the host wrapper and cuda code.
+
+Wait, I just realized: in Python, `torch.utils.cpp_extension.load_inline` auto-generates pybind code based on `functions=[...]`. So the C++ function `hmm_forward_cuda` must be defined in the `cpp_sources` or `cuda_sources`? Actually, we can define it in `cuda_sources` as `__host__` function, or define the kernel in `cuda_sources` and wrap it in `cpp_sources`. Usually `cpp_sources` contains the host wrapper and `cuda_sources` contains the device code. But since `load_inline` concatenates them, it might not matter. Let&#x27;s put the kernel in `cuda_sources` and the wrapper in `cpp_sources`. The wrapper needs to call the kernel, so the kernel must be declared or defined before the wrapper. CUDA compilation handles this if they are in the same translation unit. With `load_inline`, all sources are concatenated in order: `cpp_sources` first? Actually, the order might be `cuda_sources` appended to `cpp_sources` or vice versa. Let&#x27;s check: In PyTorch&#x27;s load_inline, `cpp_sources` are passed as `cpp_sources` and `cuda_sources` as `cuda_sources`. The generated source typically includes `cpp_sources` then `cuda_sources`. So if the kernel is in `cuda_sources` and the host function is in `cpp_sources`, the host function may not see the kernel declaration. To be safe, we can put the entire code (kernel + wrapper) in `cuda_sources` and leave `cpp_sources` empty. Or we can put a forward declaration of the kernel in `cpp_sources`. Alternatively, put everything in a single string passed to `cuda_sources`.
+
+Let&#x27;s do:
+```python
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void hmm_forward_kernel(...) { ... }
+
+torch::Tensor hmm_forward_cuda(torch::Tensor log_init, torch::Tensor log_trans, torch::Tensor log_emit, torch::Tensor observations) {
+   ...
+   hmm_forward_kernel&lt;&lt;&lt;...&gt;&gt;&gt;(...);
+   return output;
+}
+&quot;&quot;&quot;
+
+hmm_forward = load_inline(
+    name=&quot;hmm_forward&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;hmm_forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+)
+```
+
+Wait, does `load_inline` support only `cuda_sources`? Yes, we can provide only `cuda_sources`.
+
+Actually, the documentation says:
+```python
+torch.utils.cpp_extension.load_inline(
+    name,
+    cpp_sources,
+    cuda_sources=None,
+    functions=None,
+    ...
+)
+```
+So `cpp_sources` is positional required? Actually the signature is `load_inline(name, cpp_sources, cuda_sources=None, ...)`. So we need to pass something for `cpp_sources`, maybe empty string. Or we can pass the wrapper as part of `cpp_sources` and kernel declaration there too. But to avoid forward declaration issues, let&#x27;s put everything in `cpp_sources`? No, CUDA kernels cannot be in plain C++ source compiled by host compiler, but `load_inline` compiles `.cu` files if `cuda_sources` is present. The `cpp_sources` are compiled as `.cpp`. So the kernel must be in `cuda_sources`. The host wrapper can be in `cpp_sources` if we forward declare the kernel. Or we can put the host wrapper also in `cuda_sources`. Let&#x27;s put everything in `cuda_sources` and pass empty string for `cpp_sources`.
+
+```python
+hmm_cuda = load_inline(
+    name=&quot;hmm_forward_cuda&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=cuda_code,
+    functions=[&quot;hmm_forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+)
+```
+
+But `cpp_sources` might need to be a string. Let&#x27;s pass `cpp_sources=&quot;&quot;`.
+
+Actually, looking at examples, `load_inline(name, cpp_sources, cuda_sources, functions=[...])` is common. Let&#x27;s do:
+
+```python
+cpp_src = &quot;&quot;&quot;
+torch::Tensor hmm_forward_cuda(torch::Tensor log_init, torch::Tensor log_trans, torch::Tensor log_emit, torch::Tensor observations);
+&quot;&quot;&quot;
+
+cuda_src = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void hmm_forward_kernel(...) { ... }
+
+torch::Tensor hmm_forward_cuda(torch::Tensor log_init, torch::Tensor log_trans, torch::Tensor log_emit, torch::Tensor observations) {
+   ...
+}
+&quot;&quot;&quot;
+
+hmm_forward = load_inline(
+    name=&quot;hmm_forward&quot;,
+    cpp_sources=cpp_src,
+    cuda_sources=cuda_src,
+    functions=[&quot;hmm_forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+)
+```
+
+This should work. The `cpp_sources` provides the declaration (though not strictly necessary for compilation, it&#x27;s good for C++ side). Actually, `load_inline` generates a pybind wrapper that calls `hmm_forward_cuda`. It needs to know the signature. Since it&#x27;s compiled in the same translation unit, the declaration in `cpp_sources` and definition in `cuda_sources` should link fine.
+
+But sometimes `cpp_sources` and `cuda_sources` are concatenated. If so, order matters. If `cpp_sources` comes first, the declaration is needed. If `cuda_sources` comes first, the definition is available. I&#x27;m not 100% sure about the order. To be safe, I&#x27;ll put the declaration in `cpp_sources` and definition in `cuda_sources`.
+
+Alternatively, I can put the host wrapper in `cpp_sources` and have it call the kernel declared in `cuda_sources`... no, same issue. Best is to put the kernel and host wrapper entirely in `cuda_sources`, and leave `cpp_sources` empty. The pybind generated code will see the definition because everything is compiled together. Let&#x27;s try that.
+
+Actually, if `cpp_sources` is empty, the compilation unit is just the CUDA source. The function `hmm_forward_cuda` is defined there. It should be fine.
+
+Let&#x27;s write the code.
+
+One more concern: `extern __shared__ float smem[];` requires dynamic shared memory size at launch. The third kernel launch config argument is the dynamic shared memory size in bytes. We compute it correctly.
+
+Let&#x27;s also add `__forceinline__` to the kernel? Not needed.
+
+Another thought: could we use `half` or `bf16`? The tolerance is fp32 1e-4, so we need fp32 accumulation. Using fp16 would likely fail tolerance. So stick to float.
+
+Let&#x27;s also consider using `-use_fast_math`. The `--use_fast_math` flag makes `expf` faster but less accurate. With tolerance 1e-4, it might still be okay. But let&#x27;s first compile without it.
+
+Now, let&#x27;s assemble the final code.
+
+Wait, there is a potential correctness issue: the reference initializes `log_alpha = log_pi.unsqueeze(0) + emit_0`. Here `emit_0 = log_B[:, observations[:,0]].t()`. So `log_alpha[b, j] = log_pi[j] + log_B[j, obs[b,0]]`. That&#x27;s what we do.
+
+Then for each t: `log_alpha = log_alpha.unsqueeze(-1) + log_A.unsqueeze(0)` -&gt; shape (B,S,S), elementwise: `log_alpha[b,i,j] = old_log_alpha[b,i] + log_A[i,j]`.
+Then `log_alpha = torch.logsumexp(log_alpha, dim=1)` -&gt; `new_log_alpha[b,j] = logsumexp_i(old_log_alpha[b,i] + log_A[i,j])`.
+Then `emit_t = log_B[:, observations[:,t]].t()` -&gt; `emit_t[b,j] = log_B[j, obs[b,t]]`.
+Then `log_alpha = log_alpha + emit_t`. So `new_log_alpha[b,j] = logsumexp_i(...) + log_B[j, obs[b,t]]`.
+
+This matches our kernel.
+
+After loop: `log_lik = torch.logsumexp(log_alpha, dim=-1)`.
+
+Matches.
+
+So the kernel is correct.
+
+Let&#x27;s write the full kernel code.
+
+Wait, one more optimization: in the inner loops, we compute `log_trans[i * S + state]`. Since `state` is constant per thread, and `i` loops, these are strided loads. The threads in a sub-warp read contiguous memory for a given `i` (since state varies). This is coalesced. For `i=0`, sub-warp reads `log_trans[0], log_trans[1], ...` contiguous. Good. For i=1, reads `log_trans[S], log_trans[S+1], ...` contiguous. Good. So global memory access to `log_trans` is coalesced.
+
+Similarly, `log_emit[state * num_obs + ot]` for a fixed `ot` and varying `state`: threads read `log_emit[ot], log_emit[num_obs+ot], log_emit[2*num_obs+ot], ...`. These are strided by `num_obs`. Since `num_obs=64`, this is 256 bytes stride. This is not coalesced. But `log_emit` is 4KB, fits in cache. Could we transpose `log_emit` to make access coalesced? We can pass `log_emit_t` (num_obs, S) and read `log_emit_t[ot * S + state]`. Then for fixed ot and varying state, reads are contiguous! That&#x27;s better. We can transpose `log_emit` on the host before passing to kernel. Or we can just pass `log_emit` as-is; it&#x27;s small.
+
+Given the small size, it&#x27;s okay. But we can transpose in Python:
+```python
+log_B = self._normalize_log(self.log_emit, dim=-1)
+log_B_t = log_B.t().contiguous()
+```
+Then in kernel, we read `log_B_t[ot * S + state]`. This is contiguous. Let&#x27;s do that.
+
+Similarly, `log_init` is contiguous anyway.
+`log_trans` is (S,S). We pass it as-is. Access pattern: `log_trans[i*S + state]`. For a given i, state varies -&gt; contiguous. Good.
+
+`observations` is (B, T). We read `obs_ptr[t]` which is a single int64 per thread per t. Not coalesced across threads in a warp (since threads in a warp read different batch rows). But observations are tiny. Fine.
+
+Let&#x27;s also consider transposing observations? No, each thread needs a sequence of T observations. It&#x27;s row-major. A thread reads `obs_ptr[0], obs_ptr[1], ..., obs_ptr[T-1]` sequentially. This is coalesced for a single thread (memory locality). Across the warp, thread b reads obs[b,T] and thread b+1 reads obs[b+1,T], which are far apart. This is strided access. Again, tiny size, fits in cache.
+
+So the code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_CODE = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit_t,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    extern __shared__ float smem[];
+
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int threads_per_batch = S;
+    int batch_per_warp = 32 / threads_per_batch;
+    int local_batch = lane / threads_per_batch;
+    int state = lane % threads_per_batch;
+
+    int batch_per_block = (blockDim.x / 32) * batch_per_warp;
+    int batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch;
+    int smem_offset = (warp * batch_per_warp + local_batch) * S;
+
+    bool active = (batch_id &lt; B) &amp;&amp; (lane &lt; batch_per_warp * threads_per_batch);
+
+    const int64_t* obs_ptr = nullptr;
+    if (active) {
+        obs_ptr = observations + batch_id * T;
+    }
+
+    // initialize alpha at t = 0
+    if (active) {
+        int64_t o0 = obs_ptr[0];
+        smem[smem_offset + state] = log_init[state] + log_emit_t[o0 * S + state];
+    }
+    __syncwarp();
+
+    // forward recurrence
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = 0;
+        if (active) {
+            ot = obs_ptr[t];
+        }
+
+        if (active) {
+            // load previous alpha into registers
+            float alpha_i[32]; // max size
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                alpha_i[i] = smem[smem_offset + i];
+            }
+
+            // compute logsumexp_i(alpha_i[i] + log_trans[i][state])
+            float max_val = alpha_i[0] + log_trans[0 * S + state];
+            #pragma unroll
+            for (int i = 1; i &lt; S; ++i) {
+                float v = alpha_i[i] + log_trans[i * S + state];
+                if (v &gt; max_val) max_val = v;
+            }
+
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i &lt; S; ++i) {
+                sum += expf(alpha_i[i] + log_trans[i * S + state] - max_val);
+            }
+
+            smem[smem_offset + state] = max_val + logf(sum) + log_emit_t[ot * S + state];
+        }
+        __syncwarp();
+    }
+
+    // final logsumexp over alpha
+    if (active &amp;&amp; state == 0) {
+        float max_val = smem[smem_offset + 0];
+        #pragma unroll
+        for (int i = 1; i &lt; S; ++i) {
+            float v = smem[smem_offset + i];
+            if (v &gt; max_val) max_val = v;
+        }
+
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i &lt; S; ++i) {
+            sum += expf(smem[smem_offset + i] - max_val);
+        }
+
+        output[batch_id] = max_val + logf(sum);
+    }
+}
+
+torch::Tensor hmm_forward_cuda(
+    torch::Tensor log_init,
+    torch::Tensor log_trans,
+    torch::Tensor log_emit_t,
+    torch::Tensor observations)
+{
+    int B = observations.size(0);
+    int T = observations.size(1);
+    int S = log_init.size(0);
+    int num_obs = log_emit_t.size(0);
+
+    auto output = torch::empty({B}, log_init.options());
+
+    const int threads_per_warp = 32;
+    int batch_per_warp = threads_per_warp / S;
+    if (batch_per_warp &lt; 1) batch_per_warp = 1;
+    int warps_per_block = 8;
+    int batch_per_block = warps_per_block * batch_per_warp;
+    int blocks = (B + batch_per_block - 1) / batch_per_block;
+
+    int shared_mem_size = batch_per_block * S * sizeof(float);
+
+    hmm_forward_kernel&lt;&lt;&lt;blocks, warps_per_block * threads_per_warp, shared_mem_size&gt;&gt;&gt;(
+        log_init.data_ptr&lt;float&gt;(),
+        log_trans.data_ptr&lt;float&gt;(),
+        log_emit_t.data_ptr&lt;float&gt;(),
+        observations.data_ptr&lt;int64_t&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        B, T, S, num_obs
+    );
+
+    return output;
+}
+&quot;&quot;&quot;
+
+hmm_forward = load_inline(
+    name=&quot;hmm_forward&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=CUDA_CODE,
+    functions=[&quot;hmm_forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    extra_cflags=[&quot;-O3&quot;],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_states, num_obs):
+        super().__init__()
+        self.num_states = num_states
+        self.num_obs = num_obs
+        self.log_init = nn.Parameter(torch.zeros(num_states))
+        self.log_trans = nn.Parameter(torch.zeros(num_states, num_states))
+        self.log_emit = nn.Parameter(torch.zeros(num_states, num_obs))
+
+    def _normalize_log(self, x, dim=-1):
+        return x - torch.logsumexp(x, dim=dim, keepdim=True)
+
+    def forward(self, observations: torch.Tensor) -&gt; torch.Tensor:
+        log_pi = self._normalize_log(self.log_init)
+        log_A = self._normalize_log(self.log_trans, dim=-1)
+        log_B = self._normalize_log(self.log_emit, dim=-1)
+        # transpose for coalesced access: (num_obs, num_states)
+        log_B_t = log_B.t().contiguous()
+        return hmm_forward.hmm_forward_cuda(log_pi, log_A, log_B_t, observations)
+```
+
+Wait, `load_inline` returns a module-like object, but the function is accessible as `hmm_forward.hmm_forward_cuda(...)`. Actually, the result of `load_inline` is a module. So we can call `hmm_forward.hmm_forward_cuda(...)`. Good.
+
+One issue: `cpp_sources=&quot;&quot;` might cause trouble? Some versions require a non-empty string or may not generate the C++ wrapper properly if there are no C++ sources. But I think it&#x27;s okay. Alternatively, we can put a dummy declaration in `cpp_sources`. Let&#x27;s do:
+
+```python
+cpp_src = &quot;&quot;&quot;
+torch::Tensor hmm_forward_cuda(torch::Tensor log_init, torch::Tensor log_trans, torch::Tensor log_emit_t, torch::Tensor observations);
+&quot;&quot;&quot;
+```
+
+This ensures the C++ compiler sees the declaration.
+
+But actually, `load_inline` compiles C++ and CUDA into a shared library. The pybind wrapper is generated automatically. It needs to find the function at link time. If the function is defined only in `cuda_sources`, it should still be linked because NVCC compiles it into an object file and then linked with the C++ objects.
+
+So `cpp_sources` can just be empty or contain includes. Let&#x27;s put empty string. Or better, put `cpp_sources=&quot;torch::Tensor hmm_forward_cuda(...);&quot;` to avoid any weirdness.
+
+Now, compile. But note: `__syncwarp()` requires CUDA 9+. We assume GPU is modern.
+
+Another thing: `#pragma unroll` on loops with bound `S` (a variable) does nothing. That&#x27;s fine. The `float alpha_i[32]` uses a compile-time max of 32. If S &gt; 32, we&#x27;d overflow. We should maybe assert S &lt;= 32 or allocate a larger max. Since the reference uses num_states=16, 32 is enough. But to be robust, we could allocate `float alpha_i[128];` or dynamic? registers only support compile-time sized arrays. We can use a large constant like 128. Or we can use dynamic indexing into a small array? No, in C++, variable-length arrays are not standard. But CUDA supports them if the size is known at compile time or as a local array with dynamic size in some contexts? Actually, `float arr[S];` where S is a variable is allowed in CUDA (C99 VLA). But in device code, dynamic arrays in registers may not be optimized. Better to use a compile-time max: `#define MAX_STATES 64`. Then `float alpha_i[MAX_STATES];`. The compiler will allocate 64 registers for this array. But if we only use up to S, the rest are dead. For S=16, 64 registers might be okay. Let&#x27;s use `MAX_STATES 64` to be safe.
+
+Wait, register pressure: 64 floats = 64 registers. Plus a few more. Still under 255. So fine.
+
+Let&#x27;s change to `#define MAX_STATES 64` and `float alpha_i[MAX_STATES];`. Loop `for (int i = 0; i &lt; S; ++i)`. The compiler might not eliminate the unused registers, but 64 is fine.
+
+Alternatively, we can avoid `alpha_i` array entirely and just read from smem twice: once for max, once for sum. That saves registers. Since S is small and smem is fast, reading twice is okay. Let&#x27;s do that to reduce register pressure and avoid a large array.
+
+```cpp
+if (active) {
+    int64_t ot = obs_ptr[t];
+    // first pass: max
+    float max_val = smem[smem_offset + 0] + log_trans[0 * S + state];
+    for (int i = 1; i &lt; S; ++i) {
+        float v = smem[smem_offset + i] + log_trans[i * S + state];
+        if (v &gt; max_val) max_val = v;
+    }
+    // second pass: sum exp
+    float sum = 0.0f;
+    for (int i = 0; i &lt; S; ++i) {
+        sum += expf(smem[smem_offset + i] + log_trans[i * S + state] - max_val);
+    }
+    smem[smem_offset + state] = max_val + logf(sum) + log_emit_t[ot * S + state];
+}
+```
+
+This reads smem twice and trans twice. Since S=16, it&#x27;s fine. No alpha_i array needed. This is better.
+
+Also for the final logsumexp:
+```cpp
+if (active &amp;&amp; state == 0) {
+    float max_val = smem[smem_offset + 0];
+    for (int i = 1; i &lt; S; ++i) {
+        float v = smem[smem_offset + i];
+        if (v &gt; max_val) max_val = v;
+    }
+    float sum = 0.0f;
+    for (int i = 0; i &lt; S; ++i) {
+        sum += expf(smem[smem_offset + i] - max_val);
+    }
+    output[batch_id] = max_val + logf(sum);
+}
+```
+
+Great.
+
+Now, let&#x27;s think about numerical issues.
+- PyTorch&#x27;s `logsumexp` computes max and sum in a vectorized way. For 16 elements, the naive approach is very close.
+- The order of operations: PyTorch&#x27;s `torch.logsumexp` on a tensor of shape (B,S,S) along dim=1. It likely uses a custom kernel that does a tree reduction or a single-pass reduction. But for 16 elements, a simple loop is fine.
+- Potential accumulation error in `sum += expf(...)`: summing 16 positive numbers. `expf` returns float. The sum could have some rounding error. PyTorch probably does a Kahan summation or similar? Actually, for 16 elements, standard summation is fine. The values are probabilities (sum to 1), so sum is around 1. The max is subtracted, so the largest term is exp(0)=1, others are &lt;=1. Summing 16 numbers around 1: error is maybe a few ulp, which in log space translates to very small absolute error.
+
+Example: if sum = 1.0 + epsilon, log(sum) ≈ epsilon. Error in sum of 1e-6 -&gt; error in log of 1e-6. But since values are normalized, the max is subtracted, and the sum is at least 1.0 (since the max term contributes exp(0)=1). So log(sum) is &gt;= 0. If sum is slightly off by 1e-6, log(sum) is off by ~1e-6. That&#x27;s well within 1e-4.
+
+For initial step and emission addition, same.
+
+I think correctness will pass.
+
+Let&#x27;s also check `log_emit_t` indexing. `log_B = self._normalize_log(self.log_emit, dim=-1)`. `log_B_t = log_B.t().contiguous()`. So `log_B_t` shape is (num_obs, S). We pass `log_emit_t.data_ptr&lt;float&gt;()`.
+In kernel: `log_emit_t[ot * S + state]`. Since `ot` is observation index, and `state` is state index, this gives the log emission probability for state `state` and observation `ot`. This matches `log_B[state, ot]`. Good.
+
+One subtle point: `observations` is `int64` (LongTensor) on CPU or GPU? The reference gets inputs from `get_inputs()` which returns a tensor on CPU? Actually, in the benchmark, it likely moves to the same device as the model. Our `ModelNew.forward` receives `observations` which should be on the same device as parameters. The kernel launches on the current CUDA stream. We need to ensure tensors are contiguous and on CUDA.
+
+`log_pi`, `log_A`, `log_B_t`: these are computed from parameters which are nn.Parameter (on model&#x27;s device). `observations` is passed in. We&#x27;ll call `.contiguous()` to be safe?
+- `log_B_t = log_B.t().contiguous()`: already contiguous.
+- `log_pi` and `log_A` are from parameter operations, likely contiguous.
+- `observations` might not be contiguous. We can call `observations.contiguous()` in forward.
+
+Let&#x27;s add `.contiguous()` calls in forward:
+```python
+return hmm_forward.hmm_forward_cuda(
+    log_pi.contiguous(),
+    log_A.contiguous(),
+    log_B_t.contiguous(),
+    observations.contiguous()
+)
+```
+
+This ensures proper strides.
+
+Also, ensure `observations` is `int64`. `torch.randint` returns `torch.int64`. Good.
+
+Now, let&#x27;s think about the PyTorch reference&#x27;s speed. The main overhead is the Python loop over T and launching 5 PyTorch ops per iteration. Our kernel fuses everything into one launch. It should be dramatically faster.
+
+Let&#x27;s also consider if we should use `torch.cuda.synchronize()`? No, not in forward.
+
+What about compilation time? `load_inline` compiles at module import. It might take a few seconds. That&#x27;s okay.
+
+Now, potential compile errors:
+- `extern __shared__ float smem[];` is okay.
+- `__syncwarp()` is a built-in. Need to include `&lt;cuda_runtime.h&gt;` or nothing. It&#x27;s a compiler intrinsic.
+- Need to use `int64_t`. Include `&lt;stdint.h&gt;` or `&lt;cstdint&gt;`. `&lt;torch/extension.h&gt;` includes these.
+- `expf` and `logf` are in `&lt;math.h&gt;`.
+
+Let&#x27;s check the code for syntax.
+
+```cpp
+__global__ void hmm_forward_kernel(
+    const float* log_init,
+    const float* log_trans,
+    const float* log_emit_t,
+    const int64_t* observations,
+    float* output,
+    int B, int T, int S, int num_obs)
+{
+    extern __shared__ float smem[];
+    int lane = threadIdx.x % 32;
+    int warp = threadIdx.x / 32;
+    int threads_per_batch = S;
+    int batch_per_warp = 32 / threads_per_batch;
+    int local_batch = lane / threads_per_batch;
+    int state = lane % threads_per_batch;
+    int batch_per_block = (blockDim.x / 32) * batch_per_warp;
+    int batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch;
+    int smem_offset = (warp * batch_per_warp + local_batch) * S;
+    bool active = (batch_id &lt; B) &amp;&amp; (lane &lt; batch_per_warp * threads_per_batch);
+    const int64_t* obs_ptr = nullptr;
+    if (active) {
+        obs_ptr = observations + batch_id * T;
+    }
+    if (active) {
+        int64_t o0 = obs_ptr[0];
+        smem[smem_offset + state] = log_init[state] + log_emit_t[o0 * S + state];
+    }
+    __syncwarp();
+    for (int t = 1; t &lt; T; ++t) {
+        int64_t ot = 0;
+        if (active) {
+            ot = obs_ptr[t];
+        }
+        if (active) {
+            float max_val = smem[smem_offset + 0] + log_trans[0 * S + state];
+            for (int i = 1; i &lt; S; ++i) {
+                float v = smem[smem_offset + i] + log_trans[i * S + state];
+                if (v &gt; max_val) max_val = v;
+            }
+            float sum = 0.0f;
+            for (int i = 0; i &lt; S; ++i) {
+                sum += expf(smem[smem_offset + i] + log_trans[i * S + state] - max_val);
+            }
+            smem[smem_offset + state] = max_val + logf(sum) + log_emit_t[ot * S + state];
+        }
+        __syncwarp();
+    }
+    if (active &amp;&amp; state == 0) {
+        float max_val = smem[smem_offset + 0];
+        for (int i = 1; i &lt; S; ++i) {
+            float v = smem[smem_offset + i];
+            if (v &gt; max_val) max_val = v;
+        }
+        float sum = 0.0f;
+        for (int i = 0; i &lt; S; ++i) {
+            sum += expf(smem[smem_offset + i] - max_val);
+        }
+        output[batch_id] = max_val + logf(sum);
+    }
+}
+```
+
+Looks good.
+
+One thing: `batch_per_warp = 32 / threads_per_batch`. If S=16, it&#x27;s 2. `lane &lt; batch_per_warp * threads_per_batch` = `lane &lt; 32`. So active for all lanes. Good.
+
+If S=20, `batch_per_warp = 1` (integer division). `lane &lt; 20`. First 20 threads active. `local_batch = lane / 20` -&gt; 0 for lane&lt;20, 1 for lane&gt;=20? Wait, `threads_per_batch = S = 20`. `local_batch = lane / 20`. For lane=0..19, local_batch=0. For lane=20..31, local_batch=1. `state = lane % 20`. For lane=20..31, state=0..11. `batch_id` for lane=20..31 would be `... + warp*1 + 1`. So they&#x27;d process batch b+1. But `lane &lt; batch_per_warp * threads_per_batch` = `lane &lt; 20`. So lanes 20..31 are inactive. Good. But within the warp, lanes 0..19 (sub-warp of 20 threads) are active and process one batch element. They call `__syncwarp()`. Lanes 20..31 are inactive and also call `__syncwarp()`. Since all 32 threads in the warp call `__syncwarp()`, it&#x27;s fine. The active threads write to smem offset `warp*1 + 0`. They read from smem. Inactive threads don&#x27;t read/write. Good.
+
+But wait, what about S=33? `batch_per_warp = 32 / 33 = 0`. Then `batch_per_block = 0`, and we&#x27;ll have issues. We can add a fallback: if S &gt; 32, use the simple per-thread kernel. But again, S=16 for this task. We can add an assert in the host wrapper: `TORCH_CHECK(S &lt;= 32, &quot;num_states must be &lt;= 32&quot;)`. Or just assume.
+
+Given the problem statement, num_states = 16. So fine.
+
+Let&#x27;s also consider using `-use_fast_math`. It can speed up `expf` and `logf` significantly (using `__expf` and `__logf` intrinsics). The speedup could be 2-3x. Accuracy: `__expf` max error is about 2 ulp (~2e-7 relative). Since we sum 16 numbers and take log, the absolute error in the final result should be well under 1e-4. Let&#x27;s consider a worst-case scenario: if values are around -10, exp(-10) ~ 4.5e-5. Relative error of 1e-6 in exp gives absolute error 4.5e-11. Summing 16 gives ~7e-10. log(1+7e-10) ~ 7e-10. So error is tiny. For larger values, say exp(0)=1, error is around 1e-7. Sum error ~1e-6. log error ~1e-6. So still well within 1e-4.
+
+Thus, we can safely use `--use_fast_math`. Let&#x27;s add it to `extra_cuda_cflags`.
+
+Actually, `--use_fast_math` may also affect division and sqrt, but we don&#x27;t use those much. It also makes `logf(0)` return a large negative number instead of -inf, but our sum is always &gt;=1 so log(sum) is finite. It might make `expf` of large numbers overflow faster, but our max subtraction ensures arguments to exp are &lt;=0, so exp is between 0 and 1. No overflow. Underflow to 0 is fine. So `--use_fast_math` is safe.
+
+Let&#x27;s include it.
+
+Now, let&#x27;s write the complete code and compile.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_CODE = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n__global__ void hmm_forward_kernel(\n    const float* log_init,\n    const float* log_trans,\n    const float* log_emit_t,\n    const int64_t* observations,\n    float* output,\n    int B, int T, int S, int num_obs)\n{\n    extern __shared__ float smem[];\n\n    int lane = threadIdx.x % 32;\n    int warp = threadIdx.x / 32;\n    int threads_per_batch = S;\n    int batch_per_warp = 32 / threads_per_batch;\n    if (batch_per_warp &lt; 1) batch_per_warp = 1;\n    int local_batch = lane / threads_per_batch;\n    int state = lane % threads_per_batch;\n\n    int batch_per_block = (blockDim.x / 32) * batch_per_warp;\n    int batch_id = blockIdx.x * batch_per_block + warp * batch_per_warp + local_batch;\n    int smem_offset = (warp * batch_per_warp + local_batch) * S;\n\n    bool active = (batch_id &lt; B) &amp;&amp; (lane &lt; batch_per_warp * threads_per_batch);\n\n    const int64_t* obs_ptr = nullptr;\n    if (active) {\n        obs_ptr = observations + batch_id * T;\n    }\n\n    // initialize alpha at t = 0\n    if (active) {\n        int64_t o0 = obs_ptr[0];\n        smem[smem_offset + state] = log_init[state] + log_emit_t[o0 * S + state];\n    }\n    __syncwarp();\n\n    // forward recurrence\n    for (int t = 1; t &lt; T; ++t) {\n        int64_t ot = 0;\n        if (active) {\n            ot = obs_ptr[t];\n        }\n\n        if (active) {\n            // compute logsumexp_i(alpha_i + log_trans[i][state])\n            float max_val = smem[smem_offset + 0] + log_trans[0 * S + state];\n            #pragma unroll\n            for (int i = 1; i &lt; S; ++i) {\n                float v = smem[smem_offset + i] + log_trans[i * S + state];\n                if (v &gt; max_val) max_val = v;\n            }\n\n            float sum = 0.0f;\n            #pragma unroll\n            for (int i = 0; i &lt; S; ++i) {\n                sum += expf(smem[smem_offset + i] + log_trans[i * S + state] - max_val);\n            }\n\n            smem[smem_offset + state] = max_val + logf(sum) + log_emit_t[ot * S + state];\n        }\n        __syncwarp();\n    }\n\n    // final logsumexp over states\n    if (active &amp;&amp; state == 0) {\n        float max_val = smem[smem_offset + 0];\n        #pragma unroll\n        for (int i = 1; i &lt; S; ++i) {\n            float v = smem[smem_offset + i];\n            if (v &gt; max_val) max_val = v;\n        }\n\n        float sum = 0.0f;\n        #pragma unroll\n        for (int i = 0; i &lt; S; ++i) {\n            sum += expf(smem[smem_offset + i] - max_val);\n        }\n\n        output[batch_id] = max_val + logf(sum);\n    }\n}\n\ntorch::Tensor hmm_forward_cuda(\n    torch::Tensor log_init,\n    torch::Tensor log_trans,\n    torch::Tensor log_emit_t,\n    torch::Tensor observations)\n{\n    int B = observations.size(0);\n    int T = observations.size(1);\n    int S = log_init.size(0);\n    int num_obs = log_emit_t.size(0);\n\n    TORCH_CHECK(S &lt;= 32, \&quot;hmm_forward_kernel only supports num_states &lt;= 32\&quot;);\n\n    auto output = torch::empty({B}, log_init.options());\n\n    const int threads_per_warp = 32;\n    int batch_per_warp = threads_per_warp / S;\n    if (batch_per_warp &lt; 1) batch_per_warp = 1;\n    int warps_per_block = 8; // 256 threads per block\n    int batch_per_block = warps_per_block * batch_per_warp;\n    int blocks = (B + batch_per_block - 1) / batch_per_block;\n\n    int shared_mem_size = batch_per_block * S * sizeof(float);\n\n    hmm_forward_kernel&lt;&lt;&lt;blocks, warps_per_block * threads_per_warp, shared_mem_size&gt;&gt;&gt;(\n        log_init.data_ptr&lt;float&gt;(),\n        log_trans.data_ptr&lt;float&gt;(),\n        log_emit_t.data_ptr&lt;float&gt;(),\n        observations.data_ptr&lt;int64_t&gt;(),\n        output.data_ptr&lt;float&gt;(),\n        B, T, S, num_obs\n    );\n\n    return output;\n}\n\&quot;\&quot;\&quot;\n\ncpp_src = \&quot;\&quot;\&quot;\ntorch::Tensor hmm_forward_cuda(torch::Tensor log_init, torch::Tensor log_trans, torch::Tensor log_emit_t, torch::Tensor observations);\n\&quot;\&quot;\&quot;\n\nhmm_ext = load_inline(\n    name=\&quot;hmm_forward\&quot;,\n    cpp_sources=cpp_src,\n    cuda_sources=CUDA_CODE,\n    functions=[\&quot;hmm_forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    extra_cflags=[\&quot;-O3\&quot;],\n)\n\n\nclass ModelNew(nn.Module):\n    \&quot;\&quot;\&quot;Fused CUDA kernel for HMM forward algorithm.\&quot;\&quot;\&quot;\n\n    def __init__(self, num_states, num_obs):\n        super().__init__()\n        self.num_states = num_states\n        self.num_obs = num_obs\n\n        self.log_init = nn.Parameter(torch.zeros(num_states))\n        self.log_trans = nn.Parameter(torch.zeros(num_states, num_states))\n        self.log_emit = nn.Parameter(torch.zeros(num_states, num_obs))\n\n    def _normalize_log(self, x, dim=-1):\n        return x - torch.logsumexp(x, dim=dim, keepdim=True)\n\n    def forward(self, observations: torch.Tensor) -&gt; torch.Tensor:\n        log_pi = self._normalize_log(self.log_init)\n        log_A = self._normalize_log(self.log_trans, dim=-1)\n        log_B = self._normalize_log(self.log_emit, dim=-1)\n        # transpose for coalesced memory access inside the kernel\n        log_B_t = log_B.t().contiguous()\n        return hmm_ext.hmm_forward_cuda(\n            log_pi.contiguous(),\n            log_A.contiguous(),\n            log_B_t,\n            observations.contiguous(),\n        )\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ImportError.
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15&#x27; not found (required by /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_50_cache/k_92b0fb99991d/hmm_forward/hmm_forward.so)</div></details></div></details></div>
 </body></html>

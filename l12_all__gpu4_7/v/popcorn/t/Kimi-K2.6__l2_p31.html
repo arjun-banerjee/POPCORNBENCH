@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 31</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:04:55 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 31</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:10:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">31_FusedMLAAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -133,5 +133,1642 @@ GPU specs for NVIDIA H100 80GB HBM3:
     Maximum number of registers per thread: 255
     Maximum number of thread blocks per SM: 32
     Shared memory capacity per SM: 228 KB
-    Maximum shared memory per thread block: 227 KB</div></details></div></div>
+    Maximum shared memory per thread block: 227 KB</div></details></div><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 405.8s · 109,901 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 405.8s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze this problem. We have a fused MLA-style attention where:
+
+1. `q` has shape `(batch_size, seq_len, num_heads, head_dim)`
+2. `kv_latent` has shape `(batch_size, seq_len, rank)`
+3. `w_up_k` has shape `(rank, num_heads, head_dim)`
+4. `w_up_v` has shape `(rank, num_heads, head_dim)`
+
+For each batch, head, and time step `t`, we compute attention over all previous positions `s = 0..t`:
+- `k = latent @ w_up_k[:, h]` (shape: `rank` dot `(rank, head_dim)` = `head_dim`)
+- `v = latent @ w_up_v[:, h]` (shape: `head_dim`)
+- `logit = (q[b,t,h] * k).sum() * scale`
+- `softmax` over logits
+- Weighted sum of values
+
+This is essentially causal self-attention where keys and values are computed on-the-fly from latent vectors.
+
+The small sizes are:
+- batch_size = 2
+- seq_len = 32
+- num_heads = 4
+- head_dim = 16
+- rank = 24
+
+Given these small sizes, each instance of attention is small. But we can parallelize across batch, heads, and sequence positions.
+
+Let me think about the computation:
+For each (b, h, t):
+  For s in 0..t:
+    k_s = sum_r(kv_latent[b,s,r] * w_up_k[r, h, d]) for each d
+    v_s = sum_r(kv_latent[b,s,r] * w_up_v[r, h, d]) for each d
+    logit_s = sum_d(q[b,t,h,d] * k_s[d]) * scale
+
+Then softmax and weighted sum of v_s.
+
+This can be reorganized as:
+
+For each (b, h, t):
+  logit_s = scale * sum_d(q[b,t,h,d] * sum_r(kv_latent[b,s,r] * w_up_k[r,h,d]))
+          = scale * sum_r(kv_latent[b,s,r] * sum_d(q[b,t,h,d] * w_up_k[r,h,d]))
+  
+Let me define:
+  q_proj_k[r] = sum_d(q[b,t,h,d] * w_up_k[r,h,d])
+
+Then:
+  logit_s = scale * sum_r(kv_latent[b,s,r] * q_proj_k[r])
+          = scale * dot(kv_latent[b,s], q_proj_k)
+
+And for values:
+  v_s[d] = sum_r(kv_latent[b,s,r] * w_up_v[r,h,d])
+  
+  out[d] = sum_s(attn_s * v_s[d])
+         = sum_s(attn_s * sum_r(kv_latent[b,s,r] * w_up_v[r,h,d]))
+         = sum_r(sum_s(attn_s * kv_latent[b,s,r]) * w_up_v[r,h,d])
+
+So let me define:
+  attn_weighted_latent[r] = sum_s(attn_s * kv_latent[b,s,r])
+  out[d] = sum_r(attn_weighted_latent[r] * w_up_v[r,h,d])
+
+This is a nice reformulation! For each (b, h, t):
+1. `q_proj_k` = einsum(&#x27;d,rhd-&gt;r&#x27;, q[b,t,h], w_up_k[:,h])  (shape: rank)
+2. `logits` = scale * einsum(&#x27;sr,r-&gt;s&#x27;, kv_latent[b,:t+1], q_proj_k)  (shape: t+1)
+3. `attn` = softmax(logits)
+4. `attn_weighted_latent` = einsum(&#x27;s,sr-&gt;r&#x27;, attn, kv_latent[b,:t+1])  (shape: rank)
+5. `out[b,t,h]` = einsum(&#x27;r,rhd-&gt;d&#x27;, attn_weighted_latent, w_up_v[:,h])  (shape: head_dim)
+
+This drastically reduces computation. Instead of computing k and v for each s explicitly, we:
+- Project q once to rank space (cost: head_dim * rank)
+- Compute all logits with a single matvec (cost: (t+1) * rank)
+- Compute weighted latent (cost: (t+1) * rank)
+- Project to head_dim with w_up_v (cost: rank * head_dim)
+
+The original was doing O(t * rank * head_dim) work per t for k and v alone, but this reformulation does O(t * rank + rank * head_dim) per t.
+
+Wait, actually, let me double check. In the original, for each s, k is computed as `latent @ w_up_k[:, h]` which is `rank * head_dim` operations. For t+1 positions, that&#x27;s `(t+1) * rank * head_dim` operations for keys, and same for values.
+
+In the reformulation:
+- Step 1: `head_dim * rank`
+- Step 2: `(t+1) * rank`
+- Step 3: `(t+1) * rank`
+- Step 5: `rank * head_dim`
+
+Total: `2 * rank * head_dim + 2 * (t+1) * rank` vs. original `2 * (t+1) * rank * head_dim + (t+1) * head_dim`.
+
+This is a huge improvement! Even for these small sizes.
+
+Now, how to implement this efficiently in CUDA?
+
+Given the sizes are tiny (seq_len=32, rank=24, head_dim=16, num_heads=4, batch=2), I can write a single kernel that handles each (b, h, t) with one thread or one warp.
+
+Since head_dim=16 and rank=24, and seq_len=32, I could use:
+- One thread block per (b, h) pair, with threads handling different t values
+- Within each block, each thread handles one t
+
+Or maybe one block per (b, h, t) - but that might be too many small blocks. We have 2*4*32 = 256 positions total. That&#x27;s small but manageable.
+
+Let me think about a warp-level approach. If each warp handles one (b, h, t):
+- 32 threads in a warp
+- Each warp loads q[b,t,h,:] into registers (16 elements, 2 elements per thread or some pattern)
+- Each warp computes q_proj_k[r] = sum_d q[d] * w_up_k[r,h,d]
+  We can have each thread compute a subset of r, then exchange? Or use warp shuffle.
+
+Actually, let me think simpler. Since rank=24 and head_dim=16, and t&lt;=32, this is all very small. A simple approach where each thread does some work sequentially might be fine.
+
+Option 1: One thread per (b, h, t)
+- total threads = 2*4*32 = 256
+- Each thread:
+  1. Load q[b,t,h,:] (16 floats)
+  2. Compute q_proj_k[r] = sum_d q[d] * w_up_k[r,h,d] for r=0..23
+  3. For s=0..t: compute dot(kv_latent[b,s,:], q_proj_k) -&gt; logits[s]
+  4. softmax(logits[0..t])
+  5. attn_weighted_latent[r] = sum_s attn[s] * kv_latent[b,s,r]
+  6. out[d] = sum_r attn_weighted_latent[r] * w_up_v[r,h,d]
+
+This is very straightforward. Each thread does ~ O(t * rank) work. For max t=31, that&#x27;s about 32*24 = 768 operations for step 3, and same for step 5. Step 2 and 6 are rank*head_dim = 24*16 = 384 each. Total ~2300 FMAs per thread. With 256 threads, that&#x27;s 590K FMAs total. An H100 can do this in microseconds.
+
+Actually, wait - step 2 is: for each r (24), sum over d (16): 24*16 = 384 multiplies and 24*15 ≈ 360 adds.
+Step 3: for each s (0..t, avg ~16), dot of length 24: 16*24 = 384 mults and ~360 adds.
+Step 4: softmax on t+1 elements (~16) - some exp and divides.
+Step 5: for each r (24), weighted sum over s (~16): 24*16 = 384 mults and ~360 adds.
+Step 6: for each d (16), sum over r (24): 16*24 = 384 mults and ~360 adds.
+
+Total: ~2K FLOPs per thread. With 256 threads, ~512K FLOPs. H100 does ~67 TFLOPS FP32, so this is ~7.6 microseconds even at 10% utilization. 
+
+Of course, memory bandwidth is also a factor. Let me estimate memory traffic:
+- q: read once per thread, but q[b,t,h,:] is coalesced? If threads for same (b,h) with different t are in the same warp, then reading q is coalesced.
+- kv_latent: each thread reads kv_latent[b, 0..t, :]. Since each t is different, there&#x27;s divergence but within a block, the same kv_latent[b,s,:] is read by multiple threads.
+- w_up_k and w_up_v are read by all threads in a head.
+
+Actually, the simplest approach might be one block per (b, h), with threads for different t values within the block. Then they can share kv_latent[b,s,:] via shared memory! And w_up_k[:,h,:] and w_up_v[:,h,:] can also be in shared memory.
+
+Let me design this:
+- blockDim.x = 32 (one warp, handling different t values)
+- One block per (b, h)
+- Grid = (num_heads, batch_size)
+
+Shared memory:
+- w_up_k_h: rank * head_dim floats = 24*16 = 384 floats = 1536 bytes
+- w_up_v_h: rank * head_dim floats = 1536 bytes
+- kv_latent_b: seq_len * rank floats = 32*24 = 768 floats = 3072 bytes
+- Could also have a workspace for logits, but t is small and each thread can keep its own in registers.
+
+Wait, each thread needs to compute softmax over its own t+1 elements, and they differ per thread. If I have 32 threads in a warp, each has a different t. They all read the same kv_latent but different ranges.
+
+The most divergence comes from step 3 and 5 where each thread iterates s=0..t. Since t varies (0 to 31), threads in a warp will have different loop bounds. This causes thread divergence, but since seq_len is only 32, it&#x27;s not terrible.
+
+Let me think about coalescing:
+- Loading w_up_k_h and w_up_v_h to shared mem: done once per block, coalesced.
+- Loading kv_latent_b to shared mem: done once per block, coalesced.
+- Each thread reads q[b,t,h,d]: if t corresponds to threadIdx.x, and d is the inner dimension, then for a warp, reading q with stride head_dim across t... Actually q is in B S H D order. q[b,t,h,:] is contiguous in memory. If thread 0 reads q[b,0,h,:] and thread 1 reads q[b,1,h,:], they access memory at offsets 0, head_dim, 2*head_dim... These are contiguous only if head_dim=1. With head_dim=16, each access is 64 bytes, and consecutive threads access memory separated by 64 bytes. On H100, this might not be fully coalesced but it&#x27;s still reasonably good (each thread reads a contiguous 64-byte segment).
+
+Actually, wait. If thread 0 does `load 16 floats from &amp;q[b,0,h,0]` and thread 1 does `load 16 floats from &amp;q[b,1,h,0]` = `&amp;q[b,0,h,0] + num_heads*head_dim`, then consecutive threads access addresses separated by `num_heads*head_dim*sizeof(float) = 4*16*4 = 256 bytes`. These accesses are actually quite far apart and definitely not coalesced into a single transaction. But L1/L2 cache should help since the warp is reading nearby regions if multiple warps are scheduled...
+
+Hmm, actually let me reconsider. A warp has 32 threads. If I use one block = 32 threads = one warp per (b,h), and each thread handles a different t, then:
+- Thread t loads q[b, t, h, :] which is at global address: `&amp;q + ((b*seq_len + t)*num_heads + h)*head_dim`
+- Thread t+1 loads q[b, t+1, h, :] which is at: `&amp;q + ((b*seq_len + t+1)*num_heads + h)*head_dim`
+- Difference: `num_heads * head_dim * sizeof(float) = 4 * 16 * 4 = 256 bytes`
+
+Consecutive threads have a stride of 256 bytes. L2 cache line is typically 128 bytes. So each thread&#x27;s 64-byte load would need one or two cache lines, and they&#x27;re all different. This is bad for coalescing.
+
+Alternative: what if each thread handles multiple t values? Or what if we transpose the parallelism?
+
+Instead, let&#x27;s use one block per (b, t, h) with all 32-or-more threads cooperating on a single t? That&#x27;s way too many threads for a tiny computation.
+
+Another alternative: Have each block handle multiple (b, h) with threads cooperating. But the total number of positions is only 256, so even with suboptimal coalescing, it might still be fast since the total workload is tiny.
+
+Actually, wait. What if we use one thread block per (b, h), but instead of threadIdx.x = t, we have the threads within a warp collectively load and compute for the same t, then move to t+1? Like, process t sequentially within the block, with all threads cooperating on each t?
+
+For each t:
+  - Load q[b,t,h,d] cooperatively (coalesced!)
+  - Compute q_proj_k[r] cooperatively
+  - Compute logits[s] for s=0..t cooperatively
+  - Softmax cooperatively
+  - Compute output cooperatively
+
+But then we&#x27;d need block synchronization between steps. For seq_len=32, with 32 threads per block, processing 32 time steps... Let me think about the parallelism.
+
+If I have 32 threads and head_dim=16, rank=24, t&lt;=32:
+- Loading q: 16 floats, can be loaded by 16 threads (2 loads per thread if using float4, or 1 load each). Coalesced!
+- Computing q_proj_k[r=0..23]: each thread could compute a subset of r. Say thread i computes r=i and r=i+16 for i&lt;8? Actually with 32 threads and 24 elements, each thread could compute one r (with 8 threads idle or doing two). Or use warp reduce.
+  - q_proj_k[r] = sum_d q[d] * w_up_k[r, h, d]
+  - Load w_up_k into shared mem. Each thread computes for its assigned r. For r=24, say thread 0..23 each compute one r.
+- Computing logits[s=0..t]: with 32 threads, for t up to 31, each thread can compute one s (for s &lt; 32). We need dot product of kv_latent[b,s] (length 24) with q_proj_k (length 24).
+  - Each thread loads 24/32 elements? Or each thread computes one s. Since kv_latent is in shared mem, each thread just does 24 multiplications and accumulates for its s. If t &lt; threadIdx.x, some threads are idle.
+  - Wait, but t varies from 0 to 31! If we process t sequentially in a loop, at iteration t, threads with idx &gt; t are idle. That&#x27;s a lot of divergence.
+  - Alternatively, we can have each iteration load kv_latent[b,s,:] and compute all logits at once using matrix multiplication, but that&#x27;s overkill.
+
+Maybe the one-thread-per-(b,h,t) approach is actually fine, despite the coalescing issue, because the total data size is so small.
+
+Let me estimate: total memory read for all threads:
+- q: 2*32*4*16 = 4096 floats = 16KB
+- kv_latent: each (b,t) reads kv_latent[b, 0..t, :]. Average t=16, so 2*32*4*16*24 = 98,304 floats ≈ 384KB. Wait, but kv_latent for each (b,s) is read by all threads with that b and all h,t where t&gt;=s.
+  - For a fixed (b,s), it&#x27;s read by num_heads * (seq_len - s) threads.
+  - So total reads of kv_latent = sum_{b,s} num_heads * (seq_len - s) * rank
+  - = batch * num_heads * rank * sum_{s=0}^{31} (32-s)
+  - = 2 * 4 * 24 * (32*33/2)
+  - = 192 * 528 = 101,376 floats ≈ 405KB
+- w_up_k and w_up_v: each (b,h,t) reads the entire w_up_k[:,h,:] and w_up_v[:,h,:].
+  - Total reads = batch * seq_len * num_heads * rank * head_dim * 2
+  - = 2 * 32 * 4 * 24 * 16 * 2 = 196,608 floats ≈ 786KB
+
+Total memory traffic: ~1.2MB. H100 bandwidth is 3.35 TB/s. If we could read this all at max bandwidth, that&#x27;s 0.35 microseconds. But with poor coalescing and the need to do actual compute, it&#x27;ll be much slower. Still, even at 100x slower, it&#x27;s 35 microseconds.
+
+For compute: The reformulated approach has about 2K FLOPs per position. 256 positions * 2K = 512K FLOPs. At 67 TFLOPS, that&#x27;s 7.6 nanoseconds. So we&#x27;re memory-bound.
+
+Given the small size, a simple kernel with one thread per (b,h,t) might actually perform reasonably well. And we can optimize by using shared memory for w_up_k, w_up_v, and kv_latent within each block.
+
+Wait, if I use one block per (b,h), I can load:
+- w_up_k[:,h,:] into shared mem (24*16=384 floats)
+- w_up_v[:,h,:] into shared mem (384 floats)
+- kv_latent[b,:,:] into shared mem (32*24=768 floats)
+
+Then each thread in the block handles a different t. The shared mem reads are fast and uniform. The only global memory reads are q and the output write.
+
+Let me refine this:
+- Grid: (num_heads, batch_size)
+- Block: 32 threads (one warp)
+- Each block = one (b,h)
+- Thread i in the block handles t=i
+
+But wait, seq_len=32 and block size=32, so that&#x27;s perfect! One warp handles all t values for one (b,h).
+
+Shared memory layout:
+- smem[0 .. rank*head_dim-1]: w_up_k_h
+- smem[rank*head_dim .. 2*rank*head_dim-1]: w_up_v_h
+- smem[2*rank*head_dim .. 2*rank*head_dim + seq_len*rank - 1]: kv_latent_b
+
+Total shared mem: 384 + 384 + 768 = 1536 floats = 6KB. Very small!
+
+Each thread:
+1. Load q[b,t,h,d] for d=0..15 to registers (global memory)
+2. Compute q_proj_k[r] = sum_d q[d] * w_up_k_h[r,d] (using smem)
+   - This is a mat-vec: w_up_k_h^T @ q, but w_up_k_h has shape (rank, head_dim)
+   - q_proj_k[r] = sum_d w_up_k_h[r,d] * q[d]
+   - For each r=0..23, do 16 multiplications and 15 additions.
+3. Compute logits[s] = scale * sum_r kv_latent_b[s,r] * q_proj_k[r] for s=0..t
+   - For each s, 24 multiplications and 23 additions.
+   - But only for s &lt;= t.
+4. Softmax on logits[0..t]
+5. Compute attn_latent[r] = sum_{s=0}^t attn[s] * kv_latent_b[s,r] for r=0..23
+6. Compute out[d] = sum_r attn_latent[r] * w_up_v_h[r,d] for d=0..15
+9. Write out[b,t,h,d] to global memory.
+
+Now, the divergence in step 3 and 5: threads with different t values do different amounts of work. Threads with small t do less work, threads with large t do more. In a warp, this causes serialization because threads must execute together, and the warp executes the maximum number of iterations (t=31 for the last thread).
+
+Wait, actually, if I have a loop `for s=0; s&lt;=t; s++`, the threads with smaller t will be masked off in later iterations. On Hopper, this still causes some inefficiency but it&#x27;s actually not terrible - the hardware handles divergence reasonably well for small loops.
+
+But there&#x27;s actually a more elegant way! Since all threads in a warp need to compute sums over s=0..t, and t ranges from 0 to 31 for threads 0..31, we can think of this as a prefix-sum-like or cumulative computation.
+
+Actually, let me think about it differently. What if I restructure so the threads process t in a way that minimizes divergence?
+
+For instance, what if I use a 2D thread block:
+- blockDim.x = seq_len = 32 (one thread per t)
+- blockDim.y = something else?
+
+No, each t is independent and doing different amounts of work.
+
+For a tiny seq_len of 32, the divergence is actually probably fine. Even in the worst case, all threads do 32 iterations, but the early threads just do no-ops in later iterations. The overhead isn&#x27;t huge.
+
+Actually, since the amount of work is so small (24 ops per s), the divergence overhead might be noticeable. Let me think about another approach.
+
+What if I don&#x27;t have each thread handle a different t? What if all 32 threads cooperate on the same t, and the block iterates over t=0..31? That eliminates divergence within each t, but adds loop overhead and the need for synchronization. But since t is only 32 iterations, and each iteration is very fast, the sync overhead might dominate.
+
+Hmm, let me just try the simple approach first and see how it does. If it&#x27;s not fast enough, I can optimize further.
+
+Wait, I just realized: if the block handles one (b,h) and processes all 32 t values, I should be careful about how q is loaded. If thread t reads q[b,t,h,:] and these accesses are strided by num_heads*head_dim = 256 bytes, is there a better layout?
+
+Actually, if q is stored as [batch, seq, heads, dim], then q[b,t,h,:] is contiguous. Thread 0 reads bytes [0, 64), thread 1 reads bytes [256, 320), etc. These are far apart. 
+
+But if I rearrange the loading: have all threads in the block load q cooperatively for all t. For example:
+```cuda
+for (int t = 0; t &lt; seq_len; t++) {
+    // All threads load q[b,t,h,d] for their d
+    q_local = q[b,t,h,threadIdx.x];
+    // Now all threads have q for the same t
+    // Compute using q_local...
+}
+```
+
+Wait, blockDim.x = 32 and head_dim = 16. So two threads would load the same d? Or some threads would be idle. We could set blockDim.x = 16 (for the 16 dimensions), but then we&#x27;d need more blocks or process multiple t per block.
+
+Actually, what if:
+- Grid = (num_heads, batch_size)
+- Block = (16, 2) or something? One dimension for d, one for t?
+  - If blockDim.x = 16 (for head_dim), blockDim.y = 32 (for seq_len), then we have 16*32 = 512 threads per block.
+  - That&#x27;s actually quite reasonable. One block = one (b,h).
+  - Block = (16, 32), total 512 threads, about 16 warps.
+  
+  For a fixed t (which means a fixed y-coordinate), the 16 threads in x load q[b,t,h,0..15] - perfectly coalesced! Each thread loads one float, they access consecutive memory addresses.
+  
+  Then these 16 threads compute q_proj_k[r] for r=0..23. This requires parallel reduction or having each thread compute a subset.
+  
+  Actually, with 512 threads, we might as well parallelize the r dimension across the 512 threads. For q_proj_k[r]:
+  - q_proj_k[r] = sum_d w_up_k[r,d] * q[d]
+  - For each r, only d matters. With 16 threads for d, each r needs a warp reduction.
+  - We have 32 warps (if 512 threads) or 16 warps (if 256 threads).
+  
+  Hmm, this is getting complicated. For such small sizes, the overhead of coordination might exceed the benefit.
+
+Let me step back. There are 256 total (b,h,t) positions. If I launch 256 threads, each does ~2K FLOPs. That&#x27;s only 512K total FLOPs. The arithmetic intensity is very low.
+
+What if I just use a single large thread block (say 256 or 512 threads) and let each thread handle one (b,h,t)? With some clever use of warp-level primitives, I might be able to improve coalescing... but actually for 256 threads total, even with poor coalescing, the L2 cache on H100 is large and fast.
+
+Alternatively, I could use 256 threads arranged as (16, 4, 4) where:
+- x = 16 threads for d dimension (coalesced q loading per t)
+- y = 4 threads for h dimension
+- z = 4 threads for b dimension
+
+Hmm, that&#x27;s complex.
+
+Let me think about another kernel design entirely. What if I process all (b,h,t) for a fixed b and h using a single thread? That is, each block has 1 thread that computes all t for one (b,h). Total blocks = batch_size * num_heads = 8.
+
+Block = (1,), Grid = (8,)
+
+Each thread:
+1. Load all q for (b,h): 32*16 = 512 floats. Or load as needed.
+2. Load w_up_k_h and w_up_v_h to registers: 384 + 384 = 768 floats.
+3. Load kv_latent_b to registers or local memory: 32*24 = 768 floats.
+4. For t=0..31:
+   a. Compute q_proj_k[r] = sum_d q[t,d] * w_up_k_h[r,d]
+   b. For s=0..t: logit[s] = scale * dot(kv_latent_b[s], q_proj_k)
+   c. softmax(logits[0..t])
+   d. attn_latent[r] = sum_s attn[s] * kv_latent_b[s,r]
+   e. out[t,d] = sum_r attn_latent[r] * w_up_v_h[r,d]
+
+The q and out accesses for the same (b,h) are sequential and fully coalesced if done by a single thread, but actually a single thread doesn&#x27;t coalesce anything. However, with 8 blocks running on 8 SMs, each thread reads a contiguous stream of memory for q and out. The L2 cache will handle this well.
+
+The memory reads of w_up_k and w_up_v by different blocks (different h) are independent. For kv_latent, different b values read different memory regions.
+
+This might actually work well! Each block reads:
+- q: 512 floats, sequentially
+- kv_latent: 768 floats, sequentially
+- w_up_k and w_up_v: 768 floats, sequentially
+- out: 512 floats written, sequentially
+
+Per block memory: ~2.5KB read + 0.5KB write = 3KB. For 8 blocks: 24KB total memory traffic. This is tiny and will fit in L2 cache.
+
+The compute per block: for each of 32 t values:
+- Step a: 24*16 = 384 mult-adds
+- Step b: sum_{t=0}^{31} (t+1)*24 = 24 * 32*33/2 = 12,672 mult-adds
+- Step c: softmax, negligible
+- Step d: sum_{t=0}^{31} (t+1)*24 = 12,672 mult-adds
+- Step e: 32 * 16 * 24 = 12,288 mult-adds
+Total per block: ~38K mult-adds. 8 blocks: ~304K mult-adds.
+
+At 67 TFLOPS, this is ~4.5 nanoseconds of compute. Memory bandwidth limited at ~24KB, which at 3.35 TB/s is ~7 nanoseconds. So theoretical minimum is maybe 10-20 nanoseconds. Realistically, much higher due to kernel launch overhead and latency.
+
+But the reference is probably also quite fast for such small sizes. The reference in PyTorch loops over all dimensions in Python (very slow), so even a naive CUDA kernel will be much faster.
+
+Wait, the reference shown is pure Python loops. That&#x27;s going to be incredibly slow - probably milliseconds. So our kernel will definitely be faster.
+
+Actually, let me re-read... The reference model loops in Python. This means the PyTorch reference is extremely slow. But when they evaluate, they might compare against a vectorized PyTorch implementation, not the Python-loop one. Hmm, the problem says &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel&quot; and &quot;Run faster than the PyTorch reference.&quot; 
+
+I think they benchmark against the reference implementation as-is, or they might have a more efficient reference. Either way, I should write a good kernel.
+
+Let me think about what the most efficient PyTorch implementation would look like. If someone vectorized the reference in PyTorch:
+
+Using the reformulation:
+1. `q_proj_k = torch.einsum(&#x27;bthd,rhd-&gt;bthr&#x27;, q, w_up_k)` - shape (2, 32, 4, 24)
+   Actually: `q_proj_k[b,t,h,r] = sum_d q[b,t,h,d] * w_up_k[r,h,d]`
+
+2. For each t, logits[b,t,h,s] = scale * sum_r kv_latent[b,s,r] * q_proj_k[b,t,h,r] for s&lt;=t
+   This is like a causal batched matrix multiply:
+   `logits = torch.einsum(&#x27;bsr,bthr-&gt;bhts&#x27;, kv_latent, q_proj_k) * scale`
+   Then mask to make it causal: logits.masked_fill_(causal_mask, -inf)
+   `causal_mask` has shape (32, 32) where mask[s,t] = (s &gt; t)
+
+3. `attn = torch.softmax(logits, dim=-1)` where dim=-1 is the s dimension
+   Wait, the softmax is over s for each (b,h,t). The logits are (b, h, t, s) but we need them to be causal.
+
+4. `attn_weighted_latent = torch.einsum(&#x27;bhts,bsr-&gt;bthr&#x27;, attn, kv_latent)`
+   Wait, attn has shape (b, h, t, s), kv_latent has shape (b, s, r). Since attn is already causal (positions s&gt;t are zeroed after softmax), we can do:
+   `attn_latent = torch.einsum(&#x27;bhts,bsr-&gt;bthr&#x27;, attn, kv_latent)`
+
+5. `out = torch.einsum(&#x27;bthr,rhd-&gt;bthd&#x27;, attn_latent, w_up_v)`
+
+This is a very clean vectorized PyTorch implementation. For these small sizes, PyTorch&#x27;s einsum/BLAS would be quite fast but there&#x27;d be multiple kernel launches and memory traffic between them. A fused kernel that does all 5 steps without intermediate global memory writes/reads would be much faster.
+
+So the key advantage of the custom kernel is fusing all these operations.
+
+Alright, let me design the kernel. I&#x27;ll go with one block per (b, h), with blockSize = 32 (one warp), each thread handling one t. To minimize divergence, I could have each thread process a contiguous slice of t, but with only 32 threads and 32 t values, one thread per t is natural.
+
+Wait, actually there&#x27;s an important optimization. Since each warp handles all t values for one (b,h), and threads in a warp have different t values (0 to 31), the divergence in the s-loop is indeed an issue. But here&#x27;s the thing: for step 2 (logits) and step 4 (weighted latent), we can restructure so that operations are warp-wide!
+
+Consider step 2: each thread needs `logits[s]` for s=0..t. But if we think of it as computing the full logits matrix for all (t,s) pairs, then each thread is just computing one row. A warp can compute this as:
+- For s=0..31: all threads compute `dot(kv_latent_b[s], q_proj_k)` in parallel!
+  - Thread t computes `logit_s_t = dot(kv_latent_b[s], q_proj_k_t)`
+  - This means all 32 threads compute their own dot product using their own q_proj_k_t, but the same kv_latent_b[s].
+  - Each thread does 24 mult-adds. All 32 threads do this in parallel. No divergence!
+  - After this, each thread t has logits[0..31] for all s, but we only care about s&lt;=t.
+
+Actually, even better! We can compute ALL logits in parallel:
+```cuda
+for (int s = 0; s &lt; seq_len; s++) {
+    // Load kv_latent_b[s, 0..23] to registers or shared mem
+    float logit = 0.0f;
+    for (int r = 0; r &lt; rank; r++) {
+        logit += kv_latent_b[s * rank + r] * q_proj_k[r];
+    }
+    logits[s] = logit * scale;
+}
+```
+
+All threads in the warp execute the same s loop for 32 iterations. Inside each iteration, each thread computes its own dot product with its own q_proj_k. No divergence! And after the loop, each thread has logits for all 32 s values. Then thread t only uses logits[0..t].
+
+For softmax, we could also compute it per thread:
+```cuda
+float max_logit = -INFINITY;
+for (int s = 0; s &lt;= t; s++) max_logit = fmaxf(max_logit, logits[s]);
+float sum_exp = 0.0f;
+for (int s = 0; s &lt;= t; s++) {
+    float e = expf(logits[s] - max_logit);
+    attn[s] = e;
+    sum_exp += e;
+}
+for (int s = 0; s &lt;= t; s++) attn[s] /= sum_exp;
+```
+
+This loop has divergence (different t values), but only 32 iterations max. And the loop is very simple (just comparisons and accumulations). The divergence cost is not huge for such a small loop.
+
+Alternatively, we can restructure the softmax to also be divergence-free by having all threads compute on all 32 elements, then zero out or ignore the s&gt;t elements:
+```cuda
+// All threads compute max over all 32 logits
+float max_logit = -INFINITY;
+for (int s = 0; s &lt; seq_len; s++) {
+    // only consider if s &lt;= t, but this introduces divergence
+    max_logit = fmaxf(max_logit, logits[s]); // wait, for t &lt; s, we shouldn&#x27;t include logits[s]
+}
+```
+
+Hmm, this would include future positions in the max calculation which is wrong for causal softmax. We do need divergence for the max.
+
+Actually, a neat trick: since logits for s &gt; t don&#x27;t matter for thread t, but we can precompute the cumulative max! For each t, max is over s=0..t. We could have a separate warp-level prefix-scan for max, but that seems overkill for 32 elements.
+
+Let me just implement the per-thread causal softmax with a simple loop and see how it performs.
+
+Similarly for step 4: `attn_latent[r] = sum_{s=0}^t attn[s] * kv_latent_b[s, r]`
+This also has divergence due to the s&lt;=t bound. But we can restructure:
+```cuda
+for (int r = 0; r &lt; rank; r++) {
+    float acc = 0.0f;
+    for (int s = 0; s &lt;= t; s++) {
+        acc += attn[s] * kv_latent_b[s * rank + r];
+    }
+    attn_latent[r] = acc;
+}
+```
+
+With rank=24 and max t=31, this is 24*32 = 768 iterations worst case, but with divergence (earlier threads do fewer). Total work across the warp is sum_{t=0}^{31} 24*(t+1) = 24*528 = 12,672 mult-adds. At 32 threads, if perfectly balanced each would do ~396, but the max is 768. So utilization is about 52% due to divergence.
+
+Can we make this divergence-free? Yes! We can process all s in parallel across threads:
+```cuda
+// Warp-wide approach: for each s, all threads compute their contribution
+// Actually, we want: for each r, sum_s attn_s * kv_latent[s,r]
+// where attn_s depends on t (different for each thread)
+
+// This is harder to parallelize across threads in a warp because attn_s varies by t
+```
+
+Hmm, since attn_s is different for each thread (different t), this is inherently divergent if each thread t is handling one t.
+
+But for the inner operation per r, we can restructure. Let me think...
+
+For a fixed r, `attn_latent_t[r] = sum_s attn_t[s] * kv_latent[s, r]` where attn_t[s] = 0 for s &gt; t.
+This is essentially: for each r, compute a prefix-sum-like weighted sum where the weights form a lower-triangular matrix.
+
+If we precompute kv_latent in shared memory, we could use warp-level prefix scan techniques. For each r (24 values), and for each s (32 steps), update a prefix sum. But each thread has its own prefix sum...
+
+Actually, there&#x27;s a beautiful observation: 
+`attn_latent_t[r]` for t=0..31 is the cumulative sum of `attn_t[s] * kv_latent[s, r]`. But `attn_t[s]` varies with t, so it&#x27;s not a simple prefix sum of a fixed sequence.
+
+Wait, but if we process s sequentially as a warp, for each s, all threads compute `attn_t[s] * kv_latent[s, r]` and add it to their accumulator. All threads in the warp do 32 iterations, each with 1 mult-add. No divergence!
+
+```cuda
+float attn_latent[24] = {0};
+for (int s = 0; s &lt; seq_len; s++) {
+    float attn_s = (s &lt;= t) ? attn[s] : 0.0f; // This is a conditional, but it&#x27;s the same for all threads? NO!
+    // t is different for each thread. Some threads have s&lt;=t true, others false.
+    // This causes divergence.
+}
+```
+
+But wait, the divergence here is much better! It&#x27;s a single `if` statement, not a varying loop bound. And actually, for a given `s`, the condition `s &lt;= t` is true for all threads with t &gt;= s. When s=0, all 32 threads execute the true branch. When s=16, 16 threads execute true, 16 execute false (skip). When s=31, only 1 thread executes true. 
+
+On modern GPUs, divergence within a warp means the warp executes both paths serially, masking off inactive threads. So for each s, the warp executes the true path with some threads active, then the false path with others. For the false path, there&#x27;s nothing to do (masked off). So for each s, the warp executes once. Total iterations: 32 (for all s). But the amount of work varies.
+
+Actually, this is brilliant! The loop bound is always 32, so there&#x27;s no loop divergence! The only divergence is the conditional inside the loop. For s=0, all 32 threads are active (100%). For s=10, 22 threads active (69%). For s=20, 12 threads active (38%). For s=30, 2 threads active (6%). Average activity over all s: sum_{s=0}^{31} (32-s) / 32 / 32 = 528 / 1024 = 51.6%. Same as before but structured as a fixed loop with internal divergence.
+
+Is there a better way? What if we process t blocks of 32 threads differently? 
+
+Actually, I just realized: since the total workload is so tiny, maybe the kernel is memory-bound and compute efficiency doesn&#x27;t matter much. With ~1.2MB memory traffic and 3.35 TB/s bandwidth, at 10% utilization that&#x27;s still ~0.4 microseconds. In practice with kernel overhead, it might be several microseconds.
+
+Let me just write the kernel and benchmark it. I can optimize later if needed.
+
+Here&#x27;s my plan for the CUDA kernel:
+
+```cuda
+__global__ void fused_mla_attention_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ kv_latent,
+    const float* __restrict__ w_up_k,
+    const float* __restrict__ w_up_v,
+    float* __restrict__ out,
+    int batch_size, int seq_len, int num_heads, int head_dim, int rank
+) {
+    // One block per (b, h)
+    int b = blockIdx.y;
+    int h = blockIdx.x;
+    
+    if (b &gt;= batch_size || h &gt;= num_heads) return;
+    
+    // Thread index = t (seq position)
+    int t = threadIdx.x;
+    if (t &gt;= seq_len) return;
+    
+    extern __shared__ float smem[];
+    float* w_up_k_smem = smem;                          // rank * head_dim
+    float* w_up_v_smem = smem + rank * head_dim;        // rank * head_dim
+    float* kv_latent_smem = smem + 2 * rank * head_dim; // seq_len * rank
+    
+    // Load w_up_k[:, h, :] to shared memory
+    // Each thread loads a portion
+    int w_up_k_size = rank * head_dim;
+    for (int i = threadIdx.x; i &lt; w_up_k_size; i += blockDim.x) {
+        w_up_k_smem[i] = w_up_k[h * rank * head_dim + i];
+    }
+    
+    // Load w_up_v[:, h, :] to shared memory
+    for (int i = threadIdx.x; i &lt; w_up_k_size; i += blockDim.x) {
+        w_up_v_smem[i] = w_up_v[h * rank * head_dim + i];
+    }
+    
+    // Load kv_latent[b, :, :] to shared memory
+    int kv_size = seq_len * rank;
+    for (int i = threadIdx.x; i &lt; kv_size; i += blockDim.x) {
+        int s = i / rank;
+        int r = i % rank;
+        kv_latent_smem[i] = kv_latent[((b * seq_len) + s) * rank + r];
+    }
+    
+    __syncthreads();
+    
+    // Load q[b, t, h, :] (head_dim floats)
+    float q_local[16]; // head_dim = 16, fixed size for simplicity
+    #pragma unroll
+    for (int d = 0; d &lt; head_dim; d++) {
+        q_local[d] = q[(((b * seq_len + t) * num_heads + h) * head_dim + d)];
+    }
+    
+    // Step 1: q_proj_k[r] = sum_d q[d] * w_up_k[r, d]
+    float q_proj_k[24]; // rank = 24
+    #pragma unroll
+    for (int r = 0; r &lt; rank; r++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int d = 0; d &lt; head_dim; d++) {
+            acc += q_local[d] * w_up_k_smem[r * head_dim + d];
+        }
+        q_proj_k[r] = acc;
+    }
+    
+    // Step 2: logits[s] = scale * dot(kv_latent[s], q_proj_k) for all s
+    float logits[32]; // seq_len = 32
+    float scale = 1.0f / sqrtf((float)head_dim);
+    #pragma unroll
+    for (int s = 0; s &lt; seq_len; s++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int r = 0; r &lt; rank; r++) {
+            acc += kv_latent_smem[s * rank + r] * q_proj_k[r];
+        }
+        logits[s] = acc * scale;
+    }
+    
+    // Step 3: Causal softmax over s = 0..t
+    float max_logit = -1e20f; // avoid INFINITY issues
+    #pragma unroll
+    for (int s = 0; s &lt;= t; s++) {
+        max_logit = fmaxf(max_logit, logits[s]);
+    }
+    
+    float sum_exp = 0.0f;
+    #pragma unroll
+    for (int s = 0; s &lt;= t; s++) {
+        float e = expf(logits[s] - max_logit);
+        logits[s] = e; // reuse logits array for attn weights
+        sum_exp += e;
+    }
+    
+    float inv_sum = 1.0f / sum_exp;
+    #pragma unroll
+    for (int s = 0; s &lt;= t; s++) {
+        logits[s] *= inv_sum;
+    }
+    
+    // Step 4: attn_latent[r] = sum_s attn[s] * kv_latent[s, r]
+    float attn_latent[24];
+    #pragma unroll
+    for (int r = 0; r &lt; rank; r++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int s = 0; s &lt;= t; s++) {
+            acc += logits[s] * kv_latent_smem[s * rank + r];
+        }
+        attn_latent[r] = acc;
+    }
+    
+    // Step 5: out[d] = sum_r attn_latent[r] * w_up_v[r, d]
+    float out_local[16];
+    #pragma unroll
+    for (int d = 0; d &lt; head_dim; d++) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int r = 0; r &lt; rank; r++) {
+            acc += attn_latent[r] * w_up_v_smem[r * head_dim + d];
+        }
+        out_local[d] = acc;
+    }
+    
+    // Write output
+    #pragma unroll
+    for (int d = 0; d &lt; head_dim; d++) {
+        out[(((b * seq_len + t) * num_heads + h) * head_dim + d)] = out_local[d];
+    }
+}
+```
+
+Wait, I&#x27;ll need to be careful with the `#pragma unroll` and fixed-size arrays. Since seq_len=32 and head_dim=16 and rank=24, these are known at kernel definition time. But to be robust to different sizes, I should either pass them as template parameters or not use arrays on the stack and instead just use scalar accumulators where possible.
+
+Actually, using fixed-size arrays with `pragma unroll` is fine since the compiler can optimize very well for small constant sizes. But I need to make sure the arrays fit in registers. 32 + 24 + 16 + 24 = 96 floats = 384 bytes per thread. That&#x27;s fine.
+
+But note: `float logits[32]` will use 32 registers. `float q_proj_k[24]` = 24 registers. `float q_local[16]` = 16 registers. `float attn_latent[24]` = 24 registers. `float out_local[16]` = 16 registers. Total = 112 registers per thread. With 32 threads per block, that&#x27;s 3584 registers per block. Well under the 255 limit per thread and 64K per SM.
+
+Wait, but the actual register pressure might be lower due to compiler optimization. Let me not worry too much about it.
+
+Actually, let me reconsider the array sizes. If seq_len, head_dim, rank might vary, I should maybe allocate dynamically or use smaller local arrays. But the problem gives fixed sizes in `get_inputs()` and seems to expect those.
+
+Let me write this more carefully. I should avoid hard-coding the dimensions, but since the loop bounds are small I can still unroll if I define them as constants in the kernel.
+
+Actually, in CUDA, I can&#x27;t use `pragma unroll` with runtime variable loop bounds easily. But `#pragma unroll` with acompile-time constant works. If I pass dimensions as template parameters, that&#x27;s great. Otherwise, with small known sizes, the compiler might auto-unroll anyway.
+
+Actually, let me think about this. The sizes are given as constants in the Python code but passed as arguments to the kernel. To force unrolling, I can either:
+1. Hardcode the sizes in the kernel (since they&#x27;re fixed in get_inputs)
+2. Use #pragma unroll without a number and hope the compiler unrolls small loops
+3. Pass as template parameters
+
+I&#x27;ll hardcode for simplicity, or better yet, just define `constexpr` in the CUDA code.
+
+Actually, looking at this more carefully, I wonder if I should just follow the simpler approach and write the kernel generically. The compiler is pretty good at unrolling loops with small known bounds.
+
+Let me think about an even simpler approach. Since this is an H100 with tensor cores, could I use wmma? For rank=24, head_dim=16, seq_len=32, the matrices are too small for tensor cores to be efficient. The setup overhead of wmma would dwarf the actual compute.
+
+So a plain CUDA kernel with careful register usage and shared memory is the way to go.
+
+One optimization: instead of storing logits[32], I can process the softmax in a single pass to reduce register usage, but for 32 elements it&#x27;s already small. And I reuse the logits array for attn weights, which is fine.
+
+Another thought: can I eliminate the `logits[s] = e` store and the `logits[s] *= inv_sum` by doing it in one pass? Not really, since we need the sum before normalizing.
+
+For the softmax, I can use an online softmax algorithm to reduce passes from 3 to 2, but for 32 elements it&#x27;s negligible.
+
+Let me also think about warp divergence one more time. In my kernel:
+- The loop `for (int s = 0; s &lt;= t; s++)` causes divergence.
+- With t = threadIdx.x (0..31), warp execution is serialized across different control paths.
+
+In Hopper, when threads in a warp diverge, the hardware executes each path separately. For loop bounds 0..31 across threads, the warp executes the maximum 32 iterations, and threads with smaller t become inactive in later iterations. This is actually handled reasonably efficiently.
+
+Wait, that&#x27;s not quite right. For `for (s=0; s&lt;=t; s++)`, threads with t=0 execute 1 iteration, t=1 execute 2 iterations, ..., t=31 execute 32 iterations. The warp doesn&#x27;t execute all 32 iterations with early threads masked off. Instead, when threads diverge on loop bounds, the hardware might execute in lockstep until the minimum common bound, then continue with remaining threads.
+
+Actually, for warp divergence with varying loop bounds: the warp executes instructions for all active threads. If thread 0 has t=0 and thread 1 has t=1, then:
+- Iteration 0: both threads active
+- Iteration 1: thread 0 is done (exits loop), thread 1 continues
+- But in lockstep execution, thread 0 would be masked off while thread 1 executes iteration 1
+
+So the warp executes 32 iterations total, and in iteration s, threads with t &lt; s are inactive. This means total warp iterations = 32, but thread utilization decreases. Same analysis as the fixed loop with internal conditional.
+
+For 32 iterations total, this is actually quite good. The overhead of warp divergence is small.
+
+Now let me think about memory coalescing for q loading and out writing:
+- q layout: [batch, seq, heads, dim] = [b, t, h, d]
+- For a fixed (b, h), thread t accesses q[b, t, h, :]. Consecutive threads (t and t+1) access memory at stride `num_heads * head_dim * sizeof(float) = 256 bytes`.
+
+With 32 threads in a warp, this means the warp is doing 32 separate 64-byte loads (16 floats each), spaced 256 bytes apart. This is coalesced into 32 cache lines. The L1/L2 cache handles this, but it&#x27;s not optimal.
+
+Similarly for output writes.
+
+To improve coalescing, I could transpose the thread-task mapping. Instead of threadIdx.x = t, what if I use threadIdx.x within a block to handle different b or h values, and have the block process t sequentially?
+
+Option: Let block handle all (b, h) but process t sequentially with all threads cooperating?
+No, the total number of (b,h) is only 8.
+
+Option: One thread per (b, h, t) but arrange threads across warps so that consecutive threads in a warp have the same t?
+That doesn&#x27;t help because each t is independent.
+
+Actually, for the q load, what if each thread loads one float at a time, and threads in a warp load the same t but different d?
+- Thread d loads q[b, t, h, d]
+- For a fixed t, 16 threads (d=0..15) load 16 consecutive floats = perfectly coalesced!
+- But we need to process all t values.
+
+So what if:
+- Grid = enough blocks for all (b, h, t) but we process...
+- No wait, if we need 256 total outputs, and each warp handles one t with 16 threads for d, then we need 16 warps. 16 warps * 32 threads/warp = 512 threads. But only 16 threads per warp are active.
+
+Actually, we could have:
+- Each warp handles one (b, h, t)
+- 16 threads in the warp (e.g., threadIdx.x = 0..15) handle the 16 dimensions
+- The other 16 threads in the warp are idle or redundant
+
+But CUDA warps are 32 threads, and divergence within a warp for the 16 active vs 16 inactive threads causes 50% utilization. Not great.
+
+Another idea: Each warp handles TWO (b, h, t) positions, with 16 threads each.
+- First 16 threads: t0
+- Next 16 threads: t1
+But then q loads for t0 and t1 are still interleaved.
+
+Hmm, what if one block warp handles one (b,h) and all threads cooperate on one t at a time? Block = 16 threads (one warp), iterates over t=0..31.
+- For each t: 16 threads load q[b,t,h,0..15] - perfectly coalesced.
+- Then compute q_proj_k[r] cooperatively: each thread computes a subset of r.
+  - With 16 threads and 24 r values, threads 0..15 compute 1 r each, then threads 0..7 compute another. Requires warp reduction or synchronization.
+- Then compute all logits: with 16 threads, can compute logits[0..31] by having each thread compute 2 logits. All threads load kv_latent for their assigned s and compute dot with q_proj_k.
+- Then do softmax on 32 logits with 16 threads.
+- Then compute attn_latent[r]: 16 threads compute a subset of r.
+- Then compute out[d]: 16 threads compute d=0..15.
+- Then write out - perfectly coalesced.
+
+This cooperative approach eliminates divergence and improves coalescing! But it adds more synchronization and requires more careful parallel algorithm design.
+
+For seq_len=32, iterating 32 times per block with __syncthreads() each time... The overhead might be acceptable.
+
+But actually, with such small data, even the simple non-cooperative version will be limited by memory bandwidth and cache, not coalescing. The total working set is tiny and fits in L2 cache.
+
+Let me just write the simple version and see how it does. If execution time is dominated by kernel launch overhead, micro-optimizations won&#x27;t matter.
+
+Actually, wait. I should check what the reference implementation actually looks like in PyTorch. The provided reference uses Python loops. This will be extremely slow. Our kernel just needs to be reasonable.
+
+But there might be a vectorized reference that they benchmark against. Looking at the problem statement again: &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel. Your ModelNew class must: ... Run faster than the PyTorch reference.&quot;
+
+I think &quot;PyTorch reference&quot; refers to the Model(nn.Module) class provided. But they might internally run a fast PyTorch reference for benchmarking. Either way, a fused kernel should be faster than multiple PyTorch ops.
+
+Let me also think: is there a way to write this kernel that&#x27;s even more fused or efficient?
+
+One thing I notice: step 2 (computing logits for all s) and step 4 (weighted sum over s) both involve iterating over s=0..seq_len-1 with inner loop over r=0..rank-1. This is essentially multiplying kv_latent (seq_len x rank) with q_proj_k (rank x 1) and later with attn (1 x seq_len). These are matrix-vector multiplications. For seq_len=32 and rank=24, they&#x27;re tiny.
+
+Another thing: in the reference PyTorch code, values (v) are computed individually for each s. In our reformulation, we avoid materializing v entirely by doing the einsum reordering. This is a significant algorithmic improvement.
+
+Let me double-check the math is correct.
+
+Original:
+- `k_s = latent_s @ w_up_k[:, h]` where `latent_s` is rank, `w_up_k[:, h]` is (rank, head_dim), so `k_s` is head_dim.
+- `logit_s = (q_t * k_s).sum() * scale`
+  = `sum_d q_t[d] * sum_r latent_s[r] * w_up_k[r, h, d] * scale`
+  = `scale * sum_r latent_s[r] * sum_d q_t[d] * w_up_k[r, h, d]`
+  
+Let `q_proj_k[r] = sum_d q_t[d] * w_up_k[r, h, d]`.
+Then `logit_s = scale * sum_r latent_s[r] * q_proj_k[r]`. ✓
+
+- `v_s = latent_s @ w_up_v[:, h]` where `v_s` is head_dim.
+- `out_t = sum_s attn_s * v_s`
+  = `sum_s attn_s * sum_r latent_s[r] * w_up_v[r, h, d]`
+  = `sum_r (sum_s attn_s * latent_s[r]) * w_up_v[r, h, d]`
+
+Let `attn_latent[r] = sum_s attn_s * latent_s[r]`.
+Then `out_t[d] = sum_r attn_latent[r] * w_up_v[r, h, d]`. ✓
+
+Great, the math is correct.
+
+Alright, let me write the kernel code. I need to be careful with:
+1. Correct CUDA syntax
+2. Correct bindings with torch.utils.cpp_extension.load_inline
+3. No PYBIND11_MODULE in cpp_sources
+4. Numerical accuracy
+
+For numerical accuracy, I should:
+- Use float32 throughout
+- Compute scale as `1.0f / sqrtf(head_dim)`
+- Use standard softmax (max subtraction for stability)
+
+One potential issue: the reference computes `torch.softmax` on a variable-length tensor for each t. My causal softmax computes over s=0..t. This should be mathematically identical.
+
+Wait, there could be numerical differences in the softmax. Let me make sure I implement stable softmax:
+1. Find max(logits[0..t])
+2. Compute exp(logit - max)
+3. Sum the exps
+4. Divide each exp by the sum
+
+Yes, this is what I have.
+
+Let me also check: the reference inner loop is `for s in range(t + 1)`, so s goes from 0 to t inclusive. That&#x27;s what I have.
+
+Now let me think about the `logits` and `attn` arrays. I reuse `logits` to store the exponentiated values, then normalize them. After that, `logits[s]` for s&gt;t is garbage, but I only read s&lt;=t. Good.
+
+Let me also consider precision: the reference uses PyTorch float32 operations. My kernel also uses float32. The order of operations might differ slightly. For example, in the dot products, the accumulation order differs. But with such small sizes and float32, the tolerance of 1e-4 should be met.
+
+One thing I can do to improve precision: use float for accumulators (already doing this). That&#x27;s good.
+
+Let me also think if I should use `__restrict__` for pointer arguments. Yes, that&#x27;s good for performance.
+
+For shared memory, I should declare it as `extern __shared__ float smem[];` and calculate the size when launching the kernel.
+
+Now, the kernel launch parameters:
+- grid: (num_heads, batch_size)
+- block: (seq_len) = 32
+- shared_mem: `(2 * rank * head_dim + seq_len * rank) * sizeof(float)` = (2*24*16 + 32*24) * 4 = (768 + 768) * 4 = 6144 bytes = 6KB
+
+Each block has 32 threads, grid has 8 blocks. Total threads = 256. Total shared memory = 48KB across all SMs, well under limits.
+
+Wait, only 8 blocks total? That means only 8 SMs will be used out of 132+ on H100. That&#x27;s terrible occupancy and utilization!
+
+Oh no, this is a critical issue. With batch=2, num_heads=4, we only have 8 blocks. H100 has many SMs (around 132). Most SMs will be idle. And each block has only 32 threads (one warp), so each SM can run at most 32 blocks (due to 32 blocks per SM limit). But we only have 8 blocks total.
+
+To improve occupancy, I need either:
+1. More blocks by having block handle fewer elements but launching more blocks
+2. More threads per block to saturate each SM better
+
+Since the total work is tiny (256 positions), maybe the kernel will still be fast enough. But for H100, with only 8 warps total, the kernel will be severely underutilized.
+
+Let me rethink. How can I get more parallelism?
+
+Idea: Process multiple (b, h) pairs per block. For example, each block handles 4 (b,h) pairs = 4 warps = 128 threads. Then total blocks = 2. Still bad.
+
+Idea: Each block handles one (b,h) but with more threads doing more work. For example, if I use 256 threads per block, I could have 8 warps per block, each warp handling 4 t values (since seq_len=32, 32/8=4). Total blocks = 8, total warps = 64. Still only 64 warps out of thousands possible.
+
+Actually, for such tiny problem sizes, it&#x27;s inherently hard to fully utilize H100. The total FLOPs and memory are tiny. What matters is latency, not throughput.
+
+But let me think about another approach: process multiple t values per thread. If each thread handles multiple t values, I could use fewer threads per block but still only have 8 blocks.
+
+Alternatively, what if I launch more blocks by assigning each block to a subset of the output? For instance, each block computes one (b,h,t) with multiple threads cooperating. If block = 128 threads and grid = 256 blocks... but each block does very little work and there&#x27;s overhead.
+
+Actually, maybe the best approach is to have each block compute a subset of outputs, but with enough blocks to saturate the GPU. For example:
+- Launch 256 blocks (one per output position)
+- Each block has 32 threads or more, all cooperating on one (b,h,t)
+
+With 256 blocks, we can utilize ~64 SMs (4 blocks per SM), which is decent.
+
+And within each block, all 32 threads work on the same (b,h,t). This means:
+- q load: all threads load q[b,t,h,d]. Only 16 threads are needed, but 32 can redundantly load or half can be idle.
+- Actually, let&#x27;s have 16 threads load q and compute, while the other 16 compute something else or are idle.
+
+Hmm, 50% utilization within a warp for q load and output write. Given that the compute dominates, this might be okay.
+
+Wait, actually, we can have all 32 threads participate. For q[b,t,h,d] with d=16, we can have thread 0..15 load one float each, and thread 16..31 also load the same (redundant) or load a second batch if there were one.
+
+For a single (b,h,t), we don&#x27;t have natural parallelism across 32 threads for q loading. But for the matvecs:
+- q_proj_k[r=0..23]: 24 dot products. We can assign r=0..23 to threads 0..23, and threads 24..31 compute nothing or help.
+  - Each thread computes one dot product of length 16.
+- logits[s=0..t]: t+1 dot products. We can compute all s=0..31 dot products in parallel, assigning 1 s per thread. But t varies! If a block handles one specific t, then we only need s=0..t.
+
+Wait, if each block handles one specific (b,h,t), then:
+- q load: 16 threads load q, 16 are idle. 50% utilization.
+- q_proj_k: 24 threads compute one r each, 8 are idle. 75% utilization.
+- logits: need to compute s=0..t. If t=31, need 32 dot products. We have 32 threads, each computes one s. 100% utilization!
+- softmax: can be parallelized across threads. Finding max: each thread compares its assigned elements. With 32 elements and 32 threads, each thread does 1 comparison in the first step of a reduction? Actually, warp-level reduce for max. Then each thread computes exp of its element(s). Then warp-level sum reduction.
+- attn_latent: need 24 accumulations. 24 threads can each compute one r, but each needs a weighted sum over s=0..t. If t=31, each thread does 32 mult-adds. 75% utilization.
+- output: need 16 values. 16 threads compute, 16 idle. 50% utilization.
+
+This cooperative approach within a block could be quite efficient for large t. For small t, some steps have lower utilization.
+
+But with 256 blocks, we get much better GPU utilization.
+
+Let me design this cooperative kernel more carefully.
+
+Block: 32 threads = 1 warp
+Grid: (seq_len, num_heads, batch_size) = (32, 4, 2) = 256 blocks
+
+Wait, CUDA grid can only have 3 dimensions. So grid = (32, 4, 2) works perfectly.
+
+For block (t, h, b):
+- t = blockIdx.x
+- h = blockIdx.y
+- b = blockIdx.z
+
+Hmm, but then blocks with different t values for the same (b,h) will all load the same w_up_k and w_up_v and kv_latent. There&#x27;s no shared memory sharing between blocks. But the L2 cache can share kv_latent across blocks for the same b.
+
+Actually, if blocks are all independent, w_up_k and w_up_v are read 256 times each (once per block). That&#x27;s redundant. w_up_k for h is read by 64 blocks (batch*seq_len = 64). Total w_up_k reads: 64 * rank * head_dim = 64*384 = 24,576 floats. Similarly for w_up_v. That&#x27;s 192KB for w_up_k and v together.
+
+kv_latent for (b,s) is read by seq_len * num_heads = 128 blocks (all t and h for a given b and s). Total kv_latent reads: 128 * 2 * 32 * 24 = 196,608 floats ≈ 786KB. Wait, that&#x27;s per position? No: each (b,s) is read by all t that need s&lt;=t, which is seq_len values of t, and all num_heads values of h. So each (b,s,r) is read seq_len * num_heads = 128 times. Total kv_latent traffic: batch * seq_len * rank * 128 = 2*32*24*128 = 196,608 reads? No wait, each of the 256 blocks reads about (t+1)*rank elements of kv_latent on average (t+1) ≈ 16.5. So total reads = 256 * 16.5 * 24 = 101,376 floats. Same as before.
+
+But with 256 blocks, total q reads = 256 * 16 = 4096 floats (16KB).
+Total out writes = 4096 floats.
+
+Total memory traffic is similar but distributed across 256 blocks instead of 8. This means many more SMs can work in parallel, reducing latency.
+
+Will this be faster? Probably yes, because GPU throughput is higher with more blocks.
+
+Wait, but 256 blocks with 32 threads each = 8192 threads. That&#x27;s a small number for H100 but much better than 256 threads.
+
+Let me compute occupancy. Each block uses:
+- 32 threads = 1 warp
+- Registers: maybe ~64 per thread = 2048 per block = well under SM limits
+- Shared memory: we can use 0 shared memory if we read w_up_k, w_up_v, kv_latent from global memory directly.
+
+If we don&#x27;t use shared memory:
+- w_up_k and w_up_v can be cached in L1/L2
+- kv_latent is also cached
+
+With 64 blocks per SM (32 warps per SM, 1 warp per block = 32 blocks max), we&#x27;re limited to 32 blocks per SM due to the 32 block limit. Total SMs used = ceil(256/32) = 8 SMs. Still only 8 SMs!
+
+Oh right, because each block has only 1 warp, and max blocks per SM is 32, so 256 blocks can only occupy 8 SMs. That&#x27;s still bad. To use more SMs, we&#x27;d need more blocks or more warps per block.
+
+What if each block has 2 warps (64 threads)? Then max blocks per SM = 32 still, but each block has 2 warps, so 64 warps per SM. Total warps = 256 * 2 = 512. SMs used = 512 / 32 = 16 SMs. Better.
+
+What if each block has 4 warps (128 threads)? Total warps = 1024. SMs used ≈ 32.
+
+What if each block has 8 warps (256 threads)? Total warps = 2048. SMs used ≈ 64.
+
+But how do we usefully employ 256 threads for one (b,h,t)? That&#x27;s a lot of parallelism for a small computation.
+
+Alternative: Keep block size small but launch more blocks. Instead of 256 blocks (one per output), launch 2048 blocks or more by tiling/batching. For example, process multiple output positions per block? No, that reduces block count.
+
+Actually, I just realized: the key limitation is that each block only has 1 warp, so max 32 blocks per SM means max 32 warps per SM. To saturate an SM at max occupancy, we want 16 or more warps per SM. If each block has 1 warp, max is 32 blocks = 32 warps per SM, which is actually good occupancy! The issue is that we only have 256 total blocks, so we can only fill 8 SMs.
+
+If we had 1024 blocks (e.g., by having each block process 1/4 of an output or by launching more blocks somehow), we could fill 32 SMs.
+
+But for such a small workload, does it matter? The total work is tiny. What probably matters is single-block latency. With 256 blocks running on 8 SMs, each SM processes 32 blocks sequentially. If each block takes 1 microsecond, each SM takes 32 microseconds. But all 8 SMs run in parallel, so total time is 32 microseconds. 
+
+With 8 blocks (one per (b,h)) each on a separate SM, and each block does 32 positions sequentially, if each position takes 1 microsecond, each block takes 32 microseconds. Total time is also 32 microseconds. Same total time!
+
+Actually, the sequential processing in a block might have less overhead than launching separate blocks. Hmm.
+
+But with 8 blocks, each with 1 warp on a separate SM, the SM is underutilized (only 1 warp out of 32+ capacity). This doesn&#x27;t matter because we only have 8 warps total. The latency of a single warp&#x27;s execution is roughly the same whether it&#x27;s alone on an SM or shared with others.
+
+For tiny kernels, what dominates is:
+1. Kernel launch overhead
+2. Memory latency
+3. Instruction latency
+
+With 256 blocks, kernel launch overhead is higher than with 8 blocks.
+With 8 blocks, fewer total warps means less parallelism for hiding memory latency.
+
+I think for this size, 8 blocks of 32 threads with shared memory might actually be comparable to 256 blocks of 32 threads without shared memory.
+
+Let me try both approaches. Actually, I&#x27;ll start with the 8-block approach with shared memory, because it has fewer redundant memory reads and should have better cache behavior. If that doesn&#x27;t work, I&#x27;ll try the 256-block approach.
+
+Actually, let me reconsider. If 256 blocks with 32 threads each gives 256 warps, but they can only run on 8 SMs due to the 32-block-per-SM limit, that&#x27;s still 32 warps per SM, which is decent occupancy. But the SM can hold more warps (up to 64 on Hopper I think). So 32 warps per SM is 50% occupancy. Not bad.
+
+For the 8 blocks with 32 threads approach, we have only 1 warp per SM, which is terrible occupancy. But again, with such small data, the kernel might be done before any context switching anyway.
+
+I think I&#x27;ll go with the approach that has the best per-thread performance and least redundant memory access. That&#x27;s probably the shared-memory, one-block-per-(b,h) approach.
+
+Actually, wait. On H100, the maximum number of thread blocks per SM is 32, but the maximum number of warps per SM is 64 (for compute capability 9.0). So:
+- 1 warp per block → 32 blocks → 32 warps per SM (50% occupancy)
+- 2 warps per block → 32 blocks → 64 warps per SM (100% occupancy)
+
+Ah! So if I use 2 warps (64 threads) per block, I can get 32*2 = 64 warps per SM, which is max occupancy. But can I usefully employ 64 threads for a single (b,h)? 
+
+For one (b,h), we process t=0..31. With 64 threads:
+- We could have 32 threads process one (b,h,t) and the other 32 process another (b,h,t). But different t values in the same warp cause divergence.
+- Or we could have 2 warps process different t ranges. Warp 0: t=0..15, Warp 1: t=16..31. Within each warp, there&#x27;s still divergence but the range is smaller.
+
+Actually, if block handles one (b,h) and warps handle different t ranges:
+- Warp 0: t=0..15 (16 threads active if 1 thread per t, but a warp has 32 threads, so 2 threads per t)
+- Warp 1: t=16..31
+
+If 2 threads per t, they cooperate on computations. This seems complicated.
+
+Let me just use the 256-block approach with no shared memory. Each block is 1 warp = 32 threads, but I can make it so the 32 threads cooperate very nicely on one (b,h,t) with minimal divergence for large t.
+
+For a fixed (b,h,t) block:
+- 32 threads load q[b,t,h,0..15] (16 threads load, 16 idle) - but actually only the first 16 threads load q.
+- Compute q_proj_k[r=0..23]: assign r=0..23 to threads 0..23. Each thread computes dot(q, w_up_k[r]) = 16 mult-adds. Threads 24..31 idle.
+- Compute logits[s=0..t]: if t&gt;=31, assign s=0..31 to threads 0..31, each computes one dot product of length 24. Perfect! For smaller t, some threads idle.
+- Softmax: use warp-level primitives for max reduction, sum reduction.
+- Compute attn_latent[r=0..23]: assign r=0..23 to threads 0..23. Each computes weighted sum over s=0..t. For large t, each does ~t+1 mult-adds.
+- Compute out[d=0..15]: assign d=0..15 to threads 0..15. Each computes dot(attn_latent, w_up_v[:,d]) = 24 mult-adds. Threads 16..31 idle.
+- Write out: 16 threads write, 16 idle.
+
+With this approach, for large t, utilization in the logits computation is 100% (if t+1 &gt;= 32). For small t, it&#x27;s lower. But large t is where the most work is.
+
+However, there&#x27;s divergence in the loop `for (s=0; s&lt;=t; s++)` in the attn_latent computation. With each thread computing one r, and each thread&#x27;s loop bound depending on t... But wait! t is the same for all threads in a block! Because each block handles one specific t.
+
+Ah, this is crucial! In the 256-block approach, all threads in a block have the same t. So there&#x27;s no divergence for the `s&lt;=t` condition. All threads in the block iterate the same number of times.
+
+This is much better than the 8-block approach where different threads in a warp had different t values.
+
+So with 256 blocks:
+- Block (b,h,t): all 32 threads have the same t
+- Compute logits for s=0..t: we only need t+1 values. If t+1 &lt; 32, only t+1 threads are active. Some idle.
+- Softmax: over t+1 values. Can use warp-level reduce if t+1 &lt;= 32.
+- Attn_latent: each of 24 threads does a loop s=0..t. All 24 threads do exactly the same number of iterations. No divergence!
+
+This is much cleaner!
+
+Let me design the cooperative 32-thread block for one (b,h,t):
+
+```cuda
+__global__ void fused_mla_kernel(
+    const float* q, const float* kv_latent,
+    const float* w_up_k, const float* w_up_v,
+    float* out,
+    int B, int S, int H, int D, int R
+) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    
+    if (t &gt;= S || h &gt;= H || b &gt;= B) return;
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x; // 32
+    
+    // Load q[b,t,h,d] to shared memory or registers
+    // Since D=16, we can have first 16 threads load q and broadcast
+    float q_local = 0.0f;
+    if (tid &lt; D) {
+        q_local = q[((b * S + t) * H + h) * D + tid];
+    }
+    
+    // Compute q_proj_k[r] = sum_d q[d] * w_up_k[r,h,d]
+    // We need q[d] for all d. We can use warp shuffle to share.
+    // Or, since D=16 and we have 32 threads, first compute in shared mem.
+    
+    // Actually, let me use a simpler approach: have each thread compute a subset of r
+    // Each thread loads the q values it needs via shuffle.
+}
+```
+
+Hmm, with warp shuffle, it gets complicated. Let me think of a simpler cooperative approach.
+
+Actually, for such small sizes, maybe I don&#x27;t need full cooperation. What if each block has exactly t+1 threads (but block size must be a multiple of 32)? Or what if each block has 32 threads but they process multiple outputs?
+
+Wait, what if I use block size = 32 but each thread independently computes the full output for one (b,h,t)? Then I can launch 8 blocks with 32 threads each, where each block handles one (b,h) and each thread handles one t. Total threads = 256. This is the simplest approach and avoids complex cooperation.
+
+The divergence issue is real but maybe not severe for this small size. Let me try it.
+
+Actually, I just had another idea. What if I process t in a way that groups similar t values in different warps? In the one-block-per-(b,h) approach with 32 threads (one warp), the warp has t=0..31. If I instead use 2 warps per block (64 threads), where:
+- Warp 0: threads 0..31 handle t=0..31
+- Warp 1: also handles t=0..31 but maybe computes something else?
+
+No, that doesn&#x27;t help with divergence.
+
+What about: Interleave t values across threads so that each warp handles a subset? No, the divergence is the same per warp.
+
+What if I process t in reverse? Warp 0 handles t=31..0? Still same issue.
+
+I think I should just accept the divergence and test.
+
+Wait, here&#x27;s a mathematical insight that might help eliminate divergence entirely!
+
+The causal attention means:
+- `logits[s]` for s=0..t
+- `attn[s]` for s=0..t
+- `out = sum_{s=0}^t attn[s] * v_s`
+
+What if I precompute the full non-causal logits for all s=0..31 and then mask?
+`full_logits[s] = dot(kv_latent[s], q_proj_k) * scale` for all s=0..31
+Then `logits[s] = full_logits[s]` for s&lt;=t, and `-inf` for s&gt;t.
+`attn = softmax(logits_masked)` where masked positions are -inf.
+`out = sum_{s=0}^{31} attn[s] * v_s` (but attn[s] = 0 for s&gt;t due to softmax)
+
+Wait, is this correct? If I set logits to -inf for s&gt;t, then softmax gives 0 for s&gt;t. So yes! The output is the same.
+
+This means I can compute all 32 logits without divergence! All threads compute the same thing.
+
+Then for softmax: I need to compute softmax over a vector where some elements are -inf. The max is just the max over s=0..t. But if I compute the max over all s=0..31, positions s&gt;t would be -inf and wouldn&#x27;t affect the max. So I can compute max over all 32 positions without divergence!
+
+Similarly for sum of exps: `sum_{s=0}^t exp(logits[s] - max) + sum_{s=t+1}^{31} exp(-inf) = sum_{s=0}^t exp(...)`. But if I compute over all s, the terms for s&gt;t contribute 0 (since exp(-inf) = 0).
+
+Wait, but `expf(-1e20f)` underflows to 0 in float32. That&#x27;s fine.
+
+So I can implement:
+1. Compute full_logits[s] for s=0..31 (all threads do the same 32 iterations)
+2. Set full_logits[s] = -1e20f for s &gt; t ... wait, this depends on t, which is different per thread! 
+
+Oh no, t is different per thread in the one-warp-per-(b,h) approach. So setting the mask still causes divergence.
+
+But in the 256-block approach, t is the same for all threads in a block! So I CAN do this without divergence!
+
+```cuda
+for (int s = 0; s &lt; S; s++) {
+    float logit = (compute dot product);
+    if (s &gt; t) logit = -1e20f; // All threads have same t, no divergence!
+    logits[s] = logit;
+}
+```
+
+This is beautiful. With one block per (b,h,t), all threads agree on t, so `s &gt; t` is the same for all threads. No divergence!
+
+Then softmax over all S elements:
+- max over all s: all threads participate, or a subset. Let threads 0..S-1 each handle one s and use warp reduce.
+- sum exp: same.
+- normalize: each thread normalizes its assigned s.
+
+And for the output computation:
+`attn_latent[r] = sum_s attn[s] * kv_latent[s, r]`
+For s &gt; t, attn[s] = 0, so those terms don&#x27;t contribute. But we can compute the full sum over all s without divergence because we&#x27;re just summing zeros for s &gt; t.
+
+`out[d] = sum_r attn_latent[r] * w_up_v[r, d]`
+
+All operations are now divergence-free!
+
+This is the way to go. One block per (b,h,t) = 256 blocks, each with 32 threads.
+
+Now let me design the full cooperative kernel for one (b,h,t):
+
+**Data loading:**
+- q[b,t,h,:] (D=16 floats): need all threads to load. We can have thread s load q[s] for s=0..15, and threads 16..31 load nothing or redundantly load.
+- kv_latent[b,:,:] (S*R=768 floats): each thread can load a subset, or we can load on demand in loops.
+  - For the logits computation, we need kv_latent[s,r] for all s,r. Since we loop over s and compute dot with q_proj_k for each s, each thread can compute one s.
+  - If t is small, we still compute all s but with s&gt;t masked to -inf. So we need all S=32 kv_latent vectors.
+- w_up_k[h,:,:] (R*D=384 floats): needed for q_proj_k. Each thread can load a portion.
+- w_up_v[h,:,:] (R*D=384 floats): needed for output. Each thread can load a portion.
+
+Since w_up_k and w_up_v for the same h are used across 64 blocks (2 batch * 32 seq), we might benefit from L2 cache but not shared memory.
+
+Hmm, with 256 blocks each reading w_up_k and w_up_v, we get redundant memory traffic. Let me calculate:
+- w_up_k per h: 24*16=384 floats
+- Read by 64 blocks: 64*384 = 24,576 floats = 98KB per h
+- 4 heads: 392KB total for w_up_k
+- Same for w_up_v: 392KB
+- Total: 784KB
+
+With 8 blocks (one per (b,h)), each reads w_up_k and w_up_v once: 8 * 384 * 2 = 6,144 floats = 24KB total.
+
+784KB vs 24KB is a 33x difference! That&#x27;s significant.
+
+And for kv_latent per b: 32*24=768 floats.
+- In 256-block approach: each (b,s) is read by 32*4=128 blocks. Total reads: 128*768*2 = 196,608 floats = 786KB.
+- In 8-block approach: read once per b: 2*768 = 1,536 floats = 6KB. 
+
+And q: 256 blocks * 16 floats = 4,096 floats = 16KB.
+- In 8-block approach: same, 16KB.
+
+So the 256-block approach has about 1.6MB memory traffic vs 50KB for the 8-block approach with shared memory. That&#x27;s a 32x difference!
+
+For a memory-bound workload, the 8-block approach should be much faster, even though it has warp divergence. The divergence only affects compute, and if we&#x27;re memory-bound, the redundant reads matter more.
+
+Wait, for the 8-block approach with shared memory:
+- Block loads w_up_k, w_up_v, kv_latent once and shares among all threads.
+- Each thread reads q and writes out.
+- No redundant reads of w_up_k, w_up_v, kv_latent.
+- Total global memory: q (16KB) + kv_latent (6KB, but actually each position is read once into shared mem) + w_up_k (24KB) + w_up_v (24KB) + out (16KB) = 86KB.
+
+For the 256-block approach:
+- Each block reads q (16*4=64B), kv_latent (32*24*4=3KB), w_up_k (384*4=1.5KB), w_up_v (1.5KB), and writes out (64B).
+- Per block: ~6.2KB
+- 256 blocks: ~1.6MB
+
+86KB vs 1.6MB is a huge difference. At 3.35 TB/s, 86KB is 26 nanoseconds, while 1.6MB is 477 nanoseconds. Even with cache effects (the 256-block approach will hit L2 cache for w_up_k and w_up_v since multiple blocks read the same data), the L2 cache hit rate won&#x27;t be perfect.
+
+Actually, for the 256-block approach, if the 64 blocks for the same h are scheduled closely in time, w_up_k and w_up_v will be in L2 cache. L2 bandwidth is much higher than DRAM bandwidth but still finite. And there will be some redundant L2 traffic.
+
+For kv_latent, blocks for the same b but different t and h will read the same kv_latent. Since there are 128 blocks per (b,s), the L2 cache should capture this well.
+
+Let me recompute L2 traffic estimates:
+- q: 16KB (each element read once)
+- out: 16KB (each element written once)
+- kv_latent: each (b,s) read by 128 blocks. With 2*32=64 distinct (b,s) positions, total accesses = 64*128=8192 times. But L2 can cache 64 positions. Total L2 read traffic for kv_latent ≈ 64 * 768 * 4B = 196KB (assuming perfect spatial/temporal locality? No, each position is 768*4=3KB. With 64 positions at 3KB each = 192KB. Actually, if all 128 blocks for one (b,s) hit L2, then L2 reads 3KB per (b,s), and there are 64 (b,s). So 192KB of L2 traffic.)
+  
+Hmm wait, that&#x27;s if the first block brings it to L2 and all subsequent blocks hit. In practice, with 256 concurrent blocks and limited L2, there might be some eviction.
+
+- w_up_k per h: 1.5KB, read by 64 blocks. L2 traffic: 1.5KB * 4 heads = 6KB.
+- w_up_v per h: same, 6KB.
+
+Total L2 traffic ≈ 16 + 16 + 192 + 6 + 6 = 236KB. Still more than the 86KB of the shared-memory approach, but much less than 1.6MB.
+
+L2 bandwidth on H100 is around 10-20 TB/s, so 236KB is ~12-24 nanoseconds.
+
+For the shared memory approach with 8 blocks:
+- Each block has 32 threads but the warp has divergent execution.
+- Compute: 38K mult-adds per block at maybe 50% utilization due to divergence.
+- Memory: L2 traffic ~86KB.
+
+For the 256-block approach:
+- Compute: total mult-adds is the same (~304K), but better utilization due to no divergence.
+- Memory: L2 traffic ~236KB.
+
+If compute utilization is the bottleneck in the 8-block approach, the 256-block approach might be faster despite more memory traffic. But with ~38K mult-adds per block taking maybe 1-2 microseconds at 50% utilization, and memory taking ~0.1 microseconds, the compute dominates. So reducing divergence might matter more than reducing memory traffic!
+
+Wait, 38K mult-adds = 76K FLOPs. At 67 TFLOPS, pure compute time is 1.13 microseconds. At 50% utilization due to divergence, 2.26 microseconds. Memory at 0.1 microseconds. Total maybe 2.5 microseconds.
+
+For 256 blocks, each does 1/32 the work of an 8-block (because each handles one t instead of 32 t values). Wait no: in the 256-block approach, each block handles one (b,h,t). Work per block:
+- q_proj_k: 24*16 = 384 mult-adds
+- logits: 32*24 = 768 mult-adds (for all 32 s, masked)
+- softmax: negligible
+- attn_latent: 32*24 = 768 mult-adds
+- out: 16*24 = 384 mult-adds
+Total: ~2304 mult-adds = 4608 FLOPs. At 67 TFLOPS, 69 nanoseconds.
+
+Times 256 blocks, if perfectly parallel: 69 nanoseconds. But parallelization is limited by 8 SMs * 32 blocks/SM = 256 blocks capacity. If each SM processes 32 blocks sequentially: 32 * 69ns = 2.2 microseconds. Plus synchronization overhead.
+
+Hmm, the total time is actually similar! The 8-block approach has larger blocks but fewer of them, while the 256-block approach has smaller blocks but more of them.
+
+Actually, I realize both approaches do the exact same total compute. The difference is:
+- 8 blocks: each block does 32 t values with divergence, 32 threads per block.
+- 256 blocks: each block does 1 t value without divergence, 32 threads per block.
+
+With 256 blocks, we can run 32 blocks per SM (the max), but each block needs 32 threads. So we get 32 warps per SM. With 8 blocks, we get 1 warp per SM.
+
+Since each warp in the 256-block approach does 1/32 the compute of a warp in the 8-block approach, and we have 32x more warps per SM, the compute time per SM is the same.
+
+But the 256-block approach has more overhead: more kernel launches (not really, it&#x27;s one kernel), but more block scheduling overhead. Each block setup/teardown has some fixed cost. So 32 blocks per SM vs 1 block per SM means ~32x more block overhead.
+
+Also, the 256-block approach has ~3x more memory traffic (236KB vs 86KB).
+
+So the 8-block approach with shared memory will likely be faster!
+
+Let me go with the 8-block approach with shared memory. The key design decision:
+- 8 blocks (one per (b,h)), 32 threads each
+- Shared memory for w_up_k, w_up_v, kv_latent
+- Each thread handles one t
+- Some divergence due to varying t
+
+To reduce divergence overhead, I can restructure the inner loops. Let me think about processing the causal operations more efficiently.
+
+For step 2 (logits), I suggested computing ALL s first without divergence:
+```cuda
+#pragma unroll
+for (int s = 0; s &lt; S; s++) {
+    float dot = 0.0f;
+    #pragma unroll
+    for (int r = 0; r &lt; R; r++) {
+        dot += kv_latent_smem[s * R + r] * q_proj_k[r];
+    }
+    logits[s] = (s &lt;= t) ? dot * scale : -1e20f;
+}
+```
+
+Wait, `s &lt;= t` depends on t which varies per thread! This causes divergence. But it&#x27;s just a conditional assignment. The inner loop (dot product) executes for all s, which is divergence-free. The conditional at the end is a simple select.
+
+Actually, we can restructure to avoid even that conditional. What if we compute the logits in shared memory cooperatively?
+
+No, since each thread has a different q_proj_k, they can&#x27;t easily share.
+
+OK, let me just implement the simple version and see how it performs. If the profile shows high divergence overhead, I can optimize.
+
+Wait, one more thing. For the dot product accumulation, I should be careful about unrolling. For loops with constant bounds and small iteration counts, the compiler auto-unrolls them very well. I can help by adding `#pragma unroll`.
+
+Also, for the softmax, there&#x27;s a neat trick to do it in fewer passes. But for 32 elements, 3 passes is fine.
+
+Let me also think about whether to store logits in registers or shared memory. Since each thread handles one t and needs its own logits[32], storing in registers is natural. 32 floats = 128 bytes per thread. With 32 threads, that&#x27;s fine.
+
+But I need to be careful: `float logits[32];` inside a CUDA kernel where `32` is a literal constant. The compiler will place this in registers.
+
+Similarly for `q_proj_k[24]` and `attn_latent[24]`.
+
+Actually, one optimization: I don&#x27;t need to store all logits. For the first pass (max), I can just track the running max. For the second pass (exp and sum), I can compute exp and accumulate the sum, storing exp values in a local array or recomputing them later. But since we need the exp values for the weighted sum, we should store them.
+
+Wait, we need `attn[s]` for the weighted sum of kv_latent. So yes, we need to store them or recompute. Recomputing would require storing q_proj_k and redoing the dot products, which is more expensive than storing 32 floats.
+
+So storing `attn[32]` in registers is the right approach.
+
+For q_proj_k[24], we need it for the logits computation and it&#x27;s also the &quot;projection&quot; for the attention. We definitely need to store it.
+
+For attn_latent[24], we need it for the final output computation.
+
+So total register arrays: q_local[16] + q_proj_k[24] + logits/attn[32] + attn_latent[24] + out_local[16] = 112 floats. The compiler can probably compress some of these (e.g., q_local is only used to compute q_proj_k, so they can share registers temporally).
+
+Let me write the kernel and Python wrapper.
+
+One more consideration: should I read kv_latent into shared memory? With 32 threads, a block can load 32*4=128 bytes per instruction if coalesced. kv_latent has shape (32, 24). Loading row by row: each row is 24*4=96 bytes. If thread i loads kv_latent[i], they&#x27;re accessing strided memory. If thread i loads kv_latent[0, i] (column i), it&#x27;s strided by row length = 96 bytes. Not great coalescing either.
+
+To load kv_latent coalesced to shared memory, thread i should load element at offset i in the flattened array. Since kv_latent is stored as [seq, rank] in row-major, consecutive threads loading consecutive elements get coalesced access.
+
+```cuda
+for (int i = threadIdx.x; i &lt; seq_len * rank; i += blockDim.x) {
+    kv_latent_smem[i] = kv_latent[b * seq_len * rank + i];
+}
+```
+
+This is coalesced! Thread 0 loads element 0, thread 1 loads element 1, etc. Each warp loads a contiguous chunk of 128 bytes (32 floats), perfectly coalesced.
+
+Similarly for w_up_k and w_up_v:
+```cuda
+for (int i = threadIdx.x; i &lt; rank * head_dim; i += blockDim.x) {
+    w_up_k_smem[i] = w_up_k[h * rank * head_dim + i];
+}
+```
+
+Also coalesced, since w_up_k is stored as [num_heads, rank, head_dim] or [rank, num_heads, head_dim]? In PyTorch, `w_up_k` is `torch.randn(rank, num_heads, head_dim)`. So it is stored as [rank, num_heads, head_dim] in row-major? Actually, in PyTorch, `w_up_k[:, h]` gives a view with stride `(num_heads * head_dim, head_dim, 1)`. So `w_up_k[r, h, d]` is accessed at offset `r * num_heads * head_dim + h * head_dim + d`.
+
+For fixed h, `w_up_k[:, h, :]` has elements at offsets `r * num_heads * head_dim + h * head_dim + d` for r=0..rank-1, d=0..head_dim-1. This is essentially a matrix with stride `num_heads * head_dim` between rows (different r) and stride 1 between columns (different d).
+
+When we load `w_up_k_smem[i]` where `i = r * head_dim + d`, the global offset is `r * num_heads * head_dim + h * head_dim + d = r * (4*16) + h * 16 + d = r * 64 + h * 16 + d.` In the flattened `i` order, consecutive `i` values correspond to consecutive `d` (for fixed `r`), and then `r` increments when `d` wraps. The global memory access pattern for consecutive `i` is:
+- i=0: offset = h*16 + 0
+- i=1: offset = h*16 + 1
+- ...
+- i=15: offset = h*16 + 15
+- i=16: offset = 64 + h*16 + 0
+
+So for i=0..15, we access a contiguous block of 16 floats (64 bytes). For i=16..31, another contiguous block 64 bytes away. This is not fully coalesced if multiple threads load different i values in the same warp. 
+
+Wait, if thread 0 loads i=0, thread 1 loads i=1, etc., then threads 0..15 load a contiguous 64-byte region, which is 1-2 cache lines. Perfect coalescing! Threads 16..31 load another contiguous 64-byte region, also perfect. Great!
+
+Similarly for `w_up_v`.
+
+And for `kv_latent`:
+```cuda
+for (int i = threadIdx.x; i &lt; seq_len * rank; i += blockDim.x) {
+    kv_latent_smem[i] = kv_latent[b * seq_len * rank + i];
+}
+```
+
+Since kv_latent[b] is a contiguous block of `seq_len * rank` floats, this is perfectly coalesced.
+
+For q loading:
+```cuda
+for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {
+    q_local[d] = q[(((b * seq_len + t) * num_heads + h) * head_dim + d)];
+}
+```
+
+With threadIdx.x = 0..31 and head_dim = 16:
+- Thread 0 loads d=0
+- Thread 1 loads d=1
+- ...
+- Thread 15 loads d=15
+- Thread 16: d=16 &gt;= head_dim, skips
+
+Threads 0..15 access consecutive elements. Threads 16..31 are inactive. The active threads load a contiguous 64-byte block. Perfect coalescing for the active threads!
+
+Wait, but threads 16..31 are in the same warp as threads 0..15, and they&#x27;re inactive (masked off). The warp executes the load with 16 active threads, which is still coalesced. The hardware might optimize this further.
+
+For out writing:
+```cuda
+for (int d = threadIdx.x; d &lt; head_dim; d += blockDim.x) {
+    out[(((b * seq_len + t) * num_heads + h) * head_dim + d)] = out_local[d];
+}
+```
+
+Same pattern, perfectly coalesced.
+
+Great! Shared memory loading is well coalesced. Now, within the kernel, shared memory accesses are much faster and don&#x27;t have coalescing issues in the same way.
+
+Alright, I think this kernel design is solid. Let me now implement it.
+
+But wait, there&#x27;s one more issue. The 8 blocks might not be optimal for occupancy. With H100 having many SMs, but only 8 blocks, we&#x27;re only using 8 SMs. Each SM has only 1 warp active (out of 64 possible). This is very low occupancy.
+
+Will low occupancy hurt performance? For a kernel that&#x27;s memory-bound with small data, the latency might be hidden by the cache. But if memory accesses have long latency, having only 1 warp per SM means no latency hiding through context switching. However, H100 has very fast L1/L2 caches, and our working set is tiny.
+
+Actually, for such small kernels, the execution time might be dominated by:
+1. Kernel launch latency (~1-5 microseconds)
+2. Thread execution latency
+3. A few memory accesses
+
+With 8 SMs each executing 32 time steps sequentially, the total compute is 8 blocks * 32 steps = 256 thread-tasks. If each thread-task takes, say, 50 nanoseconds, total is 12.8 microseconds per SM. In parallel across 8 SMs: 12.8 microseconds. Plus kernel launch: maybe 5 microseconds. Total: ~18 microseconds.
+
+Reference Python version: probably 100+ milliseconds. So we&#x27;ll beat it easily.
+
+But wait, if there&#x27;s a vectorized PyTorch reference, how fast would that be? Let me estimate.
+
+A vectorized PyTorch implementation:
+1. `q_proj_k = torch.einsum(&#x27;bthd,rhd-&gt;bthr&#x27;, q, w_up_k)`
+   - q is [2,32,4,16], w_up_k is [24,4,16]
+   - This is essentially batch matmul. PyTorch would call a BLAS kernel.
+   - Output: [2,32,4,24], 2*32*4*24*16 = 98,304 mult-adds. Very small. BLAS overhead dominates, probably ~50-100 microseconds.
+
+2. `logits = torch.einsum(&#x27;bsr,bthr-&gt;bhts&#x27;, kv_latent, q_proj_k) * scale`
+   - kv_latent [2,32,24], q_proj_k [2,32,4,24]
+   - Output: [2,4,32,32]
+   - 2*4*32*32*24 = 196,608 mult-adds.
+   - Again, small BLAS call, ~50-100 microseconds.
+
+3. `attn = torch.softmax(logits, dim=-1)` with causal masking
+   - Element-wise ops on [2,4,32,32] = 8192 elements. ~10 microseconds.
+
+4. `attn_latent = torch.einsum(&#x27;bhts,bsr-&gt;bthr&#x27;, attn, kv_latent)`
+   - 2*4*32*32*24 = 196,608 mult-adds. ~50-100 microseconds.
+
+5. `out = torch.einsum(&#x27;bthr,rhd-&gt;bthd&#x27;, attn_latent, w_up_v)`
+   - 2*32*4*16*24 = 98,304 mult-adds. ~50-100 microseconds.
+
+Total PyTorch time: ~250-500 microseconds, dominated by kernel launch overhead for tiny BLAS calls.
+
+Our fused kernel doing everything in one launch would avoid all the intermediate kernel launches and memory traffic. We should be 10-50x faster.
+
+So the 8-block shared memory kernel will likely be around 10-50 microseconds, vs 250-500 microseconds for vectorized PyTorch. That&#x27;s a 5-50x speedup.
+
+Alright, let me write the code now.
+
+Actually, I realize I should check if there&#x27;s a way to use more blocks while still sharing data via shared memory. What if I process multiple h values in one block? Or multiple b values?
+
+For example, if each block processes 4 (b,h) pairs (e.g., b=0..1 and h=0..1), then we have 2 blocks total. That&#x27;s worse.
+
+If each block processes 1 (b,h) but we use 2 blocks per (b,h) by splitting the t dimension? But t is only 32, splitting it into 2 blocks of 16 t values each gives 16 blocks. Then each block handles 16 t values. With 16 threads per block? No, block size should be at least a warp (32).
+
+What if block handles 1 (b,h), but has 256 threads, and each thread handles 1 t? Then block is 256 threads (8 warps), and grid is 8 blocks. Each SM can run fewer blocks due to thread limits, but more warps per block.
+
+With 256 threads per block and 8 blocks: total threads = 2048. Each SM can run up to 1536 or 2048 threads (depending on architecture). On Hopper, max threads per SM is 1536. So we could fit 1 block per SM (256 threads), using 8 SMs. Still only 8 SMs.
+
+Or if max threads per SM is 2048 and we use 256 threads per block, we could fit up to 8 blocks per SM, but we only have 8 blocks total. So still 1 block per SM on average.
+
+What if we have 256 threads per block but process 8 (b,h) pairs? Then grid is 1 block. Only 1 SM used. Bad.
+
+What if we launch more blocks by having empty blocks that immediately return? That doesn&#x27;t help.
+
+I think 8 SMs is the natural parallelism for this problem, given the small batch and head count. To use more SMs, we&#x27;d need to parallelize the inner computation across more blocks. But the t positions within a (b,h) are independent, so we could use 256 blocks (one per t) and avoid shared memory for w_up_k by having each block redundantly load it.
+
+Wait, actually, what if we use the L1 cache instead of shared memory? On H100, L1 cache is 128KB per SM. w_up_k for one h is 1.5KB. If all 32 blocks for one h run on the same SM consecutively, w_up_k might stay in L1. But if they run on different SMs, each SM loads it separately.
+
+I think the shared memory approach is still best.
+
+Alright, let me now write the actual code. I need to be careful with the exact kernel syntax and Python binding.
+
+Here&#x27;s my plan for the Python file:
+
+```python
+import torch
+import torch.nn as nn
+import torch.utils.cpp_extension
+
+cuda_source = &#x27;&#x27;&#x27;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void fused_mla_attention_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ kv_latent,
+    const float* __restrict__ w_up_k,
+    const float* __restrict__ w_up_v,
+    float* __restrict__ out,
+    int batch_size, int seq_len, int num_heads, int head_dim, int rank
+) {
+    int b = blockIdx.y;
+    int h = blockIdx.x;
+    int t = threadIdx.x;
+    
+    if (b &gt;= batch_size || h &gt;= num_heads || t &gt;= seq_len) return;
+    
+    extern __shared__ float smem[];
+    float* w_up_k_smem = smem;
+    float* w_up_v_smem = smem + num_heads * head_dim * rank; // Wait, need only rank*head_dim per h
+    float* kv_latent_smem = smem + 2 * rank * head_dim;
+    
+    // Load w_up_k for head h
+    // ...
+}
+&#x27;&#x27;&#x27;
+```
+
+Wait, I need to be careful about shared memory size. I said one block per (b,h). So each block only needs w_up_k and w_up_v for one h, not all h.
+
+Shared memory per block: `2 * rank * head_dim + seq_len * rank` floats.
+
+For loading w_up_k:
+```cuda
+for (int i = threadIdx.x; i &lt; rank * head_dim; i += blockDim.x) {
+    // w_up_k is [rank, num_heads, head_dim]
+    int r = i / head_dim;
+    int d = i % head_dim;
+    w_up_k_smem[i] = w_up_k[(r * num_heads + h) * head_dim + d];
+}
+```
+
+Wait, if w_up_k is [rank, num_heads, head_dim], then `w_up_k[r, h, d]` is at offset `((r * num_heads) + h) * head_dim + d`.
+If we iterate `i = 0..rank*head_dim-1`, then:
+- `r = i / head_dim`
+- `d = i % head_dim`
+- Global offset = `((r * num_heads) + h) * head_dim + d`
+
+Consecutive i values have consecutive d, then r increments. The offset increases by 1 for each consecutive i. Are these contiguous in memory? No! Because between `i=head_dim-1` (r=0, d=head_dim-1) and `i=head_dim` (r=1, d=0), the offset jumps by `(num_heads * head_dim - head_dim) = (num_heads - 1) * head_dim`.
+
+But we read coalesced because consecutive threads (threadIdx.x) read consecutive i values, and we established earlier that for fixed h, consecutive (r, d) within the head_h slice have a pattern that IS coalesced across a warp. Let me double check.
+
+For warp loading i=0..31:
+- i=0: offset = h * head_dim + 0
+- i=1: offset = h * head_dim + 1
+- ...
+- i=head_dim-1: offset = h * head_dim + head_dim - 1
+- i=head_dim: offset = num_heads * head_dim + h * head_dim + 0
+
+So threads 0..head_dim-1 read a contiguous block starting at `h * head_dim`. Threads head_dim..2*head_dim-1 read a contiguous block starting at `num_heads * head_dim + h * head_dim`. The distance between these blocks is `num_heads * head_dim`. For num_heads=4, head_dim=16, this is 64 floats = 256 bytes.
+
+A warp of 32 threads trying to load these: threads 0..15 read addresses `h*64 + 0..15*4` (64-byte range). Thread 16 reads `h*64 + 256 + 0 = h*64 + 256`. The addresses span 320 bytes. Are they coalesced? On H100, a warp load is broken into 16-byte segments. Threads 0..3 load 16 bytes, threads 4..7 load the next 16 bytes, etc. Threads 16..19 load 16 bytes starting at offset 256. These are in different 128-byte cache lines. So we&#x27;d need multiple transactions.
+
+But the compiler and hardware might still handle this reasonably. And it&#x27;s only 384 floats being loaded total, which is 1.5KB. At L2 cache bandwidth of ~10TB/s, that&#x27;s 0.15 nanoseconds. In practice, with overhead, maybe a few nanoseconds.
+
+Actually, we can restructure the loading to be more coalesced. If each thread loads one &#x27;row&#x27; r of w_up_k[:, h, :], then:
+- Thread r loads w_up_k[r, h, 0..head_dim-1] (head_dim consecutive floats).
+- This is a contiguous block per thread, not coalesced across threads.
+
+What if we use a two-dimensional thread mapping? No, that complicates things.
+
+I think the coalescing is acceptable. Let me proceed.
+
+Actually, let me think about a simpler approach. What if we just store w_up_k and w_up_v transposed in memory to improve coalescing? But we can&#x27;t change the input layout.
+
+Hmm, for the actual inner computation, the access pattern to w_up_k_smem also matters. When computing q_proj_k[r] = sum_d q[d] * w_up_k[r, d], for each r, we read w_up_k[r, 0..15]. This is a sequential read from shared memory, which is fast.
+
+OK, let me finally write the code.
+
+One detail: I should avoid hardcoding the sizes in the kernel. I&#x27;ll pass them as parameters and use `constexpr` or just variables. But for `#pragma unroll`, it&#x27;s better if the compiler knows the bounds are small. Since these are passed at runtime, the compiler might not unroll. However, the kernel launch parameters can be captured at runtime and the compiler generates generic code.
+
+For tiny loops like `for (int d = 0; d &lt; head_dim; d++)`, since head_dim=16 is small, I can use `#pragma unroll` and hope the compiler unrolls them. With runtime variable bounds, `#pragma unroll` doesn&#x27;t force unrolling of variable-bound loops; the compiler decides. But with `-O3`, the compiler is pretty aggressive. Actually, for NVCC, `#pragma unroll` with no number tells the compiler to fully unroll small loops.
+
+Let me check: NVCC fully unrolls loops when the trip count is a compile-time constant. With runtime variables, it can&#x27;t. But I can pass head_dim, rank, seq_len as template parameters!
+
+```cuda
+template &lt;int BATCH_SIZE, int SEQ_LEN, int NUM_HEADS, int HEAD_DIM, int RANK&gt;
+__global__ void fused_mla_attention_kernel(...) { ... }
+```
+
+Then in PyTorch, I launch with these template parameters instantiated. But `load_inline` might make this trickier. Actually, I can use `cpp_sources` with a generic kernel, or I can use function template specialization.
+
+Actually, a simpler approach is to just launch with runtime parameters and manually unroll by using `if` chains for the small dimensions. Or just trust the compiler.
+
+For head_dim=16, rank=24, seq_len=32, even if the compiler doesn&#x27;t unroll, the loops are small and the branch predictor handles them well. And shared memory accesses are fast.
+
+Let me just write the generic version. If performance isn&#x27;t good enough, I&#x27;ll optimize.
+
+Wait, actually, looking at the code more carefully, I realize I should define the kernel with the sizes as template parameters to encourage unrolling. `load_inline` compiles the CUDA code at module load time. I can just write the template kernel and instantiate it in a wrapper function.
+
+```cpp
+template &lt;int HEAD_DIM, int RANK, int SEQ_LEN&gt;
+__global__ void kernel(...) { ... }
+
+extern &quot;C&quot; void launch_kernel(...) {
+    // Check dimensions match
+    kernel&lt;16, 24, 32&gt;&lt;&lt;&lt;grid, block, smem&gt;&gt;&gt;(...);
+}
+```
+
+This is clean and lets the compiler fully unroll all loops. I&#x27;ll use this.
+
+Actually, do I even need an `extern &quot;C&quot;` wrapper? `load_inline` with `functions=[&#x27;launch_kernel&#x27;]` will expose `launch_kernel` to Python. The wrapper takes torch tensors and extracts pointers and dimensions.
+
+Let me structure the code:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+template &lt;int HEAD_DIM, int RANK, int SEQ_LEN&gt;
+__global__ void fused_mla_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ kv_latent,
+    const float* __restrict__ w_up_k,
+    const float* __restrict__ w_up_v,
+    float* __restrict__ out,
+    int batch_size, int num_heads
+) {
+    // b = blockIdx.y, h = blockIdx.x, t = threadIdx.x
+    // ...
+}
+
+void launch_fused_mla(
+    torch::Tensor q,
+    torch::Tensor kv_latent,
+    torch::Tensor w_up_k,
+    torch::Tensor w_up_v,
+    torch::Tensor out
+) {
+    int batch_size = q.size(0);
+    int seq_len = q.size(1);
+    int num_heads = q.size(2);
+    int head_dim = q.size(3);
+    int rank = kv_latent.size(2);
+    
+    // Check sizes
+    // ...
+    
+    dim3 grid(num_heads, batch_size);
+    dim3 block(seq_len);
+    
+    int smem_size = (2 * rank * head_dim + seq_len * rank) * sizeof(float);
+    
+    // Dispatch based on sizes
+    if (head_dim == 16 &amp;&amp; rank == 24 &amp;&amp; seq_len == 32) {
+        fused_mla_kernel&lt;16, 24, 32&gt;&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(
+            q.data_ptr&lt;float&gt;(),
+            kv_latent.data_ptr&lt;float&gt;(),
+            w_up_k.data_ptr&lt;float&gt;(),
+            w_up_v.data_ptr&lt;float&gt;(),
+            out.data_ptr&lt;float&gt;(),
+            batch_size, num_heads
+        );
+    } else {
+        // Generic fallback or error
+    }
+}
+```
+
+Wait, `load_inline` auto-generates bindings from the `functions` list. But it expects C++ functions, not CUDA-specific types? No, it should work with any C++ function.
+
+Actually, I should check: does `load_inline` support functions that take `torch::Tensor`? I think yes, if we include `&lt;torch/extension.h&gt;`.
+
+But actually, let me be careful. The `cpp_sources` string in `load_inline` gets compiled by nvcc for the CUDA parts. I need to make sure:
+1. I include `&lt;torch/extension.h&gt;`
+2. The wrapper function is declared `extern &quot;C&quot;` or at least not namespaced in a way that pybind11 misses it.
+
+Looking at PyTorch docs, `load_inline` takes `functions=[...]` which are the C++ function names to bind. These can be any functions visible in the `cpp_sources`. 
+
+Let me also be careful about the tensor data access. In modern PyTorch, `.data_ptr&lt;float&gt;()` is correct.
+
+Alright, let me draft the complete code and compile it. I&#x27;ll start with a basic version and iterate.
+
+Actually, one more thought: I should make sure I&#x27;m not using too much shared memory. The limit is 48KB per block by default. I only need 6KB. Fine.
+
+Also, I should double-check the synchronization. `__syncthreads()` is needed after loading shared memory and before any thread uses it. Since all threads write to shared memory and all threads read from it, one `__syncthreads()` after all loads is sufficient.
+
+But what if some threads return early? `if (t &gt;= seq_len) return;` - if seq_len=32 and block=32, no thread returns early. Good.
+
+Now let me also think about a potential optimization: can I use float4 or vector loads to improve memory bandwidth? For loading kv_latent and w_up_k into shared memory, we can use float4 which loads 4 floats at once. But with small sizes and good cache behavior, the benefit might be minimal. Let me keep it simple first.
+
+What about using registers instead of shared memory for w_up_k and w_up_v? Each thread needs all of w_up_k[:, h, :] (24*16=384 floats). That&#x27;s too much for registers (1536 bytes per thread would be 48KB per warp, exceeding register file limits). So shared memory is needed.
+
+But actually, each thread only needs to access w_up_k one row at a time. If we load w_up_k row by row when needed, we could keep it in shared memory but with a smaller buffer. Or, we could read it from global memory cached in L1.
+
+Since w_up_k is only 1.5KB per head, and each SM processes one block at a time (in the 8-block case), L1 cache can easily hold it. So we could read w_up_k directly from global memory without shared memory!
+
+Similarly for w_up_v. And kv_latent is 3KB per batch, also fits in L1.
+
+If we don&#x27;t use shared memory:
+- Simpler code (no __syncthreads, no shared mem management)
+- L1 cache might handle it well
+
+But shared memory is faster than L1 cache. And shared memory ensures the data is loaded once and broadcast to all threads. With L1, each thread might generate separate load requests for the same data (though they hit L1 cache).
+
+For w_up_k[r, h, d], when all threads compute q_proj_k for different r, they read different rows of w_up_k. These are spread across L1 cache lines. Each thread reads 16 floats for its assigned r. With 32 threads and row-major storage where each row is contiguous, these reads are mostly independent and don&#x27;t conflict much.
+
+Actually, if all 32 threads read 32 different rows of w_up_k simultaneously, and each row is 64 bytes, the total read is 2KB. This fits in L1 and can be done in parallel.
+
+But for w_up_v, when computing out[d] = sum_r attn_latent[r] * w_up_v[r, d], all threads computing the same d need to read all rows of w_up_v. This has more contention.
+
+I think shared memory is still the safer choice for predictable performance.
+
+OK, let me write the code. I&#x27;ll compile and test, then optimize based on the profile.
+
+Wait, one more thing. Since the batch, seq_len, head_dim, rank sizes might change in evaluation (though they seem fixed based on get_inputs), I should write the generic kernel but instantiate the most common case.
+
+Actually, the evaluation probably uses the exact sizes from get_inputs(). I&#x27;ll support those but also have generic fallbacks.
+
+Let me draft the code now.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nimport torch.utils.cpp_extension\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\ntemplate &lt;int HEAD_DIM, int RANK, int SEQ_LEN&gt;\n__global__ void fused_mla_kernel(\n    const float* __restrict__ q,\n    const float* __restrict__ kv_latent,\n    const float* __restrict__ w_up_k,\n    const float* __restrict__ w_up_v,\n    float* __restrict__ out,\n    int batch_size, int num_heads\n) {\n    int b = blockIdx.y;\n    int h = blockIdx.x;\n    int t = threadIdx.x;\n    \n    if (b &gt;= batch_size || h &gt;= num_heads || t &gt;= SEQ_LEN) return;\n    \n    extern __shared__ float smem[];\n    float* w_up_k_smem = smem;\n    float* w_up_v_smem = smem + RANK * HEAD_DIM;\n    float* kv_latent_smem = smem + 2 * RANK * HEAD_DIM;\n    \n    // Load w_up_k for head h\n    for (int i = threadIdx.x; i &lt; RANK * HEAD_DIM; i += blockDim.x) {\n        int r = i / HEAD_DIM;\n        int d = i % HEAD_DIM;\n        w_up_k_smem[i] = w_up_k[((r * num_heads + h) * HEAD_DIM + d)];\n    }\n    \n    // Load w_up_v for head h\n    for (int i = threadIdx.x; i &lt; RANK * HEAD_DIM; i += blockDim.x) {\n        int r = i / HEAD_DIM;\n        int d = i % HEAD_DIM;\n        w_up_v_smem[i] = w_up_v[((r * num_heads + h) * HEAD_DIM + d)];\n    }\n    \n    // Load kv_latent for batch b\n    for (int i = threadIdx.x; i &lt; SEQ_LEN * RANK; i += blockDim.x) {\n        int s = i / RANK;\n        int r = i % RANK;\n        kv_latent_smem[i] = kv_latent[((b * SEQ_LEN + s) * RANK + r)];\n    }\n    \n    __syncthreads();\n    \n    // Load q[b, t, h, d]\n    float q_local[HEAD_DIM];\n    #pragma unroll\n    for (int d = 0; d &lt; HEAD_DIM; d++) {\n        q_local[d] = q[(((b * SEQ_LEN + t) * num_heads + h) * HEAD_DIM + d)];\n    }\n    \n    // q_proj_k[r] = sum_d q[d] * w_up_k[r, d]\n    float q_proj_k[RANK];\n    #pragma unroll\n    for (int r = 0; r &lt; RANK; r++) {\n        float acc = 0.0f;\n        #pragma unroll\n        for (int d = 0; d &lt; HEAD_DIM; d++) {\n            acc += q_local[d] * w_up_k_smem[r * HEAD_DIM + d];\n        }\n        q_proj_k[r] = acc;\n    }\n    \n    // Compute logits[s] = scale * dot(kv_latent[s], q_proj_k) for all s\n    float logits[SEQ_LEN];\n    const float scale = 1.0f / sqrtf((float)HEAD_DIM);\n    #pragma unroll\n    for (int s = 0; s &lt; SEQ_LEN; s++) {\n        float dot = 0.0f;\n        #pragma unroll\n        for (int r = 0; r &lt; RANK; r++) {\n            dot += kv_latent_smem[s * RANK + r] * q_proj_k[r];\n        }\n        logits[s] = (s &lt;= t) ? dot * scale : -1e20f;\n    }\n    \n    // Softmax over s=0..t\n    float max_logit = -1e20f;\n    #pragma unroll\n    for (int s = 0; s &lt;= t; s++) {\n        max_logit = fmaxf(max_logit, logits[s]);\n    }\n    \n    float sum_exp = 0.0f;\n    #pragma unroll\n    for (int s = 0; s &lt;= t; s++) {\n        float e = expf(logits[s] - max_logit);\n        logits[s] = e;\n        sum_exp += e;\n    }\n    \n    float inv_sum = 1.0f / sum_exp;\n    #pragma unroll\n    for (int s = 0; s &lt;= t; s++) {\n        logits[s] *= inv_sum;\n    }\n    \n    // attn_latent[r] = sum_s attn[s] * kv_latent[s, r]\n    float attn_latent[RANK];\n    #pragma unroll\n    for (int r = 0; r &lt; RANK; r++) {\n        float acc = 0.0f;\n        #pragma unroll\n        for (int s = 0; s &lt;= t; s++) {\n            acc += logits[s] * kv_latent_smem[s * RANK + r];\n        }\n        attn_latent[r] = acc;\n    }\n    \n    // out[d] = sum_r attn_latent[r] * w_up_v[r, d]\n    float out_local[HEAD_DIM];\n    #pragma unroll\n    for (int d = 0; d &lt; HEAD_DIM; d++) {\n        float acc = 0.0f;\n        #pragma unroll\n        for (int r = 0; r &lt; RANK; r++) {\n            acc += attn_latent[r] * w_up_v_smem[r * HEAD_DIM + d];\n        }\n        out_local[d] = acc;\n    }\n    \n    // Write output\n    #pragma unroll\n    for (int d = 0; d &lt; HEAD_DIM; d++) {\n        out[(((b * SEQ_LEN + t) * num_heads + h) * HEAD_DIM + d)] = out_local[d];\n    }\n}\n\nvoid launch_fused_mla(\n    torch::Tensor q,\n    torch::Tensor kv_latent,\n    torch::Tensor w_up_k,\n    torch::Tensor w_up_v,\n    torch::Tensor out\n) {\n    int batch_size = q.size(0);\n    int seq_len = q.size(1);\n    int num_heads = q.size(2);\n    int head_dim = q.size(3);\n    int rank = kv_latent.size(2);\n    \n    dim3 grid(num_heads, batch_size);\n    dim3 block(seq_len);\n    \n    int smem_size = (2 * rank * head_dim + seq_len * rank) * sizeof(float);\n    \n    if (head_dim == 16 &amp;&amp; rank == 24 &amp;&amp; seq_len == 32) {\n        fused_mla_kernel&lt;16, 24, 32&gt;&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n            q.data_ptr&lt;float&gt;(),\n            kv_latent.data_ptr&lt;float&gt;(),\n            w_up_k.data_ptr&lt;float&gt;(),\n            w_up_v.data_ptr&lt;float&gt;(),\n            out.data_ptr&lt;float&gt;(),\n            batch_size, num_heads\n        );\n    } else {\n        // generic fallback - not expected for this problem\n        AT_ERROR(\&quot;Unsupported dimensions\&quot;);\n    }\n}\n\&quot;\&quot;\&quot;\n\n_mod = torch.utils.cpp_extension.load_inline(\n    name=\&quot;fused_mla\&quot;,\n    cpp_sources=\&quot;\&quot;,\n    cuda_sources=cuda_source,\n    functions=[\&quot;launch_fused_mla\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    \&quot;\&quot;\&quot;Custom CUDA kernel for fused MLA attention.\&quot;\&quot;\&quot;\n\n    def __init__(self):\n        super().__init__()\n\n    def forward(\n        self,\n        q: torch.Tensor,\n        kv_latent: torch.Tensor,\n        w_up_k: torch.Tensor,\n        w_up_v: torch.Tensor,\n    ) -&gt; torch.Tensor:\n        out = torch.empty_like(q)\n        _mod.launch_fused_mla(q, kv_latent, w_up_k, w_up_v, out)\n        return out\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;fused_mla&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_mla -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_31_cache/k_93a281ddb44a/fused_mla/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_mla -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_31_cache/k_93a281ddb44a/fused_mla/main.cpp -o main.o 
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_31_cache/k_93a281ddb44a/fused_mla/main.cpp: In function &#x27;void pybind11_init_fused_mla(pybind11::module_&amp;)&#x27;:
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_31_cache/k_93a281ddb44a/fused_mla/main.cpp:4:55: error: &#x27;launch_fused_mla&#x27; was not declared in this scope; did you mean &#x27;PyInit_fused_mla&#x27;?
+    4 | m.def(&quot;launch_fused_mla&quot;, torch::wrap_pybind_function(launch_fused_mla), &quot;launch_fused_mla&quot;);
+      |                                                       ^~~~~~~~~~~~~~~~
+      |                                                       PyInit_fused_mla
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=fused_mla -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/popcorn/Kimi-K2.6/level_2_problem_31_cache/k_93a281ddb44a/fused_mla/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
