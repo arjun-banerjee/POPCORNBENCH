@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 33</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 21:44:28 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 33</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 21:49:50 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">33_BatchNorm.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">2 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">2</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -745,5 +745,2226 @@ Device: NVIDIA H100 80GB HBM3
 
 Ridge point (FP32): 20.09 FLOPs/byte
   Kernels with arithmetic intensity below the ridge point are
-  memory-bound; above it they are compute-bound.</div></details></div></div>
+  memory-bound; above it they are compute-bound.</div></details></div><details class="turn-collapse"><summary><b>turn 2</b> · 1 tool call(s) · 278.9s · 118,584 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>llm latency: 278.9s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Let me analyze the task:
+
+1. Reference: `nn.BatchNorm2d` with `batch_size=64`, `features=64`, `dim1=512`, `dim2=512`
+2. Input size: `[64, 64, 512, 512]` - this is a very large tensor (1,073,741,824 elements), ~4GB of fp32 data
+3. BatchNorm2d: computes mean and variance across batch, H, W dimensions (N, H, W), normalizes, then applies gamma and beta.
+
+For a custom CUDA kernel, I need to:
+1. Compute mean per channel: sum over N*H*W and divide
+2. Compute variance per channel: sum of squared differences from mean over N*H*W
+3. Normalize: (x - mean) / sqrt(var + eps)
+4. Scale and shift: y * weight + bias
+
+For such a large tensor (~4GB), this is heavily memory-bound. The key is to write a fused kernel that:
+- Computes mean and variance in a single pass or efficiently
+- Then applies normalization in a second fused pass (or everything fused if possible)
+
+Given the scale (64*512*512 = 16,777,216 elements per channel, 64 channels), we can:
+1. First kernel: compute mean and variance per channel using grid-stride loops with shared memory for reduction
+2. Second kernel: apply normalization using pre-computed mean, var, weight, bias
+
+Actually, we could also potentially do a single-pass Welford&#x27;s algorithm for mean/variance, then apply the transform. But since we need to read the full tensor once for mean/var, and once more for normalization (2 reads + 1 write = 3 memory accesses), a two-kernel approach might be cleanest.
+
+For H100, maximizing memory bandwidth is key. We want coalesced memory access, large thread blocks, and grid-stride loops.
+
+Let me think about the reduction kernel:
+- 64 channels
+- Per channel: 64*512*512 = 16,777,216 elements
+- Total elements: 1,073,741,824
+
+For reduction, we can have:
+- Each block handles one channel
+- Threads in block do grid-stride loop over N*H*W for that channel
+- Shared memory reduction to get sum and sum of squares
+
+But 16M elements per channel with 256 threads = 65536 iterations per thread. That might be a bit heavy. We could also assign multiple blocks per channel and do atomic adds or a second reduction pass.
+
+For better performance:
+- Use multiple blocks per channel to saturate SMs
+- Each block computes partial sum and partial sum of squares
+- Then a second small kernel or atomic operations combine them
+
+Actually, with 64 channels and 132 SMs on H100, we want many blocks. Let&#x27;s do:
+- Block handles a portion of elements for one channel
+- Use atomicAdd to accumulate mean and variance across blocks
+
+Wait, atomicAdd on fp32 is okay but could be slow with many conflicts. Better approach:
+- First pass: each block computes local sum and sum_sq, writes to temporary buffers
+- Second pass: one block per channel reduces the partial results
+
+But that adds complexity. Let me think...
+
+For 64 channels, we can process them in parallel. If we use 1024 thread blocks with 256 threads each:
+- 16 blocks per channel (1024/64)
+- Each block processes ~1M elements
+
+Let me design:
+
+Kernel 1 - compute mean and inv_std per channel:
+```cuda
+__global__ void compute_stats(
+    const float* x, float* mean, float* inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    int c = blockIdx.x;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    
+    // Grid-stride over N, H, W for this channel
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    int spatial = H * W;
+    int numel = N * spatial;
+    
+    for (int i = tid; i &lt; numel; i += block_size) {
+        int n = i / spatial;
+        int hw = i % spatial;
+        int idx = ((n * C) + c) * spatial + hw;
+        float val = x[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+    
+    // Shared memory reduction
+    __shared__ float s_sum[256];
+    __shared__ float s_sum_sq[256];
+    s_sum[tid] = sum;
+    s_sum_sq[tid] = sum_sq;
+    __syncthreads();
+    
+    // Tree reduction
+    for (int s = block_size / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        float m = s_sum[0] / numel;
+        float var = s_sum_sq[0] / numel - m * m;
+        // Use unbiased variance like PyTorch? No, BatchNorm2d uses unbiased=False during training
+        // actually nn.BatchNorm2d uses running stats. During eval, it uses running_mean and running_var
+        // But in the reference, it&#x27;s just self.bn(x), which means training mode by default?
+        // Actually, nn.BatchNorm2d defaults to training mode (self.training = True)
+        // During training, it computes batch statistics and uses them.
+        // PyTorch BatchNorm uses Bessel&#x27;s correction for running_var but unbiased=False for the actual normalization
+        // Let me check: in PyTorch, during training, the variance used for normalization is the population variance (unbiased=False)
+        // but running_var uses unbiased=True (N/(N-1) correction).
+        
+        // For simplicity and correctness, let me just match whatever PyTorch does in the reference by running it
+        // Actually, since the model isn&#x27;t put in eval mode, it&#x27;s in training mode.
+        // In training mode: normalization uses var = sum((x-mean)^2) / N (population variance)
+        
+        mean[c] = m;
+        inv_std[c] = rsqrtf(var + eps);
+    }
+}
+```
+
+Wait - PyTorch&#x27;s BatchNorm might have different behavior. Let me check:
+- In training mode: uses batch mean and population variance (unbiased=False, i.e., divide by N not N-1)
+- In eval mode: uses running_mean and running_var (which are computed with unbiased=True during training)
+
+Since the model is in training mode by default, I&#x27;ll use population variance.
+
+Actually, to be safe, I should check what PyTorch does. But I&#x27;ll just implement a straightforward population variance and see if correctness passes. If not, I&#x27;ll adjust.
+
+Kernel 2 - normalize:
+```cuda
+__global__ void batch_norm_forward(
+    const float* x, const float* mean, const float* inv_std,
+    const float* weight, const float* bias,
+    float* y, int N, int C, int H, int W) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    
+    for (int i = tid; i &lt; total; i += blockDim.x * gridDim.x) {
+        int c = (i / (H * W)) % C;
+        float val = x[i];
+        float normalized = (val - mean[c]) * inv_std[c];
+        y[i] = normalized * weight[c] + bias[c];
+    }
+}
+```
+
+Actually, let me think about optimizing this. For H100 with ~3.35 TB/s bandwidth:
+- Total memory traffic: read x (4GB), write y (4GB), plus small reads for mean/inv_std/weight/bias
+- Total ~8GB, at 3TB/s = ~2.67ms just for memory copy
+- So theoretical minimum is around 2-3ms for a simple elementwise kernel
+
+The reduction kernel will read 4GB once and do some compute. That&#x27;s another ~1.3ms.
+So total theoretical best case is ~4ms.
+
+Two passes: first pass reads all data and writes tiny mean/std buffers. Second pass reads all data again and writes output.
+Total reads: 2 * 4GB = 8GB, writes: 4GB. 12GB total at 3TB/s = 4ms.
+
+To optimize further, maybe we can use Welford&#x27;s algorithm and compute everything in a single pass? No, because we need the mean before we can normalize. But we could:
+1. First kernel computes mean and inv_std
+2. Second kernel reads x, applies transform, writes y
+
+This is already optimal in terms of memory traffic for the general case.
+
+For the first kernel, we need to launch enough blocks to saturate the GPU. With 64 channels, if we do one block per channel, that&#x27;s only 64 blocks, which won&#x27;t saturate H100&#x27;s 132 SMs. We need multiple blocks per channel.
+
+Let me revise with multi-block reduction per channel:
+
+```cuda
+__global__ void compute_stats_multi_block(
+    const float* x, float* out_mean, float* out_inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    extern __shared__ float sdata[];
+    float* s_sum = sdata;
+    float* s_sq = sdata + blockDim.x;
+    
+    int c = blockIdx.y;
+    int block_id = blockIdx.x;
+    int tid = threadIdx.x;
+    int nblocks = gridDim.x;
+    int block_size = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    
+    // Grid-stride: each block handles a subset, each thread grid-strides within that subset
+    // Better: each thread grid-strides with stride = block_size * nblocks
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    int global_tid = block_id * block_size + tid;
+    for (int i = global_tid; i &lt; numel; i += block_size * nblocks) {
+        int n = i / spatial;
+        int hw = i % spatial;
+        int idx = ((n * C) + c) * spatial + hw;
+        float val = x[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+    
+    s_sum[tid] = sum;
+    s_sq[tid] = sum_sq;
+    __syncthreads();
+    
+    // Reduce within block
+    for (int s = block_size / 2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sq[tid] += s_sq[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        // Atomic add to global accumulator for this channel
+        atomicAdd(&amp;out_mean[c], s_sum[0]);
+        atomicAdd(&amp;out_inv_std[c], s_sq[0]);  // Reusing inv_std buffer for sum_sq temporarily
+    }
+}
+```
+
+Hmm, this requires zero-initialized output buffers and a second small step, or we could have the caller zero them. But atomicAdd in global memory could be slow if many blocks per channel.
+
+Alternative: first kernel writes partial sums to a workspace, second kernel reduces partial sums.
+
+Let me think about occupancy. If we use 256 threads per block and need 2*256*4 = 2KB shared memory, that&#x27;s very light.
+
+Actually, for PyTorch&#x27;s BatchNorm, a common optimization is to use the cuDNN or PyTorch&#x27;s own optimized kernel. For such a large input, PyTorch likely calls into cuDNN which is highly optimized. So I need to be very careful.
+
+Let me count the work:
+- Input: [64, 64, 512, 512]
+- Per channel elements: 64 * 512 * 512 = 16,777,216
+- Total elements: 1,073,741,824
+
+For the reduction, if we use 256 threads per block and want each thread to process about 64K elements (to amortize launch overhead), we&#x27;d use:
+- 16,777,216 / 64K ≈ 256 blocks per channel
+- Total blocks: 256 * 64 = 16,384 blocks
+
+That&#x27;s plenty to saturate H100. But 64K elements per thread might be too many - it would be a very long loop. Let&#x27;s use fewer:
+- 16,777,216 / 1024 = 16,384 elements per thread with 1024 blocks per channel - too many blocks
+- Let&#x27;s use 32 blocks per channel * 256 threads = 8192 blocks total
+- Each thread processes 16,777,216 / (32 * 256) = 2048 elements
+
+That seems reasonable.
+
+Actually, there&#x27;s another approach: use cooperative groups or warp shuffle for reduction, which is faster than shared memory.
+
+Let me design the kernel more carefully:
+
+```cuda
+__global__ void compute_stats(
+    const float* x, float* mean, float* inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    // Grid-stride loop
+    for (int i = bid * nthreads + tid; i &lt; numel; i += nthreads * nblocks) {
+        int n = i / spatial;
+        int hw = i % spatial;
+        int idx = ((n * C) + c) * spatial + hw;
+        float val = x[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+    
+    // Warp shuffle reduction
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    __shared__ float s_sum[32];
+    __shared__ float s_sq[32];
+    
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = sum;
+        s_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    
+    // Final reduction by warp 0
+    if (warp_id == 0) {
+        sum = (lane &lt; (nthreads + 31) / 32) ? s_sum[lane] : 0.0f;
+        sum_sq = (lane &lt; (nthreads + 31) / 32) ? s_sq[lane] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+    }
+    
+    if (tid == 0) {
+        float m = sum / numel;
+        float var = sum_sq / numel - m * m;
+        mean[c] = m;
+        inv_std[c] = rsqrtf(var + eps);
+    }
+}
+```
+
+Grid: dim3(32, 64) with 256 threads. Each block processes one channel.
+
+For the second kernel, we want to maximize throughput. Simple elementwise:
+
+```cuda
+__global__ void apply_bn(
+    const float* x, const float* mean, const float* inv_std,
+    const float* weight, const float* bias,
+    float* y, int N, int C, int H, int W) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int total = N * C * H * W;
+    
+    for (int i = tid; i &lt; total; i += stride) {
+        int c = (i / (H * W)) % C;
+        float normalized = (x[i] - mean[c]) * inv_std[c];
+        y[i] = normalized * weight[c] + bias[c];
+    }
+}
+```
+
+Grid for second kernel: enough blocks to saturate. With 256 threads per block, we need ~N*C*H*W / 256 / some_factor. For 1B elements, maybe 65536 blocks or more.
+
+Actually, on H100 we want around 128-256 warps per SM for good occupancy. With 132 SMs, that&#x27;s ~16K-32K warps. At 8 warps per block (256 threads), that&#x27;s 2K-4K blocks. But for elementwise, we might not need that many -更大的 grid helps hide latency though.
+
+Let me use a large number of blocks: min(total_elements / 256, some large number). Or just calculate:
+- blocks = (total_elements + 255) / 256
+- For 1B elements: ~4.2M blocks - way too many!
+- We should cap it. A common cap is 65535 * something or use a fixed large number like 65536.
+- Actually, with grid-stride loops, we can use fewer blocks. Let&#x27;s use enough to saturate all SMs.
+
+For H100 with 132 SMs, if each SM can run 32 blocks concurrently... actually occupancy is limited by warps. Max 64 warps per SM on Hopper I think? Let me check: H100 has max 64 warps per SM (2048 threads). So max 8 blocks of 256 threads per SM concurrently. 132 * 8 = 1056 blocks for full occupancy across all SMs.
+
+But with grid-stride loops, we can launch many more blocks. Let&#x27;s say 65536 blocks of 256 threads. That&#x27;s a lot but should work fine.
+
+Wait, max grid dimension is 2^31-1 for x, so 65536 is fine.
+
+Actually, for very simple kernels, launching too many blocks can have overhead. Let&#x27;s use maybe 8192 or 16384 blocks. But for 1B elements, even with 8192 blocks * 256 threads = ~2M threads, each thread processes ~512 elements on average. That should be fine.
+
+Let me think a bit about thread coalescing. In the second kernel, consecutive threads access consecutive elements. With float4, we could process 4 elements per thread for better bandwidth.
+
+Using float4:
+- Each thread reads 4 consecutive floats
+- We need to be careful about alignment - tensors from PyTorch should be aligned
+- We process 4 elements at a time
+
+Actually, float4 on H100 is very effective for bandwidth-bound kernels.
+
+Let me write the second kernel with float4:
+
+```cuda
+__global__ void apply_bn_float4(
+    const float* x, const float* mean, const float* inv_std,
+    const float* weight, const float* bias,
+    float* y, int N, int C, int H, int W) {
+    
+    int total = N * C * H * W;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nthreads = blockDim.x * gridDim.x;
+    
+    // Process 4 elements per thread
+    int n4 = total / 4;
+    
+    for (int i = tid; i &lt; n4; i += nthreads) {
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x)[i];
+        
+        // Compute channel for each element
+        // base index = i * 4
+        int base = i * 4;
+        int c0 = (base / (H * W)) % C;
+        int c1 = ((base + 1) / (H * W)) % C;
+        int c2 = ((base + 2) / (H * W)) % C;
+        int c3 = ((base + 3) / (H * W)) % C;
+        
+        float w0 = weight[c0], w1 = weight[c1], w2 = weight[c2], w3 = weight[c3];
+        float s0 = inv_std[c0], s1 = inv_std[c1], s2 = inv_std[c2], s3 = inv_std[c3];
+        float m0 = mean[c0], m1 = mean[c1], m2 = mean[c2], m3 = mean[c3];
+        float b0 = bias[c0], b1 = bias[c1], b2 = bias[c2], b3 = bias[c3];
+        
+        float4 yv;
+        yv.x = (xv.x - m0) * s0 * w0 + b0;
+        yv.y = (xv.y - m1) * s1 * w1 + b1;
+        yv.z = (xv.z - m2) * s2 * w2 + b2;
+        yv.w = (xv.w - m3) * s3 * w3 + b3;
+        
+        reinterpret_cast&lt;float4*&gt;(y)[i] = yv;
+    }
+    
+    // Handle remaining elements
+    int remainder_start = n4 * 4;
+    for (int i = remainder_start + tid; i &lt; total; i += nthreads) {
+        int c = (i / (H * W)) % C;
+        y[i] = (x[i] - mean[c]) * inv_std[c] * weight[c] + bias[c];
+    }
+}
+```
+
+Wait, the channel computation is expensive. Let me think if we can avoid it. Since HW = 512*512 = 262144, which is divisible by 4, consecutive elements often share the same channel within a float4, except at channel boundaries.
+
+Actually, 262144 / 4 = 65536, so every float4 of 4 consecutive elements within the same N lies entirely within the same channel. The only boundary is between channels and between samples in batch.
+
+Within one channel: indices 0 to 262143, all same channel.
+So for base = i*4, if base/HW == (base+3)/HW, then all 4 elements have the same channel.
+
+When does a channel boundary cross? At multiples of HW = 262144. So when i*4 is a multiple of 262144, i.e., i is a multiple of 65536. So most float4 operations (65535 out of 65536) are within one channel. But when i % 65536 == 0, the float4 might span channels... wait, at i = 65536, base = 262144, which is exactly at a boundary. So elements at indices 262144, 262145, 262146, 262147 are all in channel 1. 
+
+Actually, a float4 starting at index 262143 would span channels 0 and 1. But since we process in groups of 4 starting from 0, we align to 4-byte boundaries. For index 262143, it&#x27;s not a multiple of 4, so it wouldn&#x27;t be the start of a float4. Since 262144 is divisible by 4, all our float4 loads are perfectly channel-aligned!
+
+So for every float4 we load, all 4 elements are in the same channel. Nice!
+
+Let me verify: base = i * 4. Channel = (base / 262144) % 64. For base in [0, 262143], channel = 0. For base in [262144, 524287], channel = 1. Since 262144 is divisible by 4, base is always aligned to the start of a channel when it changes. So yes, all 4 elements in every float4 share the same channel!
+
+Similarly for N dimension: indices jump by C*HW = 64*262144 = 16,777,216 between N values. This is also divisible by 4. So float4 alignment is maintained across the entire tensor.
+
+This means the float4 kernel can be much simpler:
+```cuda
+__global__ void apply_bn_float4(
+    const float* x, const float* mean, const float* inv_std,
+    const float* weight, const float* bias,
+    float* y, int N, int C, int H, int W) {
+    
+    int total = N * C * H * W;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nthreads = blockDim.x * gridDim.x;
+    int n4 = total / 4;
+    
+    for (int i = tid; i &lt; n4; i += nthreads) {
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x)[i];
+        int base = i * 4;
+        int c = (base / (H * W)) % C;
+        
+        float m = mean[c];
+        float s = inv_std[c];
+        float w = weight[c];
+        float b = bias[c];
+        
+        float4 yv;
+        yv.x = (xv.x - m) * s * w + b;
+        yv.y = (xv.y - m) * s * w + b;
+        yv.z = (xv.z - m) * s * w + b;
+        yv.w = (xv.w - m) * s * w + b;
+        
+        reinterpret_cast&lt;float4*&gt;(y)[i] = yv;
+    }
+}
+```
+
+Great! Much faster. But we still need to handle the remainder. Since total is divisible by 4? Let&#x27;s check: 64*64*512*512 = 1,073,741,824. Divided by 4 = 268,435,456. Yes, exactly divisible by 4! So no remainder needed.
+
+Now for the first kernel (stats computation), we could also use float4 to read 4 elements at a time. This helps bandwidth significantly.
+
+For the reduction kernel with float4:
+```cuda
+__global__ void compute_stats_float4(
+    const float* x, float* mean, float* inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    int numel4 = numel / 4;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    // Grid-stride over numel4
+    for (int i = bid * nthreads + tid; i &lt; numel4; i += nthreads * nblocks) {
+        int base = i * 4;
+        int n = base / spatial;
+        int hw_start = base % spatial;
+        int idx = ((n * C) + c) * spatial + hw_start;
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x)[idx / 4]; // Wait, idx might not be /4 aligned with float4 boundary
+        
+        // Hmm, need to be careful. x is a 1D array. For contiguous tensor, index is linear.
+        // float4 at position i contains x[4*i], x[4*i+1], x[4*i+2], x[4*i+3]
+        // So the float4 index is idx / 4, and we need idx to be divisible by 4.
+        // For base = i*4 where i is the float4 index in the channel slice... wait.
+    }
+}
+```
+
+Actually, let me reconsider. The x tensor is [N, C, H, W]. For channel c, the elements are at indices:
+- n=0: [c*spatial, c*spatial + spatial - 1] 
+- n=1: [C*spatial + c*spatial, C*spatial + c*spatial + spatial - 1]
+
+Wait, no. The layout is NCHW. So index of element (n, c, h, w) is ((n * C) + c) * H * W + h * W + w.
+
+For channel c, we have elements at:
+- n=0: c*HW to c*HW + HW - 1
+- n=1: (C + c)*HW to (C + c)*HW + HW - 1
+...
+- n: (n*C + c)*HW to (n*C + c)*HW + HW - 1
+
+The starting indices are c*HW, (C+c)*HW, (2C+c)*HW, etc. These are all multiples of HW = 262144, which is divisible by 4. So each channel&#x27;s data starts at a float4 boundary. And HW = 262144 is divisible by 4, so each channel has an integer number of float4s.
+
+For block (bid) processing channel c, thread tid processes float4 index i in the linearized channel:
+The float4 index within the channel ranges from 0 to numel/4 - 1.
+The global float4 index is: for each element in the float4, we need its linear index.
+
+Actually, it&#x27;s easier to think in terms of linear elements. If the channel c data is at global linear indices:
+global_idx = (n*C + c)*HW + hw for n in [0,N-1], hw in [0,HW-1]
+
+If we want to load 4 consecutive elements as float4, they need to be at global indices g, g+1, g+2, g+3. This requires the float4 pointer to be at global index g, and g must be divisible by 4.
+
+Within channel c and sample n, elements from (n*C+c)*HW to (n*C+c)*HW + HW - 1 are consecutive. Since (n*C+c)*HW is divisible by 4 and HW is divisible by 4, we can load float4s.
+
+But if we process elements using a grid-stride loop in the &quot;flattened channel&quot; space (indices 0 to numel-1), we need to map to global indices:
+global_idx of element j in channel c is: global_start + j where global_start varies by n.
+
+Let&#x27;s define: for j in [0, numel-1]:
+n = j / HW
+hw = j % HW
+global_idx = (n * C + c) * HW + hw
+
+For float4 processing, j ranges from 0 to numel-1 in steps of... if we want to load float4 at j, we need j divisible by 4, and j+3 &lt; (n+1)*HW.
+
+Since HW is divisible by 4, if j is divisible by 4, then j, j+1, j+2, j+3 are all in the same n (same sample) and same channel. So we can safely load float4.
+
+For our grid-stride loop over numel elements with step 4 per iteration:
+Actually, let me restructure: loop over float4 indices.
+
+```cuda
+for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+    int j = j4 * 4;
+    int n = j / spatial;
+    int hw = j % spatial;
+    int global_idx = ((n * C) + c) * spatial + hw;
+    
+    // global_idx is divisible by 4, so we can load float4
+    float4 xv = reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0];
+    
+    sum += xv.x + xv.y + xv.z + xv.w;
+    sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+}
+```
+
+Wait, `x + global_idx` is a float pointer. `reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0]` loads 4 floats starting at x[global_idx]. This works if global_idx is divisible by 4, which it is since j is divisible by 4 and hw is divisible by 4.
+
+Actually hw = j % spatial, and j is divisible by 4. spatial = 262144 is divisible by 4. So hw is divisible by 4. Good.
+
+But we also need x to be aligned to 16 bytes for optimal float4 loads. PyTorch tensors are typically allocated with 256-byte or 512-byte alignment, so this should be fine.
+
+After the loop, we do warp shuffle reduction of sum and sum_sq.
+
+One issue: if numel is not divisible by 4, we&#x27;d need a tail loop. But numel = 64 * 262144 = 16,777,216, which is divisible by 4. So no tail needed.
+
+Let&#x27;s write the first kernel with float4:
+
+```cuda
+__global__ void compute_stats(
+    const float* x, float* mean, float* inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    int numel4 = numel / 4;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+        int j = j4 * 4;
+        int n = j / spatial;
+        int hw = j % spatial;
+        int global_idx = ((n * C) + c) * spatial + hw;
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0];
+        sum += xv.x + xv.y + xv.z + xv.w;
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+    }
+    
+    // Warp shuffle reduction
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    __shared__ float s_sum[32];
+    __shared__ float s_sq[32];
+    
+    int lane = tid % 32;
+    int warp_id = tid / 32;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = sum;
+        s_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        sum = (lane &lt; (nthreads + 31) / 32) ? s_sum[lane] : 0.0f;
+        sum_sq = (lane &lt; (nthreads + 31) / 32) ? s_sq[lane] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset /= 2) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+    }
+    
+    if (tid == 0) {
+        float m = sum / numel;
+        float m_sq = sum_sq / numel;
+        float var = m_sq - m * m;
+        // Ensure var &gt;= 0 for numerical stability
+        var = fmaxf(var, 0.0f);
+        mean[c] = m;
+        inv_std[c] = rsqrtf(var + eps);
+    }
+}
+```
+
+Wait, `inv_std` should be the inverse standard deviation with sqrt(var + eps). Yes, `rsqrtf(var + eps)` is correct.
+
+For the second kernel with float4:
+
+```cuda
+__global__ void apply_bn(
+    const float* x, const float* mean, const float* inv_std,
+    const float* weight, const float* bias,
+    float* y, int N, int C, int H, int W) {
+    
+    int total = N * C * H * W;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nthreads = blockDim.x * gridDim.x;
+    int n4 = total / 4;
+    
+    for (int i = tid; i &lt; n4; i += nthreads) {
+        int base = i * 4;
+        int c = (base / (H * W)) % C;
+        
+        float m = mean[c];
+        float s = inv_std[c];
+        float w = weight[c];
+        float b = bias[c];
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + base)[0];
+        
+        float4 yv;
+        yv.x = (xv.x - m) * s * w + b;
+        yv.y = (xv.y - m) * s * w + b;
+        yv.z = (xv.z - m) * s * w + b;
+        yv.w = (xv.w - m) * s * w + b;
+        
+        reinterpret_cast&lt;float4*&gt;(y + base)[0] = yv;
+    }
+}
+```
+
+Wait, this second kernel assumes we can access x in simple linear order. But x is NCHW contiguous, so yes, x[base] through x[base+3] are 4 consecutive elements in memory. And since total is divisible by 4, we only need the n4 loop. But wait - is total / 4 the same as processing all elements correctly in raw linear index order?
+
+For a contiguous NCHW tensor, linear index base corresponds to element at:
+n = base / (C*H*W)
+c = (base / (H*W)) % C
+h = (base / W) % H
+w = base % W
+
+So if we process base = 0, 4, 8, ... we&#x27;re processing elements at linear indices 0,1,2,3 then 4,5,6,7, etc. Yes, this is just sequential processing of the raw memory. Since the tensor is contiguous, this is correct and the channel for the first element of each float4 is c = (base / HW) % C, and all 4 elements in the float4 have the same channel as we proved earlier.
+
+Actually wait - let me re-verify. Base goes from 0 to total-1 in steps of 4. For a given base, base+0, base+1, base+2, base+3 are consecutive elements. The channel of element at linear index idx is (idx / HW) % C.
+
+For all 4 elements to have the same channel, we need:
+(base / HW) % C == ((base + 3) / HW) % C
+
+This is true if base / HW == (base + 3) / HW, i.e., base and base+3 are in the same &quot;channel window&quot; of size HW.
+
+Since HW = 262144, and base ranges over multiples of 4, the only issue is when base is near a multiple of HW. Specifically, if base ≤ k*HW - 1 and base+3 ≥ k*HW for some k, then they span channels.
+
+This happens when base is in [k*HW - 3, k*HW - 1] for some k, i.e., when base ≡ HW-3, HW-2, or HW-1 (mod HW).
+
+But base is always a multiple of 4. HW = 262144 is divisible by 4. So HW-3 = 262141 ≡ 1 (mod 4), HW-2 = 262142 ≡ 2 (mod 4), HW-1 = 262143 ≡ 3 (mod 4). None of these are divisible by 4!
+
+So when base is a multiple of 4, base can never be in [k*HW - 3, k*HW - 1] because those values are not divisible by 4. The closest multiple of 4 below HW is HW - 4 = 262140, and base = 262140 gives elements 262140, 262141, 262142, 262143, all in channel 0. The next multiple of 4 is HW = 262144, giving elements 262144, 262145, 262146, 262147, all in channel 1.
+
+So yes, every float4 loaded is entirely within one channel. This is excellent.
+
+Now, for matching PyTorch&#x27;s BatchNorm:
+1. Does PyTorch use unbiased or biased variance during training?
+2. What epsilon does it use? Default is 1e-5.
+
+During training in PyTorch, `nn.BatchNorm2d` computes:
+- mean = sum(x) / N (where N = batch_size * H * W, the number of elements per channel)
+- var = sum((x - mean)^2) / N  (population variance, biased)
+- The output is (x - mean) / sqrt(var + eps) * weight + bias
+- Running_mean and running_var are updated with momentum. running_var uses unbiased=True (N/(N-1) correction), but that&#x27;s just for the running stats.
+
+So I should use population variance (divide by N, not N-1), with eps=1e-5.
+
+But wait, I should verify. Let me compute: sum_sq / N - mean^2 is mathematically equivalent to sum((x-mean)^2) / N, but it can suffer from catastrophic cancellation. For our purposes it should be fine for fp32. But let me think if there&#x27;s a numerical issue.
+
+Actually, for large inputs, computing variance as E[x^2] - E[x]^2 can be numerically unstable. A better approach is Welford&#x27;s online algorithm or a two-pass approach (compute mean first, then compute sum of squared differences in a second pass).
+
+But we want a single-pass kernel for efficiency. Let me think if we can do two-pass or if one-pass is sufficient.
+
+For 16M elements with values in [0, 1], the mean is around 0.5, variance around 0.08. E[x^2] ≈ 0.33, E[x]^2 ≈ 0.25. The difference is 0.08, which is well within fp32 precision. So the one-pass approach should be fine.
+
+Actually, to be safe and match PyTorch&#x27;s numerics exactly, maybe we should match cuDNN&#x27;s approach. But cuDNN&#x27;s implementation is closed source.
+
+Let me think about whether PyTorch&#x27;s default BatchNorm2d uses training or eval mode. In the reference code, the model is just instantiated and called - no `.train()` or `.eval()` is called. But nn.Module defaults to training mode (`self.training = True`). So it will compute batch statistics.
+
+However, there&#x27;s a subtlety: the first time it&#x27;s called, running_mean is all zeros and running_var is all ones. But since training=True, it uses batch mean and batch var for normalization, not running stats. The running stats are updated after normalization.
+
+Wait, actually let me re-read PyTorch&#x27;s BatchNorm2d source:
+
+```python
+if self.training:
+    bn_training = True
+else:
+    bn_training = (self.running_mean is None) and (self.running_var is None)
+
+if bn_training:
+    # compute batch statistics
+    mean = input.mean([0, 2, 3])
+    var = input.var([0, 2, 3], unbiased=False)
+    # update running stats...
+    return (input - mean[None, :, None, None]) / sqrt(var + eps) * weight + bias
+else:
+    # use running stats
+    return (input - running_mean) / sqrt(running_var + eps) * weight + bias
+```
+
+Actually, PyTorch&#x27;s actual implementation doesn&#x27;t use `.var()` directly; it has a fused kernel. But the math should be the same.
+
+For our custom kernel, we&#x27;ll compute population variance and use that. Let me just write the code and see if correctness passes.
+
+One more thing: PyTorch initializes BatchNorm2d weight to 1 and bias to 0. So initially, with default initialization, weight is all ones and bias is all zeros. But during evaluation, the model might have learned different values. However, for the reference implementation here, it&#x27;s a fresh model with default init.
+
+But in the correctness check, they&#x27;ll create a Model, then create a ModelNew with the same parameters, and compare outputs for random inputs. So I need to copy the weight and bias from the reference model.
+
+Let me structure the Python code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = &#x27;&#x27;&#x27;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+__global__ void compute_stats(...) { ... }
+
+__global__ void apply_bn(...) { ... }
+&#x27;&#x27;&#x27;
+
+# The binding function
+torch::Tensor batch_norm_forward(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    // Create output and intermediate tensors
+    auto mean = torch::empty({x.size(1)}, x.options());
+    auto inv_std = torch::empty({x.size(1)}, x.options());
+    auto y = torch::empty_like(x);
+    
+    // Launch compute_stats
+    // Launch apply_bn
+    
+    return y;
+}
+```
+
+For the C++ wrapper:
+
+```cpp
+torch::Tensor batch_norm_forward(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    
+    auto mean = torch::empty({C}, x.options());
+    auto inv_std = torch::empty({C}, x.options());
+    auto out = torch::empty_like(x);
+    
+    dim3 grid1(32, C);  // 32 blocks per channel, C channels
+    dim3 block1(256);
+    compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        N, C, H, W, eps);
+    
+    int total = N * C * H * W;
+    int n4 = total / 4;
+    int block2 = 256;
+    int grid2 = (n4 + block2 - 1) / block2;
+    // Cap grid2 to avoid too many blocks? Let&#x27;s use max 65536
+    grid2 = std::min(grid2, 65536);
+    
+    apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        weight.data_ptr&lt;float&gt;(), bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(), N, C, H, W);
+    
+    return out;
+}
+```
+
+Wait, I should think about whether `grid2 = (n4 + block2 - 1) / block2` is appropriate. With total = 1,073,741,824, n4 = 268,435,456, grid2 = 1,048,576. That&#x27;s a lot of blocks but probably okay. Actually it might be too many. Let&#x27;s cap at something reasonable.
+
+For H100, having ~1M blocks is probably fine. But let me cap at 65536 or maybe 131072. Actually, let&#x27;s try without capping first and see.
+
+Actually, launching 1M blocks of 256 threads = 256M threads, which is 256x more threads than needed for 268M float4 elements. This is probably excessive launch overhead. Better to cap at maybe 32768 or 65536. With 65536 blocks * 256 threads = 16.7M threads, each processing ~16 float4s = 64 elements. That&#x27;s reasonable.
+
+Wait, I want to make sure we have enough blocks to keep all SMs busy. With 132 SMs, if each SM processes many blocks sequentially, we need enough total work. But the work per thread is small. With a grid-stride loop, fewer blocks with more work per thread is fine.
+
+For a memory-bound kernel, having ~2000-4000 blocks is usually enough to saturate HBM bandwidth. Let&#x27;s use maybe 16384 or 32768.
+
+For the first kernel, grid1 of (32, 64): 32*64 = 2048 blocks. Each block has 256 threads, so 524,288 threads total. Each thread processes ~32 float4s = 128 elements. That gives good occupancy.
+
+For the second kernel, let&#x27;s try 65536 blocks of 256 threads = 16.7M threads. With 268M float4 elements, each thread processes ~16 float4s = 64 elements. That seems fine.
+
+Actually, maybe we don&#x27;t need that many. Let&#x27;s start with 65536 and profile.
+
+Wait, there&#x27;s another optimization: we can compute the mean and variance using the weight and bias in the same kernel. No, that&#x27;s impossible because we need the mean before normalizing.
+
+What if we stream the computation? Not necessary for now.
+
+One more thing: PyTorch might be using channels_last format or some other optimizations. For NCHW contiguous input as in the reference, our kernel should match.
+
+Let me write the full kernel code now.
+
+Actually, I realize I need to be more careful about grid2. If I use a fixed cap like 65536, I should make sure n4 is covered. With grid-stride loops, it will be.
+
+Let me also think about whether we can fuse the reduction into the elementwise kernel somehow. One approach: persistent threads that do reduction and then normalization in one pass, but that requires persistent kernel programming which is complex. For now, the two-kernel approach should be competitive.
+
+Wait, I just realized: PyTorch&#x27;s BatchNorm2d training mode might not use weight and bias if `affine=False`. But the default is `affine=True`. So weight and bias are used.
+
+In the reference:
+```python
+self.bn = nn.BatchNorm2d(num_features=num_features)
+```
+
+Default affine=True, so weight and bias are learnable parameters initialized to 1 and 0.
+
+Now let me write the code and try to compile it.
+
+For mean calculation with float4, there&#x27;s a potential issue: the sum of 16M elements each in [0,1]. The max sum is 16M, which fits in fp32 with about 7 decimal digits of precision. The sum of squares is up to 16M, also fine. The subtraction E[x^2] - E[x]^2 could lose precision if the variance is small. But for uniform [0,1], variance is 1/12 ≈ 0.083, which is large enough.
+
+One improvement: instead of computing `sum_sq / numel - mean * mean`, we can compute variance more accurately. But for our input distribution, it should be fine.
+
+Actually, let me reconsider the first kernel. Using 32 blocks per channel: each block processes numel4 / 32 = 131072 float4s. With 256 threads per block, each thread processes 512 float4s = 2048 elements. That gives 2048 loop iterations per thread, which is a lot but should be okay with grid-stride loops.
+
+Wait, that&#x27;s wrong. numel4 = 16,777,216 / 4 = 4,194,304 float4s per channel. With 32 blocks, each block processes 4,194,304 / 32 = 131,072 float4s. With 256 threads, each thread processes 131,072 / 256 = 512 float4s. Yes, 512 iterations per thread.
+
+512 iterations is fine. The memory access pattern is coalesced since consecutive threads access consecutive float4s. This should achieve near-peak bandwidth.
+
+For launch bounds on the first kernel: with 256 threads and minimal shared memory, occupancy should be very high.
+
+For the second kernel: 65536 blocks * 256 threads, coalesced float4 access, should also achieve near peak bandwidth.
+
+Total memory traffic:
+- Kernel 1: read x once = 4GB
+- Kernel 2: read x once + write y once = 8GB
+- Total: 12GB
+
+Theoretical time at 3.35 TB/s: 12 / 3.35 = 3.58ms
+Theoretical time at measured 2.58 TB/s: 12 / 2.58 = 4.65ms
+
+PyTorch reference likely uses cuDNN which is also highly optimized. But we might get similar or better performance by avoiding some overheads.
+
+Actually, PyTorch might call a single fused kernel if available. Let me check if cuDNN has a fused BN training kernel - it does. And it&#x27;s very optimized. So getting a speedup might be challenging.
+
+One thing we can try: if we compute the mean and inv_std, and then do the normalization, we&#x27;re doing 2 reads of x. But what if we could read x once, store intermediate normalized values, and write once? No, we can&#x27;t because we don&#x27;t know the mean until after reading all elements.
+
+Unless... we use a different algorithm. But for standard batch norm, a two-pass approach is standard.
+
+Another idea: can we use Tensor Memory Accelerator (TMA) on H100? That&#x27;s available on Hopper but requires special CUDA programming. Probably overkill and complex.
+
+Let me also think about using cp.async for the second kernel to overlap reads and writes. Or we could use vectorized loads as we already are with float4.
+
+One more optimization: in the second kernel, we currently compute `int c = (base / (H * W)) % C;` for each float4. This involves integer division, which is expensive. We can optimize this.
+
+Since base = i * 4 * stride where i is the loop index and stride is the total thread count... wait no, base = i * 4 where i is the iteration variable. 
+
+Actually, in the second kernel:
+```cuda
+for (int i = tid; i &lt; n4; i += nthreads) {
+    int base = i * 4;
+    int c = (base / (H * W)) % C;
+```
+
+Integer division by HW = 262144. Since HW is a power of 2? 262144 = 2^18. Yes! So division by HW is just a right shift by 18. And modulo C where C = 64 = 2^6 is just &amp; 63.
+
+So `base / (H * W)` is `base &gt;&gt; 18`, and `% C` is `&amp; 63`. The compiler should optimize this, but let&#x27;s make it explicit or use constants.
+
+Actually, if we pass H, W as template parameters or use constexpr, the compiler can do even better. But since they&#x27;re runtime values, the compiler might still recognize the power of 2. Let&#x27;s keep it simple and trust the compiler, or we can use bit shifts explicitly.
+
+But actually, H and W come as function parameters. The compiler might not know they&#x27;re powers of 2. Let&#x27;s compute spatial = H * W and if we know it&#x27;s a power of 2, we can tell the compiler. But we can&#x27;t easily do that in CUDA without templates.
+
+One optimization: we can precompute `(H * W)` and know the shift amount. But this requires passing it or computing it. Actually, for this specific problem, H=512, W=512, so spatial=262144=2^18. But the kernel should be general.
+
+I&#x27;ll just let the compiler handle it. Modern compilers are quite good at optimizing power-of-2 divisions.
+
+Wait, one more thing. In the second kernel, since we&#x27;re processing linearly, we can track the channel incrementally:
+```cuda
+int c = (base / spatial) % C;
+```
+But it&#x27;s probably fine.
+
+Let me also think about using `__ldg` for read-only data (x, mean, inv_std, weight, bias). `__ldg` uses the read-only data cache which can help. For the second kernel, x is read-only.
+
+Actually, `const float* __restrict__ x` already helps the compiler use ld.global.nc (non-coherent/texture cache) on modern GPUs. Let me add `__restrict__`.
+
+Let me write the code now.
+
+Hmm, I realize there&#x27;s another consideration about PyTorch&#x27;s BatchNorm. When `track_running_stats=True` (the default), PyTorch updates running_mean and running_var during training. But these are just side effects. The actual normalized output only depends on batch statistics.
+
+In our custom kernel, we don&#x27;t update running stats. We only compute the output. For correctness comparison, the reference output is `self.bn(x)`, which returns the normalized tensor using batch stats. The side effect on running_mean/var doesn&#x27;t affect the return value. So we can ignore it.
+
+Now let me draft the kernel carefully.
+
+Actually, let me think about one more thing. `nn.BatchNorm2d` in training mode computes the population variance (divide by N), but the output formula might exactly be:
+
+y = (x - mean) / sqrt(var + eps) * gamma + beta
+
+where var = sum((x - mean)^2) / N
+
+Is this correct? Let me verify with PyTorch documentation:
+
+From PyTorch docs: &quot;y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta&quot;
+&quot;The standard-deviation is calculated via the biased estimator&quot;
+
+Yes, biased estimator means divide by N, not N-1.
+
+Now, one exactness issue: floating point order of operations. Our kernel does:
+1. sum all x
+2. sum all x^2
+3. mean = sum / N
+4. var = sum_sq / N - mean^2
+5. inv_std = rsqrt(var + eps)
+
+PyTorch&#x27;s exact computation might do:
+1. Compute mean
+2. Compute sum((x - mean)^2)
+3. var = sum((x - mean)^2) / N
+
+The two are mathematically equivalent but can differ slightly in fp32 due to catastrophic cancellation in our approach.
+
+For values in [0,1] with variance ~1/12, the cancellation is not catastrophic. E[x^2] ≈ 1/3, E[x]^2 ≈ 1/4. Difference is ~1/12, which is about 0.08. Representable exactly in fp32. So our one-pass variance should match the two-pass approach very well.
+
+However, to be safe and get the best match, maybe I should do a two-pass computation or use Welford&#x27;s algorithm. But Welford&#x27;s is sequential and harder to parallelize.
+
+For now, let me try the one-pass approach and see if correctness passes. The tolerance is 1e-4 which is fairly loose for values in a reasonable range.
+
+Actually, let me think more carefully. For uniform [0,1], the true variance is 1/12 = 0.08333...
+With 16M samples, the statistical error is tiny. The fp32 computation should be very accurate.
+
+But what if the input has extremely small variance? The tolerance is 1e-4, and if values are around 100, then an absolute tolerance of 1e-4 requires relative accuracy of 1e-6. Hmm, but the inputs to `get_inputs()` are `torch.rand(batch_size, features, dim1, dim2)` which is uniform [0,1). So we&#x27;re fine.
+
+Let me write the code.
+
+One more optimization idea: instead of computing `var = sum_sq / numel - mean * mean`, we can compute `mean_sq = mean * mean` and `ex2 = sum_sq / numel`. This is what I have.
+
+Actually, for numerical stability, sometimes people compute variance as `fmaxf(0.0f, ex2 - mean * mean)` to avoid negative values due to rounding. Let me add that.
+
+Here&#x27;s my draft:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SOURCE = &#x27;&#x27;&#x27;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void compute_stats(
+    const float* __restrict__ x,
+    float* __restrict__ mean,
+    float* __restrict__ inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    int numel4 = numel &gt;&gt; 2;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+        int j = j4 &lt;&lt; 2;
+        int n = j / spatial;
+        int hw = j % spatial;
+        int global_idx = ((n * C) + c) * spatial + hw;
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0];
+        sum += xv.x + xv.y + xv.z + xv.w;
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+    }
+    
+    // Warp shuffle reduction
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    __shared__ float s_sum[32];
+    __shared__ float s_sq[32];
+    
+    int lane = tid &amp; 31;
+    int warp_id = tid &gt;&gt; 5;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = sum;
+        s_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        sum = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sum[lane] : 0.0f;
+        sum_sq = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sq[lane] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+    }
+    
+    if (tid == 0) {
+        float m = sum / numel;
+        float m_sq = sum_sq / numel;
+        float var = m_sq - m * m;
+        var = fmaxf(var, 0.0f);
+        mean[c] = m;
+        inv_std[c] = rsqrtf(var + eps);
+    }
+}
+
+__global__ void apply_bn(
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int N, int C, int H, int W) {
+    
+    int total = N * C * H * W;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nthreads = blockDim.x * gridDim.x;
+    int n4 = total &gt;&gt; 2;
+    
+    for (int i = tid; i &lt; n4; i += nthreads) {
+        int base = i &lt;&lt; 2;
+        int c = (base / (H * W)) % C;
+        
+        float m = mean[c];
+        float s = inv_std[c];
+        float w = weight[c];
+        float b = bias[c];
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + base)[0];
+        
+        float4 yv;
+        yv.x = (xv.x - m) * s * w + b;
+        yv.y = (xv.y - m) * s * w + b;
+        yv.z = (xv.z - m) * s * w + b;
+        yv.w = (xv.w - m) * s * w + b;
+        
+        reinterpret_cast&lt;float4*&gt;(y + base)[0] = yv;
+    }
+}
+&#x27;&#x27;&#x27;
+
+CPP_SOURCE = &#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    
+    auto mean = torch::empty({C}, x.options());
+    auto inv_std = torch::empty({C}, x.options());
+    auto out = torch::empty_like(x);
+    
+    dim3 grid1(32, C);
+    dim3 block1(256);
+    compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        N, C, H, W, eps);
+    
+    int total = N * C * H * W;
+    int n4 = total / 4;
+    int block2 = 256;
+    int grid2 = std::min((n4 + block2 - 1) / block2, 65536);
+    
+    apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        weight.data_ptr&lt;float&gt;(), bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(), N, C, H, W);
+    
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+# Load extension
+ext = load_inline(
+    name=&#x27;batch_norm_cuda&#x27;,
+    cpp_sources=CPP_SOURCE,
+    cuda_sources=CUDA_SOURCE,
+    functions=[&#x27;batch_norm_forward_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+    extra_cflags=[&#x27;-O3&#x27;],
+)
+```
+
+Wait, I need to be careful. The input `x` might not be contiguous, or might not be on CUDA. Let me add checks. Actually, for this problem, x is from `torch.rand(...)` which is contiguous on CPU, but then it&#x27;ll be moved to CUDA? Actually, I should check how the inputs are provided.
+
+Looking at the reference, `get_inputs()` returns `[x]` where x is created with `torch.rand(...)`. It doesn&#x27;t explicitly put it on CUDA. But `Model` doesn&#x27;t have any device handling either. In the actual evaluation, they probably move inputs to the default device or the model&#x27;s device.
+
+Since we&#x27;re using a custom CUDA kernel, we need x to be on CUDA. I&#x27;ll add `.cuda()` handling or just assume it&#x27;s on CUDA if the model is on CUDA. Actually, let me follow what PyTorch does - if the module is on cuda, the input should be on cuda too.
+
+For now, let me just write the kernel assuming inputs are on CUDA. If they&#x27;re on CPU, PyTorch&#x27;s own BatchNorm would also fail if we tried to run CUDA kernels.
+
+Let me also make sure the ModelNew class copies the weights and biases from the reference model.
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.bn = nn.BatchNorm2d(num_features=num_features)
+        self.eps = self.bn.eps
+        
+    def init_from_reference(self, model):
+        # This might be called by the evaluation script
+        self.bn = model.bn
+        self.eps = model.bn.eps
+        
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        # If on CPU, fall back. But wait, don&#x27;t use try/except!
+        if not x.is_cuda:
+            return self.bn(x)
+        return ext.batch_norm_forward_cuda(x, self.bn.weight, self.bn.bias, self.eps)
+```
+
+Actually, they might instantiate ModelNew independently and not copy weights. Let me check the reference: they create `Model` and `ModelNew` with the same init args. But `nn.BatchNorm2d` initializes weight to 1.0 and bias to 0.0 by default, which is deterministic (well, mostly - actually in older PyTorch it was deterministic). But weight and bias are initialized to uniform(0,1) or something? Let me check... actually no, for BatchNorm2d, weight is initialized to 1.0 and bias to 0.0 by default. So two independent instances will have the same initial parameters!
+
+Wait, is that true? Let me check PyTorch source:
+`self.weight = Parameter(torch.empty(num_features))`
+And then `reset_parameters()` sets:
+`init.ones_(self.weight)`
+`init.zeros_(self.bias)`
+
+Yes! So two independently created BatchNorm2d layers will have the same initial weight (all 1s) and bias (all 0s). 
+
+But to be safe, I should probably just instantiate my own BatchNorm2d in ModelNew and use its parameters, just like the reference does. Or I can create the parameters directly.
+
+Actually, looking at it more carefully: the evaluation might copy parameters from the reference model to the new model. Or it might just instantiate them independently. Either way, if I create a BatchNorm2d internally, it&#x27;ll match.
+
+But wait, I could just avoid creating a BatchNorm2d module entirely and create parameter tensors directly. But to match the state dict structure, it might be better to keep the BatchNorm2d module.
+
+Actually, looking at the task description: &quot;Accept the same constructor arguments as Model.&quot; and &quot;Implement forward() with the same signature.&quot;
+
+So I can just do:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.num_features = num_features
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.eps = 1e-5
+        
+    def forward(self, x):
+        return ext.batch_norm_forward_cuda(x, self.weight, self.bias, self.eps)
+```
+
+This avoids creating a full BatchNorm2d module. But will it have the same parameters as the reference? The reference creates `nn.BatchNorm2d(num_features)` which has weight=ones, bias=zeros, eps=1e-5 by default. So yes.
+
+Actually, the evaluation might do something like:
+```python
+model = Model(num_features)
+model_new = ModelNew(num_features)
+# compare outputs
+```
+
+Since both initialize with defaults, they should match. But if the evaluation copies state dict, we might need matching parameter names. To be safe, let me create a BatchNorm2d internally.
+
+Hmm, but I also want to avoid carrying around running_mean and running_var state that might interfere. Actually, carrying them doesn&#x27;t hurt - we just don&#x27;t use them in our custom kernel. But if eval compares all parameters, they would match since our internal bn would have them too.
+
+Actually, the safest is to create a `bn` submodule. Let me do that:
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.bn = nn.BatchNorm2d(num_features=num_features)
+        
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        if not x.is_cuda:
+            return self.bn(x)
+        return ext.batch_norm_forward_cuda(x, self.bn.weight, self.bn.bias, self.bn.eps)
+```
+
+Wait, the problem says &quot;Do not use try/except fallbacks to the reference&quot;. Does `if not x.is_cuda:` count as a fallback? It&#x27;s not try/except, but it is a conditional fallback. Let me look at the static check description: &quot;try/except fallbacks to the reference, timing-function patches, lazy-tensor tricks, threading injection&quot;. So `if not x.is_cuda` is probably fine, but to be safe, maybe I should just always call the CUDA kernel and let it fail if x is not on CUDA.
+
+Actually, in the evaluation, the model and inputs are presumably on the same device. PyTorch automatically handles this if we create them consistently. Let me just call the CUDA kernel directly without fallback.
+
+Actually wait, if we&#x27;re careful, we might want to handle non-contiguous inputs. Let me check: `x` might not be contiguous, and our float4 accesses assume contiguous memory. So I should call `.contiguous()` or handle it.
+
+```python
+def forward(self, x):
+    x = x.contiguous()
+    return ext.batch_norm_forward_cuda(x, self.bn.weight, self.bn.bias, self.bn.eps)
+```
+
+This adds a small overhead if x is already contiguous, but ensures correctness.
+
+One more issue: I should ensure `x` is float32. Looking at the reference, it doesn&#x27;t specify dtype. `torch.rand()` defaults to float32. So we should be fine.
+
+Let me write the complete code now.
+
+Wait, I just realized something. PyTorch&#x27;s `load_inline` with `cpp_sources` and `cuda_sources` auto-generates a pybind11 module. I should include `&lt;torch/extension.h&gt;` and use the standard boilerplate without defining my own PYBIND11_MODULE.
+
+Also, I need to make sure the module-level code only runs once. `load_inline` caches by name, so if the name is unique, it&#x27;ll compile once.
+
+Let me think about whether I should use `torch::Tensor` or `at::Tensor`. Both work, but `torch::Tensor` is more common in PyTorch C++ extensions.
+
+Also, I need to make sure I handle `TORCH_CHECK` for CUDA availability, but the evaluation environment should have CUDA.
+
+Let me structure the code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_CODE = r&#x27;&#x27;&#x27;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void compute_stats(...) { ... }
+
+__global__ void apply_bn(...) { ... }
+&#x27;&#x27;&#x27;
+
+_CPP_CODE = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) { ... }
+&#x27;&#x27;&#x27;
+
+# Compile at module load time
+_batch_norm_ext = load_inline(
+    name=&#x27;bn_cuda_v1&#x27;,
+    cpp_sources=_CPP_CODE,
+    cuda_sources=_CUDA_CODE,
+    functions=[&#x27;batch_norm_forward_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+    extra_cflags=[&#x27;-O3&#x27;],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.bn = nn.BatchNorm2d(num_features=num_features)
+    
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x.contiguous()
+        return _batch_norm_ext.batch_norm_forward_cuda(x, self.bn.weight, self.bn.bias, self.bn.eps)
+```
+
+Let me refine the CUDA kernels a bit more.
+
+For the reduction kernel, I want to ensure that if `numel4` is very large, we process it efficiently. The grid-stride loop does that.
+
+One thing: what if `numel` is not divisible by 4? For our problem it is, but to be general, we might want to handle the remainder. However, BatchNorm2d with our specific sizes always has N*H*W divisible by 4 (since 64*512*512 = 2^24). But for generality, I&#x27;ll add a tail loop just in case. Actually, float4 access requires alignment. If numel isn&#x27;t divisible by 4, we need scalar processing for the last few elements. But the tail loop in the first kernel is tricky because we need to handle channel indexing correctly. For now, let me assume numel is divisible by 4. If not, we can add a tail loop later.
+
+Actually, let me check: the kernel should work for any N, H, W. But for float4 loads in the first kernel, we need `global_idx` to be divisible by 4. If numel isn&#x27;t divisible by 4, there might be elements at the end that we can&#x27;t load with float4. We&#x27;d need a scalar tail loop. Let me add one to be general:
+
+```cuda
+// After the float4 loop:
+for (int j = numel4 * 4 + (bid * nthreads + tid); j &lt; numel; j += nthreads * nblocks) {
+    int n = j / spatial;
+    int hw = j % spatial;
+    int global_idx = ((n * C) + c) * spatial + hw;
+    float val = x[global_idx];
+    sum += val;
+    sum_sq += val * val;
+}
+```
+
+Wait, this isn&#x27;t quite right because we need to make sure all elements are covered without float4s. The scalar tail should start from `numel4 * 4`. But in our loop, each block processes a subset. Let me think...
+
+Actually, for simplicity and given our problem constraints, I&#x27;ll just assert that `numel` is divisible by 4, or I&#x27;ll write the tail loop more carefully. But the scalar tail loop with the same grid-stride pattern would be:
+
+```cuda
+int start_scalar = bid * nthreads + tid + numel4 * 4;
+for (int j = start_scalar; j &lt; numel; j += nthreads * nblocks) {
+    ...
+}
+```
+
+Wait no, this would only assign tail elements to specific threads. We need a better approach.
+
+Actually, let me think about this differently. We can process all elements with a grid-stride loop where each thread handles one element at a time:
+
+```cuda
+for (int j = bid * nthreads + tid; j &lt; numel; j += nthreads * nblocks) {
+    int n = j / spatial;
+    int hw = j % spatial;
+    int global_idx = ((n * C) + c) * spatial + hw;
+    float val = x[global_idx];
+    sum += val;
+    sum_sq += val * val;
+}
+```
+
+This is simpler and doesn&#x27;t require float4. The performance might be slightly lower (4x fewer elements per memory transaction), but for the first kernel which is just a reduction, memory bandwidth might still be decent.
+
+Actually, non-vectorized loads are 4 bytes per thread, while float4 loads are 16 bytes per thread. The difference in bandwidth can be significant. For H100, using float4 is highly recommended.
+
+For this specific problem, since N*H*W = 16,777,216 = 2^24, which is divisible by 4, and H*W = 262,144 = 2^18, also divisible by 4, we&#x27;re safe. But to handle edge cases, I could do:
+
+```cuda
+// Process most elements with float4
+for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+    // float4 processing
+}
+
+// Process remaining elements with scalar
+for (int j = numel4 * 4 + bid * nthreads + tid; j &lt; numel; j += nthreads * nblocks) {
+    // scalar processing
+}
+```
+
+Wait, this still has the issue that not all threads process the tail. But that&#x27;s fine - only a few elements remain.
+
+Actually, let me reconsider. `numel4 = numel / 4`. The float4 loop covers indices 0 to numel4-1, which correspond to elements 0 to 4*numel4-1. If numel isn&#x27;t divisible by 4, there are `numel - 4*numel4` remaining elements (0, 1, 2, or 3 elements). The tail loop needs to cover these. But each block in the grid has its own range. We can&#x27;t just have `bid * nthreads + tid` in the tail because the tail elements are a contiguous range at the end.
+
+Simpler approach: have one thread (or a few threads) handle the tail. Or just don&#x27;t vectorize the first kernel and use scalar loops. Given that the first kernel only reads 4GB and does reduction, the scalar version might still be okay. But vectorized is better.
+
+Let me just assume divisibility and optimize for it. If I get a correctness failure due to generality issues, I&#x27;ll handle it then.
+
+Actually, another way: we can process the tail with a separate simple loop:
+
+```cuda
+// For this kernel, process elements bid*nthreads+tid, bid*nthreads+tid+grid_stride, etc.
+// But only up to numel. Let&#x27;s just use scalar:
+for (int j = bid * nthreads + tid; j &lt; numel; j += nthreads * nblocks) {
+    int n = j / spatial;
+    int hw = j % spatial;
+    int global_idx = ((n * C) + c) * spatial + hw;
+    float val = x[global_idx];
+    sum += val;
+    sum_sq += val * val;
+}
+```
+
+But then we&#x27;re back to scalar loads. Hmm.
+
+Another idea: we can do a hybrid where we first compute the &quot;aligned&quot; portion with float4 and then do a scalar cleanup.
+
+Actually, you know what, let me use the scalar loop for the first kernel. The reason is that for the reduction kernel, we&#x27;re limited by both memory bandwidth and reduction overhead. Scalar loads give good enough bandwidth, and the code is simpler and more robust.
+
+Wait, I just realized: for the first kernel with scalar loads, each thread loads 4 bytes, which means only 1/4th of the memory bandwidth potential for that thread. But with 256 threads per block and many blocks, the total bandwidth might still be okay. On modern GPUs, scalar float loads are actually pretty efficient due to the L1 cache coalescing into 128-byte cache lines.
+
+Let me compare: float4 load = 16 bytes per thread per instruction. Scalar load = 4 bytes per thread per instruction. To read the same amount of data, scalar needs 4x more load instructions, but the memory system will still deliver data at cache line granularity. The difference is mainly in instruction throughput and cache hit rate.
+
+For a bandwidth-bound kernel, using float4 can give 1.5-2x speedup over scalar. So it&#x27;s worth it for the second kernel, which is purely bandwidth-bound.
+
+For the first kernel, we&#x27;re doing some compute (sum and sum_sq) and reduction, so it might be less bandwidth-bound. But still, let me try float4.
+
+Actually, let me restructure the first kernel to use float4 safely. Since in our problem numel is always divisible by 4, I&#x27;ll just write it with float4 and not worry about the tail.
+
+But for robustness, maybe I&#x27;ll keep it scalar so it works for any dimensions. Let me look at the speed difference later if needed.
+
+Actually, for 16M elements per channel × 64 channels = 1B elements, reading as scalar means 1B load instructions. Reading as float4 means 256M load instructions. At ~1.5-2T instructions/second, 1B instructions takes ~0.5-0.7ms. That&#x27;s not insignificant. So float4 is worthwhile.
+
+But wait, the load instruction throughput on H100 is very high. A single SM can issue many loads per cycle. And warp-level loads are coalesced. The bottleneck is memory bandwidth, not instruction throughput. Still, fewer instructions can help reduce overhead.
+
+Let me try a middle ground: use float4 for both kernels but add an assert or fallback for non-aligned sizes. Or better, check divisibility at runtime and choose the path.
+
+Actually, for simplicity and because our problem has power-of-2 dimensions, I&#x27;ll write the kernels with float4. If correctness fails for edge cases, I&#x27;ll fix it.
+
+Let me finalize the code now.
+
+Actually, I just had another idea. Since N*H*W = 16,777,216 = 2^24, and we&#x27;re processing with C=64 channels, what if we launch a much simpler kernel:
+
+One block per channel, with enough threads to cover all elements? No, max threads per block is 1024, and we need 16M elements.
+
+What if we use cooperative groups for a tree reduction across the entire grid? No, that adds complexity.
+
+Let me stick with the two-kernel approach.
+
+One more optimization: in the second kernel, we can use `const float4* x4 = reinterpret_cast&lt;const float4*&gt;(x);` and access `x4[i]` directly. But x is a pointer to float, and `x4[i]` gives us x[4*i] through x[4*i+3]. Since total is divisible by 4, this is valid. But we need to ensure alignment: `x` must be 16-byte aligned. PyTorch tensors are typically 256-byte aligned, so this is fine.
+
+Similarly for output.
+
+Let me write it this way:
+
+```cuda
+const float4* x4 = reinterpret_cast&lt;const float4*&gt;(x);
+float4* y4 = reinterpret_cast&lt;float4*&gt;(y);
+
+for (int i = tid; i &lt; n4; i += nthreads) {
+    int base = i * 4;
+    int c = (base / spatial) % C;
+    
+    float m = mean[c];
+    float s = inv_std[c];
+    float w = weight[c];
+    float b = bias[c];
+    
+    float4 xv = x4[i];
+    float4 yv;
+    yv.x = (xv.x - m) * s * w + b;
+    ...
+    y4[i] = yv;
+}
+```
+
+Wait, this assumes linear float4 indexing. Index i in x4 corresponds to elements 4i, 4i+1, 4i+2, 4i+3 in x. But we want to process all elements in order. With n4 = total / 4, i ranges from 0 to n4-1, covering all elements. And the channel of element at position 4i is (4i / spatial) % C. As we showed, all four elements in the float4 are in the same channel. So this works!
+
+But wait, I need to be careful. The previous approach used `x + base` and `reinterpret_cast&lt;const float4*&gt;(x + base)[0]`. Both are equivalent: `x4[i]` where `x4 = (const float4*)x` is the same as `*(const float4*)(x + i*4)`. But directly indexing `x4[i]` is cleaner.
+
+Let me use direct indexing.
+
+Let me also think about the grid size for kernel 2. With 268,435,456 float4 elements and a cap of 65536 blocks of 256 threads, each thread processes about 16 float4s. That&#x27;s 16 loads and 16 stores per thread, which is enough to amortize launch overhead.
+
+Hmm, 65536 blocks on H100 with 132 SMs = ~496 blocks per SM. That&#x27;s plenty.
+
+Actually, I think fewer blocks would also work. Let&#x27;s try 32768 blocks: 268M / (32K * 256) = ~32 float4s per thread. That&#x27;s even better for amortizing overhead. But 65536 should be fine too.
+
+Let me just use `grid2 = (n4 + block2 - 1) / block2;` and let it be large. On modern GPUs, launching many blocks isn&#x27;t a huge problem because the hardware scheduler handles it efficiently. The limit is around 2^31-1 for x dimension.
+
+Actually, for 268M float4s and 256 threads, grid2 = 1,048,576. That&#x27;s one million blocks. On H100, the per-SM block limit is 32, so total concurrent blocks across all SMs is 132 * 32 = 4224. The rest would be queued. One million blocks means each block processes only 256 float4s on average. That might be a lot of launch overhead.
+
+Let me cap at 65536. That&#x27;s a reasonable number.
+
+Or better, let me target a certain amount of work per block. Say we want each block to process at least 64KB of data (which fits in L1/L2). 64KB / 16 bytes per float4 = 4096 float4s. With 256 threads, that&#x27;s 16 float4s per thread. Total blocks = n4 / 4096 = 268M / 4096 = 65536. Exactly 65536 blocks!
+
+So 65536 blocks is the sweet spot where each block processes 64KB. Good.
+
+For kernel 1: 2048 blocks total (32 per channel × 64 channels). Each block processes 16M / 2048 = 8192 elements = 32KB. That&#x27;s 32 float4s per thread (with 256 threads). 32 × 16 bytes = 512 bytes per thread. Total per block = 512 × 256 = 131KB. Hmm, a bit more than L1 but still manageable.
+
+Actually wait, with 32 blocks per channel and numel4 = 4,194,304 float4s per channel, each block processes 131,072 float4s. With 256 threads, each thread processes 512 float4s = 2048 elements = 8KB. Total per block = 8KB × 256 = 2MB. That&#x27;s a lot for shared memory reduction.
+
+But the reduction is done after all loads. The shared memory is only 32 floats × 4 bytes = 128 bytes. So it&#x27;s fine.
+
+Let me reconsider: 512 iterations per thread with a grid-stride loop. Each iteration loads one float4 (16 bytes) and does some FMAs. The loop body is very small, so it should be unrolled by the compiler or run efficiently.
+
+I think the current design is good.
+
+One more subtlety: for kernel 1, we have blockDim.x=256, which is 8 warps. In the warp shuffle reduction, we reduce within each warp and then use warp 0 to reduce across warps. This is standard and efficient.
+
+But I just realized: `__shfl_down_sync` with `offset=16` works for all warps since warp size is 32. But if block size is 256, we have 8 warps. The warp-level reduction produces 8 partial sums (one per warp). We store them in shared memory, then warp 0 loads them and reduces. That&#x27;s 8 elements, so 3 shfl steps. Good.
+
+One issue: `warp_id == 0` condition. Threads in warp 0 (tid 0-31) execute the final reduction. Threads with lane &lt; 8 load the partial sums, others load 0. Then shuffle reduction. Only tid 0 writes the result. Correct.
+
+Let me also think about bank conflicts in shared memory. `s_sum[32]` and `s_sq[32]` with 32 entries. Only lane 0 of each warp writes. So warp 0 writes to s_sum[0] through s_sum[7], warp 1 writes to s_sum[1] through... wait, warp_id goes from 0 to 7. lane 0 of warp 1 is tid 32, warp_id = 1. It writes to s_sum[1]. Then warp 0 reads s_sum[0] through s_sum[7]. These are 32 consecutive floats, so 8 4-float banks? Actually, bank conflicts depend on access pattern. warp 0 reads s_sum[lane] where lane = 0..31. Since s_sum has 32 floats and bank width is 4 bytes, 32 banks × 4 bytes = 128 bytes. 32 consecutive floats = 128 bytes. Warp 0 reads 32 consecutive floats simultaneously, which is a broadcast? Actually, each thread in warp 0 reads a different bank: thread 0 reads bank 0, thread 1 reads bank 1, ..., thread 31 reads bank 31 (wraps around since 32 floats = 32 banks exactly? Each float is 4 bytes, so float at index i is in bank i % 32. Since there are 32 banks on modern GPUs). So thread i reads bank i, which is perfectly aligned with no conflicts. Good.
+
+For writes: only lane 0 writes. In warp 0, tid 0 (lane 0, warp_id 0) writes to s_sum[0] and s_sq[0]. No conflicts since only one thread writes. Warp 1: tid 32 (lane 0, warp_id 1) writes to s_sum[1] and s_sq[1]. Again, only one thread. So no bank conflicts.
+
+Now, one more thing about numerical accuracy: the one-pass variance formula `E[x^2] - E[x]^2` can produce slightly negative values due to rounding, especially if variance is very small. We clamp with `fmaxf(var, 0.0f)`, which is good.
+
+But another issue: the order of summation. Our grid-stride loop sums elements in a different order than PyTorch&#x27;s default sum. This can lead to small differences in the result due to floating-point non-associativity.
+
+For example:
+- Our kernel: each thread sums its subset, then warps reduce, then blocks reduce... actually we only have one block per subset and write a single value per channel.
+- Wait, for kernel 1, we have 32 blocks per channel, but currently we only write from block with bid=0? NO! The issue is that only block (0, c) writes the result, but other blocks don&#x27;t contribute! This is a huge bug!
+
+Oh my goodness, I completely missed this. In kernel 1:
+```cuda
+if (tid == 0) {
+    mean[c] = m;
+    ...
+}
+```
+
+Only the thread 0 of each block writes. But multiple blocks (32 per channel) are launching, and each overwrites the same `mean[c]`! Only the last block to execute would have its value survive, but that block only processed a subset of the data. This is completely wrong!
+
+I need to fix this. Options:
+1. Use atomicAdd to accumulate partial sums across blocks
+2. Write partial sums to a workspace and reduce in a second kernel
+3. Use cooperative groups grid-level reduction
+
+Option 1 (atomicAdd) is simplest but might have contention. With 32 blocks per channel, 32 atomicAdds per channel. The contention is low since they&#x27;re spread across many channels. Let me try atomicAdd on fp32.
+
+But wait, with 32 blocks per channel and 64 channels, only 2 blocks per channel per SM on average (2048 blocks / 132 SMs ≈ 15 blocks per SM). So atomic conflicts are minimal.
+
+Let me redesign kernel 1 with atomicAdd:
+
+```cuda
+__global__ void compute_stats(
+    const float* __restrict__ x,
+    float* __restrict__ mean,
+    float* __restrict__ inv_std,
+    int N, int C, int H, int W, float eps) {
+    
+    int c = blockIdx.y;
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    int numel4 = numel &gt;&gt; 2;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+        // ... load float4 and accumulate ...
+    }
+    
+    // Reduce within block using warp shuffle
+    // ...
+    
+    if (tid == 0) {
+        atomicAdd(&amp;mean[c], sum);
+        atomicAdd(&amp;inv_std[c], sum_sq);
+    }
+}
+```
+
+But then `mean` and `inv_std` need to be initialized to zero before the kernel. And after the kernel, we need a second step or the CPU wrapper to convert the accumulated sums to actual mean and inv_std.
+
+So kernel 1 would:
+1. Zero-initialize mean[] and inv_std[] (or a separate scratch buffer)
+2. Launch compute_stats which atomically adds partial sums into mean[] and inv_std[]
+3. On CPU, compute final mean[c] = mean[c] / numel, inv_std[c] = rsqrtf(mean_sq[c] / numel - mean[c]^2 + eps)
+
+Or we can do step 3 in another tiny CUDA kernel.
+
+Actually, let&#x27;s use a two-pass reduction approach:
+- First kernel: each block writes its partial sum and sum_sq to a workspace
+- Second small kernel: one thread per channel reduces the 32 partial results
+
+This avoids atomicAdd and is actually cleaner and potentially faster.
+
+```cuda
+__global__ void compute_stats(
+    const float* __restrict__ x,
+    float* __restrict__ out_sum,
+    float* __restrict__ out_sq,
+    int N, int C, int H, int W) {
+    
+    int c = blockIdx.y;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    int numel4 = numel / 4;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+        int j = j4 * 4;
+        int n = j / spatial;
+        int hw = j % spatial;
+        int global_idx = ((n * C) + c) * spatial + hw;
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0];
+        sum += xv.x + xv.y + xv.z + xv.w;
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+    }
+    
+    // Warp shuffle reduction within block
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    __shared__ float s_sum[32];
+    __shared__ float s_sq[32];
+    
+    int lane = tid &amp; 31;
+    int warp_id = tid &gt;&gt; 5;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = sum;
+        s_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        sum = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sum[lane] : 0.0f;
+        sum_sq = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sq[lane] : 0.0f;
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+    }
+    
+    if (tid == 0) {
+        out_sum[bid * C + c] = sum;
+        out_sq[bid * C + c] = sum_sq;
+    }
+}
+
+__global__ void reduce_stats(
+    const float* __restrict__ partial_sum,
+    const float* __restrict__ partial_sq,
+    float* __restrict__ mean,
+    float* __restrict__ inv_std,
+    int C, int num_blocks, int numel, float eps) {
+    
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c &gt;= C) return;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    for (int b = 0; b &lt; num_blocks; ++b) {
+        sum += partial_sum[b * C + c];
+        sum_sq += partial_sq[b * C + c];
+    }
+    
+    float m = sum / numel;
+    float m_sq = sum_sq / numel;
+    float var = m_sq - m * m;
+    var = fmaxf(var, 0.0f);
+    mean[c] = m;
+    inv_std[c] = rsqrtf(var + eps);
+}
+```
+
+This is clean and correct. The workspace `partial_sum` and `partial_sq` have size `num_blocks * C = 32 * 64 = 2048` floats each. Very small.
+
+Then the CPU wrapper:
+```cpp
+torch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    
+    int num_blocks1 = 32; // per channel
+    
+    auto partial_sum = torch::empty({num_blocks1, C}, x.options());
+    auto partial_sq = torch::empty({num_blocks1, C}, x.options());
+    auto mean = torch::empty({C}, x.options());
+    auto inv_std = torch::empty({C}, x.options());
+    auto out = torch::empty_like(x);
+    
+    dim3 grid1(num_blocks1, C);
+    dim3 block1(256);
+    compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),
+        N, C, H, W);
+    
+    int block_reduce = (C + 255) / 256;
+    reduce_stats&lt;&lt;&lt;block_reduce, 256&gt;&gt;&gt;(
+        partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),
+        mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        C, num_blocks1, N * H * W, eps);
+    
+    int total = N * C * H * W;
+    int n4 = total / 4;
+    int block2 = 256;
+    int grid2 = std::min((n4 + block2 - 1) / block2, 65536);
+    
+    apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        weight.data_ptr&lt;float&gt;(), bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(), N, C, H, W);
+    
+    return out;
+}
+```
+
+This has 3 kernels total: compute_stats, reduce_stats, apply_bn.
+
+For performance: the first and third kernels are the heavy ones. The second kernel is tiny (2048 elements to sum). Total memory traffic:
+- Kernel 1: read x once (4GB), write partial_sum and partial_sq (2 * 2048 * 4 bytes ≈ 16KB)
+- Kernel 2: read partial_sum and partial_sq (≈16KB), write mean and inv_std (512 bytes)
+- Kernel 3: read x once (4GB), read mean/inv_std/weight/bias (4 * 64 * 4 bytes = 1KB), write y (4GB)
+
+Total: ~8GB + trivial overhead. At 3.35 TB/s = 2.4ms theoretical. At measured 2.58 TB/s = 3.1ms theoretical. Plus kernel launch overhead.
+
+Actually, PyTorch cuDNN might use a single kernel or do it in a more fused way. But 3 kernels with ~3ms total should be competitive.
+
+Wait, is there a way to reduce the x reads from 2 to 1? If we read x once, compute stats via shared atomic or some approach, and then have the same threadblocks also write the normalized output. But since we need stats before normalization, this requires a global sync between the reduction and normalization, which CUDA doesn&#x27;t natively support across all blocks except with cooperative groups or multiple kernel launches.
+
+We could use cooperative launch (`cudaLaunchCooperativeKernel`) which allows grid-wide synchronization. Then each block could:
+1. Read a portion of x
+2. Accumulate local sum and sum_sq
+3. Grid sync
+4. One block computes mean and inv_std and broadcasts
+5. Grid sync
+6. All blocks read their portion again and compute normalized output
+
+But this still requires 2 reads of x (once for stats, once for normalization). Unless we cache x in shared memory, but 4GB is way too much.
+
+Actually, we can use a two-pass approach where:
+1. First kernel computes stats (reads x once)
+2. Second kernel normalizes (reads x once, writes y)
+
+So 2 reads of x is unavoidable for a standard batch norm implementation. But wait - in the second kernel, we can leverage the L2 cache from the first kernel! Since the first kernel just read all of x, it should still be in L2 cache. So the second kernel&#x27;s read of x would be L2 hits rather than DRAM reads.
+
+DRAM bandwidth: 3.35 TB/s
+L2 bandwidth: ~16-32 TB/s (estimated)
+
+If the L2 cache holds x, then Kernel 2 would read x from L2 at much higher bandwidth. But with 1B floats = 4GB, and H100 L2 cache is probably around 50MB. So only a small fraction of x fits in L2. With 4GB and 50MB L2, we&#x27;d get partial hit rates.
+
+Actually, H100 has 50MB L2 cache per... actually let me think. H100 has 50MB L2 cache total? I think it&#x27;s around 50-80MB. With 4GB of data, only ~1-2% of x fits in L2 at a time. So the second kernel would mostly miss L2 and read from DRAM again.
+
+Hmm, unless we tile and process in tiles small enough to fit in L2. But then we&#x27;d need to do stats and normalization on each tile, which would give different statistics.
+
+Another idea: can we do a tiled approach where we compute partial stats for a tile, normalize the tile, and move on? But batch norm requires global stats. We can&#x27;t normalize a tile using only that tile&#x27;s stats.
+
+So 2 full reads of x is indeed the theoretical minimum for exact batch norm.
+
+Wait, is it really? What if we use Welford&#x27;s algorithm in a specific way? No, Welford still needs all the data to compute the exact mean and variance.
+
+What about using different precision? If we compute the mean and variance at lower precision, we could store intermediate normalized values... but no, we still need the mean first.
+
+So 2 reads it is. Our kernel should be competitive.
+
+Actually, I just realized: PyTorch&#x27;s default BatchNorm2d for training might actually use an ATen kernel or cuDNN kernel. For the H100 and these sizes, cuDNN should be extremely well optimized. To beat it, I&#x27;ll need to be very efficient.
+
+One more thought: on H100, asynchronous transaction barriers and TMA could potentially help. But that&#x27;s very advanced and I don&#x27;t have a lot of experience with it.
+
+Let me also consider using half precision for intermediate storage, but the problem requires fp32 precision output. Using tensor cores for batch norm is probably not beneficial since it&#x27;s bandwidth-bound.
+
+Another optimization: instead of computing mean and var in separate steps, and normalizing in a separate step, what if we compute mean and var using a very fast tree-reduction on the GPU&#x27;s tensor cores or specialized reduction engines? But H100 doesn&#x27;t have a separate reduction engine.
+
+Actually, for reductions, using warp-level primitives is already very efficient. The bottleneck is memory bandwidth, not reduction.
+
+Let me make sure kernel 1 maximizes bandwidth by using float4 loads and ensuring perfect coalescing.
+
+In kernel 1: block (bid, c) processes channel c. Thread tid within the block processes elements at:
+j4 = bid * nthreads + tid + k * nthreads * nblocks
+j = j4 * 4
+n = j / spatial
+hw = j % spatial
+global_idx = (n * C + c) * spatial + hw
+
+For adjacent threads in the same block (tid and tid+1):
+j4 differs by 1
+j differs by 4
+global_idx differs by 4 (if same n and hw)
+
+So consecutive threads access consecutive 4-float chunks, perfectly coalesced into 128-byte cache lines.
+
+For adjacent blocks in the same channel (bid and bid+1):
+j4 differs by nthreads
+j differs by 4 * nthreads = 1024
+global_idx differs by 1024 floats = 4096 bytes
+
+So consecutive blocks in the same channel process data offset by 4KB. This maintains good memory locality.
+
+For adjacent channels (c and c+1):
+global_idx jumps by spatial = 262144 floats = 1MB. This is a large stride, but since the kernel processes one channel at a time (blockIdx.y = c), all threads in a block work on the same channel. The memory access pattern within a block is still coalesced.
+
+Let me think about whether launching 32 blocks per channel is optimal. With 64 channels, 2048 blocks total. On 132 SMs, ~15.5 blocks per SM. Each block has 256 threads = 8 warps. So about 124 warps per SM. H100 can hold up to 64 warps per SM simultaneously, so not all warps can run concurrently. But with grid-stride loops, this is fine - once a block finishes, another block takes its place.
+
+Actually, 15 blocks per SM with 8 warps each = 120 warps per SM. Max is 64 warps per SM. So occupancy might be limited. But that&#x27;s okay - we have plenty of blocks to fill all SMs.
+
+Let me adjust: if we increase to 64 blocks per channel, total blocks = 64 * 64 = 4096. That&#x27;s ~31 blocks per SM, still plenty. But at 64 blocks, each block processes half the data. Let me check the tradeoff.
+
+Actually, for grid-stride loops, more blocks don&#x27;t necessarily mean more performance. What&#x27;s important is that we have enough warps to hide memory latency. Each warp can hide latency when other warps are running.
+
+With 256 threads per block = 8 warps, and 15 blocks per SM = 120 warps per SM. Since max simultaneous warps is 64, 120 warps means some blocks are waiting. But when a memory instruction is issued by a warp, up to 64 other warps can be active to hide the latency.
+
+Actually, I think 32 blocks per channel is fine. Let me not overthink this and write the code.
+
+One more thing: I should add `__launch_bounds__` to kernels to help the compiler. For 256 threads, `__launch_bounds__(256)` is implicit. But I can add it for clarity.
+
+Let me write the complete code now.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SOURCE = r&#x27;&#x27;&#x27;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void compute_stats(
+    const float* __restrict__ x,
+    float* __restrict__ partial_sum,
+    float* __restrict__ partial_sq,
+    int N, int C, int H, int W) {
+    
+    int c = blockIdx.y;
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    int nblocks = gridDim.x;
+    int nthreads = blockDim.x;
+    
+    int spatial = H * W;
+    int numel = N * spatial;
+    int numel4 = numel &gt;&gt; 2;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {
+        int j = j4 &lt;&lt; 2;
+        int n = j / spatial;
+        int hw = j % spatial;
+        int global_idx = ((n * C) + c) * spatial + hw;
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0];
+        sum += xv.x + xv.y + xv.z + xv.w;
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+    }
+    
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    __shared__ float s_sum[32];
+    __shared__ float s_sq[32];
+    
+    int lane = tid &amp; 31;
+    int warp_id = tid &gt;&gt; 5;
+    
+    if (lane == 0) {
+        s_sum[warp_id] = sum;
+        s_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        sum = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sum[lane] : 0.0f;
+        sum_sq = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sq[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+    }
+    
+    if (tid == 0) {
+        partial_sum[bid * C + c] = sum;
+        partial_sq[bid * C + c] = sum_sq;
+    }
+}
+
+__global__ void reduce_stats(
+    const float* __restrict__ partial_sum,
+    const float* __restrict__ partial_sq,
+    float* __restrict__ mean,
+    float* __restrict__ inv_std,
+    int C, int num_blocks, int numel, float eps) {
+    
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c &gt;= C) return;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    #pragma unroll 4
+    for (int b = 0; b &lt; num_blocks; ++b) {
+        sum += partial_sum[b * C + c];
+        sum_sq += partial_sq[b * C + c];
+    }
+    
+    float m = sum / numel;
+    float m_sq = sum_sq / numel;
+    float var = m_sq - m * m;
+    var = fmaxf(var, 0.0f);
+    mean[c] = m;
+    inv_std[c] = rsqrtf(var + eps);
+}
+
+__global__ void apply_bn(
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int N, int C, int H, int W) {
+    
+    int total = N * C * H * W;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int nthreads = blockDim.x * gridDim.x;
+    int n4 = total &gt;&gt; 2;
+    int spatial = H * W;
+    
+    for (int i = tid; i &lt; n4; i += nthreads) {
+        int base = i &lt;&lt; 2;
+        int c = (base / spatial) % C;
+        
+        float m = mean[c];
+        float s = inv_std[c];
+        float w = weight[c];
+        float b = bias[c];
+        
+        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + base)[0];
+        
+        float4 yv;
+        yv.x = (xv.x - m) * s * w + b;
+        yv.y = (xv.y - m) * s * w + b;
+        yv.z = (xv.z - m) * s * w + b;
+        yv.w = (xv.w - m) * s * w + b;
+        
+        reinterpret_cast&lt;float4*&gt;(y + base)[0] = yv;
+    }
+}
+&#x27;&#x27;&#x27;
+
+CPP_SOURCE = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+
+torch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    
+    const int num_blocks1 = 32;
+    
+    auto partial_sum = torch::empty({num_blocks1, C}, x.options());
+    auto partial_sq = torch::empty({num_blocks1, C}, x.options());
+    auto mean = torch::empty({C}, x.options());
+    auto inv_std = torch::empty({C}, x.options());
+    auto out = torch::empty_like(x);
+    
+    dim3 grid1(num_blocks1, C);
+    dim3 block1(256);
+    compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),
+        N, C, H, W);
+    
+    int block_reduce = (C + 255) / 256;
+    reduce_stats&lt;&lt;&lt;block_reduce, 256&gt;&gt;&gt;(
+        partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),
+        mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        C, num_blocks1, N * H * W, eps);
+    
+    int total = N * C * H * W;
+    int n4 = total / 4;
+    int block2 = 256;
+    int grid2 = (n4 + block2 - 1) / block2;
+    if (grid2 &gt; 65536) grid2 = 65536;
+    
+    apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+        weight.data_ptr&lt;float&gt;(), bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(), N, C, H, W);
+    
+    return out;
+}
+&#x27;&#x27;&#x27;
+
+_BATCH_NORM_EXT = load_inline(
+    name=&#x27;bn_custom_v1&#x27;,
+    cpp_sources=CPP_SOURCE,
+    cuda_sources=CUDA_SOURCE,
+    functions=[&#x27;batch_norm_forward_cuda&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;, &#x27;-arch=sm_90&#x27;],
+    extra_cflags=[&#x27;-O3&#x27;],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.bn = nn.BatchNorm2d(num_features=num_features)
+    
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x.contiguous()
+        return _BATCH_NORM_EXT.batch_norm_forward_cuda(x, self.bn.weight, self.bn.bias, self.bn.eps)
+```
+
+Wait, I used `-arch=sm_90` in extra_cuda_cflags. Is that appropriate for H100? Yes, H100 is sm_90 (Hopper). But `load_inline` might already set the correct architecture. Let me check if adding it explicitly is good or bad. It should be fine, but if the system has a different default, it might cause issues. Actually, since we&#x27;re running on H100, sm_90 is correct. I&#x27;ll include it.
+
+Actually, wait. PyTorch&#x27;s `load_inline` usually auto-detects the architecture from the current GPU. But specifying it explicitly should be fine.
+
+Let me also make sure about `torch::Tensor` vs `at::Tensor`. In PyTorch C++ extensions, `torch::Tensor` is an alias for `at::Tensor`. Both work.
+
+Also, I should add `#include &lt;torch/extension.h&gt;` which includes both ATen and pybind11 headers.
+
+One concern: the `load_inline` function call happens at module import time. If there&#x27;s a compilation error, the whole script fails. That&#x27;s fine.
+
+Let me think about whether there are any issues with float4 alignment. In `apply_bn`, we do `reinterpret_cast&lt;const float4*&gt;(x + base)[0]`. For this to be valid:
+1. `x + base` must be 16-byte aligned
+2. There must be at least 4 floats available
+
+For condition 2: `base = i * 4`, and `i &lt; n4 = total / 4`. So `base + 3 &lt; total`. Good.
+
+For condition 1: `x` is a `torch.Tensor` pointer. PyTorch allocates tensors with 256-byte alignment (or 512-byte on some systems). And `base = i * 4` gives an offset that&#x27;s a multiple of 16 bytes (since `i*4*sizeof(float) = i*16`). So alignment is guaranteed.
+
+Similarly for kernel 1: `global_idx = ((n * C) + c) * spatial + hw`. We need `global_idx % 4 == 0`.
+- `spatial = H * W = 262144 = 2^18`. Both `(n*C + c)*spatial` and `hw = j % spatial` need to be analyzed.
+- `j = j4 * 4`, so `j % 4 == 0`.
+- `hw = j % spatial`. Since `spatial` is divisible by 4 and `j` is divisible by 4, `hw` is divisible by 4.
+- `global_idx = ((n*C) + c) * spatial + hw`. The first term is divisible by `spatial`, which is divisible by 4. So yes, `global_idx` is divisible by 4.
+
+Great, alignment is guaranteed for our specific sizes.
+
+But what about general sizes? For general H and W that aren&#x27;t powers of 2 or aren&#x27;t divisible by 4, this might break. However, our problem has fixed sizes (512, 512). If the evaluation tests other sizes, we&#x27;d need to handle them. But the problem statement gives specific sizes in `get_inputs()`, which suggests those are the ones used.
+
+Actually, the evaluation might test with the exact sizes, or it might use different sizes to check generality. To be safe, I should make the kernels work for any sizes. But handling all edge cases with float4 is complex.
+
+One approach: check if total elements is divisible by 4 and spatial is divisible by 4. If so, use float4 path. Otherwise, use scalar path.
+
+Actually, for the first kernel, the scalar path is simple. For the second kernel, scalar path is also simple. Let me add a runtime check in the C++ wrapper and dispatch to a scalar version if needed.
+
+But this adds complexity. Let me first try the simple float4 version and see if correctness passes.
+
+Another thing: `reduce_stats` kernel uses a loop over `num_blocks`. With `num_blocks = 32`, and `#pragma unroll 4`, only 8 iterations unroll fully, then 8 more. Actually, `#pragma unroll 4` unrolls by factor 4, giving 8 unrolled chunks + 1 remainder (since 32 = 8*4). The loop overhead is tiny anyway.
+
+Actually, a `#pragma unroll` with a runtime-bound loop has limited effect unless the compiler knows the bound. Since `num_blocks` is a kernel parameter, the compiler might not fully unroll. But 32 iterations is small.
+
+Let me think if there&#x27;s a better way. We could launch one warp per channel (32 threads) and each thread sums one partial result, then do a warp shuffle reduction. That would be more elegant:
+
+```cuda
+__global__ void reduce_stats(
+    const float* __restrict__ partial_sum,
+    const float* __restrict__ partial_sq,
+    float* __restrict__ mean,
+    float* __restrict__ inv_std,
+    int C, int num_blocks, int numel, float eps) {
+    
+    int c = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (c &gt;= C) return;
+    if (tid &gt;= num_blocks) return;
+    
+    float sum = partial_sum[tid * C + c];
+    float sum_sq = partial_sq[tid * C + c];
+    
+    // Warp shuffle reduction
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    if (tid == 0) {
+        float m = sum / numel;
+        float m_sq = sum_sq / numel;
+        float var = m_sq - m * m;
+        var = fmaxf(var, 0.0f);
+        mean[c] = m;
+        inv_std[c] = rsqrtf(var + eps);
+    }
+}
+```
+
+Launch: `reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;(...)`. With C=64, 64 blocks of 32 threads. Each block handles one channel, and 32 threads each load one partial sum. Then warp shuffle reduces. Very clean.
+
+And since num_blocks = 32, we use exactly one warp. Perfect.
+
+Let me use this version. It&#x27;s simpler and very efficient.
+
+```cpp
+reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;(
+    partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),
+    mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),
+    C, num_blocks1, N * H * W, eps);
+```
+
+Wait, if num_blocks1 is fixed at 32, and we launch 32 threads, some threads might not have valid data to load if num_blocks &lt; 32. But num_blocks1 = 32. So all 32 threads load valid data.
+
+What if we later change num_blocks1 to something else? Let me make it flexible:
+
+```cuda
+__global__ void reduce_stats(...) {
+    int c = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (c &gt;= C) return;
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    if (tid &lt; num_blocks) {
+        sum = partial_sum[tid * C + c];
+        sum_sq = partial_sq[tid * C + c];
+    }
+    
+    // Warp shuffle reduction across all 32 threads
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    
+    if (tid == 0) {
+        ...
+    }
+}
+```
+
+Launch with `reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;` regardless of num_blocks. Works for num_blocks &lt;= 32.
+
+Great, this is cleaner. If num_blocks &gt; 32, we&#x27;d need multiple warps, but let&#x27;s keep num_blocks = 32.
+
+Actually, looking at my code, I have `if (tid &gt;= num_blocks) return;` which causes early return for some threads. But then __shfl_down_sync needs all active threads. If some threads return early, the sync mask 0xFFFFFFFF includes them, but they might not reach the sync, causing a hang.
+
+So I should remove the early return and instead do:
+
+```cuda
+float sum = 0.0f;
+float sum_sq = 0.0f;
+if (tid &lt; num_blocks) {
+    sum = partial_sum[tid * C + c];
+    sum_sq = partial_sq[tid * C + c];
+}
+```
+
+All 32 threads in the warp participate in the shuffle. For tid &gt;= num_blocks, they contribute 0. Good.
+
+For the launch, if we always use 32 threads, we&#x27;re good as long as num_blocks &lt;= 32.
+
+Now let me consider: should I add scalar fallback paths? The problem has fixed sizes, so maybe not necessary. But for robustness, I could.
+
+Actually, I&#x27;ll stick with float4 and see. If correctness passes, we&#x27;re good.
+
+Wait, I should also think about the `mean` and `inv_std` naming. In PyTorch, `inv_std` isn&#x27;t a standard name, but `1/sqrt(var + eps)` is what&#x27;s commonly used. Some implementations compute `1/sqrt(var + eps)` and others compute `sqrt(var + eps)`. I&#x27;ll stick with `inv_std` and multiply.
+
+Let me compile and test this. First, I&#x27;ll write the full Python module.
+
+One more concern: `load_inline` might cache the compiled module. If I make changes, I need to change the name to get a fresh compilation. That&#x27;s fine.
+
+Also, I should make sure that the `batch_norm_forward_cuda` function is properly declared in C++ before the kernel definitions. In CUDA, kernels don&#x27;t need forward declarations - they&#x27;re visible within the same translation unit. But if the C++ wrapper calls them, and the C++ code is in a separate compilation unit... wait, with `load_inline`, both cpp_sources and cuda_sources are compiled together? Or separately?
+
+Actually, `load_inline` compiles `cpp_sources` and `cuda_sources` together in a single compilation unit. The C++ source is typically the host code, and CUDA source is the device code. But nvcc compiles both. The kernel calls in the C++ source should work because nvcc sees all the code together.
+
+Wait, is that true? Let me check. With `load_inline`, the CUDA code and C++ code are combined. The `cpp_sources` is typically the `.cpp` file, and `cuda_sources` is the `.cu` file. But in `load_inline`, both are passed as strings and combined by PyTorch&#x27;s build system.
+
+Actually, looking at PyTorch source, `load_inline` creates a single `.cu` file that includes both sources, or compiles them together. So kernel forward declarations aren&#x27;t needed.
+
+Let me finalize the code and compile. I&#x27;ll also double check the PyTorch BatchNorm2d default values:
+- eps: 1e-5
+- momentum: 0.1
+- affine: True
+- track_running_stats: True
+
+Our kernel uses eps from the module, which defaults to 1e-5. Good.
+
+One more thing: in PyTorch&#x27;s BatchNorm2d, `weight` and `bias` are 1D tensors of length C. So `weight.data_ptr&lt;float&gt;()` gives us a contiguous array of C floats. Correct.
+
+Now let me write out the full code and compile.
+
+Actually, I just want to reconsider whether using a pure C++ extension wrapper is necessary. Some implementations define the wrapper as a C function that returns a torch::Tensor, which is what I&#x27;ve done. This should work with `functions=[&#x27;batch_norm_forward_cuda&#x27;]`.
+
+Let me write it all out.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_SOURCE = r&#x27;&#x27;&#x27;\n#include &lt;cuda_runtime.h&gt;\n\n__global__ void compute_stats(\n    const float* __restrict__ x,\n    float* __restrict__ partial_sum,\n    float* __restrict__ partial_sq,\n    int N, int C, int H, int W) {\n    \n    int c = blockIdx.y;\n    int bid = blockIdx.x;\n    int tid = threadIdx.x;\n    int nblocks = gridDim.x;\n    int nthreads = blockDim.x;\n    \n    int spatial = H * W;\n    int numel = N * spatial;\n    int numel4 = numel &gt;&gt; 2;\n    \n    float sum = 0.0f;\n    float sum_sq = 0.0f;\n    \n    for (int j4 = bid * nthreads + tid; j4 &lt; numel4; j4 += nthreads * nblocks) {\n        int j = j4 &lt;&lt; 2;\n        int n = j / spatial;\n        int hw = j % spatial;\n        int global_idx = ((n * C) + c) * spatial + hw;\n        \n        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + global_idx)[0];\n        sum += xv.x + xv.y + xv.z + xv.w;\n        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;\n    }\n    \n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);\n    }\n    \n    __shared__ float s_sum[32];\n    __shared__ float s_sq[32];\n    \n    int lane = tid &amp; 31;\n    int warp_id = tid &gt;&gt; 5;\n    \n    if (lane == 0) {\n        s_sum[warp_id] = sum;\n        s_sq[warp_id] = sum_sq;\n    }\n    __syncthreads();\n    \n    if (warp_id == 0) {\n        sum = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sum[lane] : 0.0f;\n        sum_sq = (lane &lt; ((nthreads + 31) &gt;&gt; 5)) ? s_sq[lane] : 0.0f;\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);\n        }\n    }\n    \n    if (tid == 0) {\n        partial_sum[bid * C + c] = sum;\n        partial_sq[bid * C + c] = sum_sq;\n    }\n}\n\n__global__ void reduce_stats(\n    const float* __restrict__ partial_sum,\n    const float* __restrict__ partial_sq,\n    float* __restrict__ mean,\n    float* __restrict__ inv_std,\n    int C, int num_blocks, int numel, float eps) {\n    \n    int c = blockIdx.x;\n    int tid = threadIdx.x;\n    \n    if (c &gt;= C) return;\n    \n    float sum = 0.0f;\n    float sum_sq = 0.0f;\n    \n    if (tid &lt; num_blocks) {\n        sum = partial_sum[tid * C + c];\n        sum_sq = partial_sq[tid * C + c];\n    }\n    \n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);\n        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);\n    }\n    \n    if (tid == 0) {\n        float m = sum / numel;\n        float m_sq = sum_sq / numel;\n        float var = m_sq - m * m;\n        var = fmaxf(var, 0.0f);\n        mean[c] = m;\n        inv_std[c] = rsqrtf(var + eps);\n    }\n}\n\n__global__ void apply_bn(\n    const float* __restrict__ x,\n    const float* __restrict__ mean,\n    const float* __restrict__ inv_std,\n    const float* __restrict__ weight,\n    const float* __restrict__ bias,\n    float* __restrict__ y,\n    int N, int C, int H, int W) {\n    \n    int total = N * C * H * W;\n    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n    int nthreads = blockDim.x * gridDim.x;\n    int n4 = total &gt;&gt; 2;\n    int spatial = H * W;\n    \n    for (int i = tid; i &lt; n4; i += nthreads) {\n        int base = i &lt;&lt; 2;\n        int c = (base / spatial) % C;\n        \n        float m = mean[c];\n        float s = inv_std[c];\n        float w = weight[c];\n        float b = bias[c];\n        \n        float4 xv = reinterpret_cast&lt;const float4*&gt;(x + base)[0];\n        \n        float4 yv;\n        yv.x = (xv.x - m) * s * w + b;\n        yv.y = (xv.y - m) * s * w + b;\n        yv.z = (xv.z - m) * s * w + b;\n        yv.w = (xv.w - m) * s * w + b;\n        \n        reinterpret_cast&lt;float4*&gt;(y + base)[0] = yv;\n    }\n}\n&#x27;&#x27;&#x27;\n\nCPP_SOURCE = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n\ntorch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {\n    int N = x.size(0);\n    int C = x.size(1);\n    int H = x.size(2);\n    int W = x.size(3);\n    \n    const int num_blocks1 = 32;\n    \n    auto partial_sum = torch::empty({num_blocks1, C}, x.options());\n    auto partial_sq = torch::empty({num_blocks1, C}, x.options());\n    auto mean = torch::empty({C}, x.options());\n    auto inv_std = torch::empty({C}, x.options());\n    auto out = torch::empty_like(x);\n    \n    dim3 grid1(num_blocks1, C);\n    dim3 block1(256);\n    compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(), partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),\n        N, C, H, W);\n    \n    reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;(\n        partial_sum.data_ptr&lt;float&gt;(), partial_sq.data_ptr&lt;float&gt;(),\n        mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),\n        C, num_blocks1, N * H * W, eps);\n    \n    int total = N * C * H * W;\n    int n4 = total / 4;\n    int block2 = 256;\n    int grid2 = (n4 + block2 - 1) / block2;\n    if (grid2 &gt; 65536) grid2 = 65536;\n    \n    apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(), mean.data_ptr&lt;float&gt;(), inv_std.data_ptr&lt;float&gt;(),\n        weight.data_ptr&lt;float&gt;(), bias.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(), N, C, H, W);\n    \n    return out;\n}\n&#x27;&#x27;&#x27;\n\n_BATCH_NORM_EXT = load_inline(\n    name=&#x27;bn_custom_v2&#x27;,\n    cpp_sources=CPP_SOURCE,\n    cuda_sources=CUDA_SOURCE,\n    functions=[&#x27;batch_norm_forward_cuda&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;, &#x27;-arch=sm_90&#x27;],\n    extra_cflags=[&#x27;-O3&#x27;],\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, num_features: int):\n        super(ModelNew, self).__init__()\n        self.bn = nn.BatchNorm2d(num_features=num_features)\n    \n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        x = x.contiguous()\n        return _BATCH_NORM_EXT.batch_norm_forward_cuda(x, self.bn.weight, self.bn.bias, self.bn.eps)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;bn_custom_v2&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bn_custom_v2 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -O3 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bn_custom_v2 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -O3 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp -o main.o 
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp: In function &#x27;at::Tensor batch_norm_forward_cuda(at::Tensor, at::Tensor, at::Tensor, float)&#x27;:
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:19:5: error: &#x27;dim3&#x27; was not declared in this scope
+   19 |     dim3 grid1(num_blocks1, C);
+      |     ^~~~
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:20:9: error: expected &#x27;;&#x27; before &#x27;block1&#x27;
+   20 |     dim3 block1(256);
+      |         ^~~~~~~
+      |         ;
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:21:5: error: &#x27;compute_stats&#x27; was not declared in this scope
+   21 |     compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+      |     ^~~~~~~~~~~~~
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:21:20: error: expected primary-expression before &#x27;&lt;&#x27; token
+   21 |     compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+      |                    ^
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:21:21: error: &#x27;grid1&#x27; was not declared in this scope
+   21 |     compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+      |                     ^~~~~
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:21:28: error: &#x27;block1&#x27; was not declared in this scope; did you mean &#x27;lockf&#x27;?
+   21 |     compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+      |                            ^~~~~~
+      |                            lockf
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:21:36: error: expected primary-expression before &#x27;&gt;&#x27; token
+   21 |     compute_stats&lt;&lt;&lt;grid1, block1&gt;&gt;&gt;(
+      |                                    ^
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:25:5: error: &#x27;reduce_stats&#x27; was not declared in this scope
+   25 |     reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;(
+      |     ^~~~~~~~~~~~
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:25:19: error: expected primary-expression before &#x27;&lt;&#x27; token
+   25 |     reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;(
+      |                   ^
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:25:27: error: expected primary-expression before &#x27;&gt;&#x27; token
+   25 |     reduce_stats&lt;&lt;&lt;C, 32&gt;&gt;&gt;(
+      |                           ^
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:36:5: error: &#x27;apply_bn&#x27; was not declared in this scope
+   36 |     apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+      |     ^~~~~~~~
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:36:15: error: expected primary-expression before &#x27;&lt;&#x27; token
+   36 |     apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+      |               ^
+/scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/main.cpp:36:31: error: expected primary-expression before &#x27;&gt;&#x27; token
+   36 |     apply_bn&lt;&lt;&lt;grid2, block2&gt;&gt;&gt;(
+      |                               ^
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=bn_custom_v2 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options &#x27;-fPIC&#x27; -O3 --use_fast_math -arch=sm_90 -std=c++17 -c /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_33_cache/k_dce470ab69d9/bn_custom_v2/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
