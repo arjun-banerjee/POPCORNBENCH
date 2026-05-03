@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 4</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:53:20 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 4</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:58:44 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">4_MambaBlock.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">5 / 8</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">5</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">6 / 8</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">6</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -4003,5 +4003,45 @@ compile_kernel PASSED: kernel compiled without errors.</div></details></div></de
 run_correctness FAILED: (0 / 3) trials did not all match.
 correctness_issue: Output mismatch
 max_difference: [&#x27;0.276568&#x27;, &#x27;0.263260&#x27;, &#x27;0.262457&#x27;]
-avg_difference: [&#x27;0.033653&#x27;, &#x27;0.033663&#x27;, &#x27;0.033632&#x27;]</div></details></div></details></div>
+avg_difference: [&#x27;0.033653&#x27;, &#x27;0.033663&#x27;, &#x27;0.033632&#x27;]</div></details></div></details><details class="turn-collapse"><summary><b>turn 5</b> · 1 tool call(s) · 14.7s · 8,645 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 5</span><span>llm latency: 14.7s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The issue with the correctness is in the shuffle reduction. The problem is that I have a 2D block of 16x16, but I&#x27;m using `__shfl_down_sync` with a warp size of 16, but my threads are organized in a 2D grid where the total block size is 256 (16x16). But `__shfl_down_sync` operates within warps of 32 threads.
+
+Actually, looking at my kernel more carefully, I have a `blockDim` of `(16, 16)` which means 256 threads per block. But `__shfl_down_sync` with a warp size of 16 won&#x27;t work properly because CUDA warps are 32 threads and are arranged in x-dimension first.
+
+Let me rethink the kernel design:
+- For each (batch, d_inner, t) we need to sum over d_state=16
+- So we can have each warp handle one (batch, d_inner, t) combination and sum 16 lanes
+- But since d_state=16, we can have 16 threads in a warp each handling one state dimension
+
+Actually, let me restructure:
+- Use 1 thread block dimension with 32 threads (1 warp) for the reduction
+- Each warp processes one (batch, d_inner, t)
+- Thread i in warp handles state dimension i
+- We need to sum over 16 lanes, ignoring lanes 16-31
+
+Let me rewrite with a cleaner approach:
+
+For each (b, d, t):
+    h = 0
+    val = h * C[b,t,n]
+    Sum val across n=0..15
+    y[b,t,d] = sum + x[b,t,d] * D[d]
+
+The most efficient approach:
+- One thread per (b, d, t) is too many threads.
+- One warp per (b, d, t) with 16 active threads for the 16 states, then reduce with shuffle.
+
+Or:
+- Since there are 16x512 = 8192 states per (b,t), and we have 2048 time steps
+- Total independent units: batch * d_inner * L = 16 * 512 * 2048 = 16,777,216
+
+Each warp handles one (b,d,t):
+- 16 active threads (d_state=16), but a warp has 32 threads
+- For the shuffle: only reduce across first 16 lanes
+
+Let me fix the kernel:
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport os\n\nos.environ[&#x27;LD_LIBRARY_PATH&#x27;] = &#x27;/opt/conda/lib:&#x27; + os.environ.get(&#x27;LD_LIBRARY_PATH&#x27;, &#x27;&#x27;)\n\ncpp_source = &#x27;&#x27;&#x27;\ntorch::Tensor selective_scan_cuda(\n    torch::Tensor x,\n    torch::Tensor delta,\n    torch::Tensor B,\n    torch::Tensor C,\n    torch::Tensor A_log,\n    torch::Tensor D_param);\n&#x27;&#x27;&#x27;\n\ncuda_source = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n__global__ void selective_scan_kernel(\n    const float* __restrict__ x,\n    const float* __restrict__ delta,\n    const float* __restrict__ B,\n    const float* __restrict__ C,\n    const float* __restrict__ A_log,\n    const float* __restrict__ D_param,\n    float* __restrict__ y,\n    int batch, int L, int d_inner, int d_state)\n{\n    // Each block handles multiple (b, d, t) items\n    // Each warp handles one (b, d, t), with threads 0..d_state-1 computing state sub-parts\n    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;\n    const int lane = threadIdx.x % 32;\n    \n    const int total_items = batch * d_inner * L;\n    if (warp_id &gt;= total_items) return;\n    \n    const int t = warp_id % L;\n    const int bd = warp_id / L;\n    const int d = bd % d_inner;\n    const int b = bd / d_inner;\n    \n    if (lane &gt;= d_state) return;\n    \n    const int n = lane;\n    \n    const float A_val = -expf(A_log[d * d_state + n]);\n    const float D_val = D_param[d];\n    \n    // We&#x27;ll process sequentially along t - but wait, each warp only handles one t\n    // Actually we need to process h sequentially. Let me reconsider.\n    \n    // We process the sequence sequentially\n    float h = 0.0f;\n    \n    for (int time = 0; time &lt; L; ++time) {\n        const float x_val = x[((b * L) + time) * d_inner + d];\n        const float delta_val = delta[((b * L) + time) * d_inner + d];\n        const float B_val = B[((b * L) + time) * d_state + n];\n        const float C_val = C[((b * L) + time) * d_state + n];\n        \n        h = expf(delta_val * A_val) * h + x_val * delta_val * B_val;\n        \n        if (time == t) {\n            float val = h * C_val;\n            \n            // Reduce within warp using only first d_state lanes\n            unsigned int mask = 0x0000FFFF; // first 16 lanes\n            #pragma unroll\n            for (int offset = d_state / 2; offset &gt; 0; offset &gt;&gt;= 1) {\n                val += __shfl_down_sync(mask, val, offset, d_state);\n            }\n            \n            if (lane == 0) {\n                y[((b * L) + t) * d_inner + d] = val + x_val * D_val;\n            }\n        }\n    }\n}\n\ntorch::Tensor selective_scan_cuda(\n    torch::Tensor x,\n    torch::Tensor delta,\n    torch::Tensor B,\n    torch::Tensor C,\n    torch::Tensor A_log,\n    torch::Tensor D_param)\n{\n    int batch = x.size(0);\n    int L = x.size(1);\n    int d_inner = x.size(2);\n    int d_state = A_log.size(1);\n    \n    auto y = torch::empty_like(x);\n    \n    const int total_items = batch * d_inner * L;\n    const int warps_per_block = 4;\n    const int threads_per_block = warps_per_block * 32;\n    const int blocks = (total_items + warps_per_block - 1) / warps_per_block;\n    \n    selective_scan_kernel&lt;&lt;&lt;blocks, threads_per_block&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        delta.data_ptr&lt;float&gt;(),\n        B.data_ptr&lt;float&gt;(),\n        C.data_ptr&lt;float&gt;(),\n        A_log.data_ptr&lt;float&gt;(),\n        D_param.data_ptr&lt;float&gt;(),\n        y.data_ptr&lt;float&gt;(),\n        batch, L, d_inner, d_state\n    );\n    \n    return y;\n}\n&#x27;&#x27;&#x27;\n\ntry:\n    fused_scan = torch.utils.cpp_extension.load_inline(\n        name=\&quot;selective_scan_v3\&quot;,\n        cpp_sources=cpp_source,\n        cuda_sources=cuda_source,\n        functions=[\&quot;selective_scan_cuda\&quot;],\n        extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n        verbose=False\n    ).selective_scan_cuda\nexcept Exception as e:\n    print(f\&quot;Error: {e}\&quot;)\n    fused_scan = None\n\nclass ModelNew(nn.Module):\n    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int):\n        super(ModelNew, self).__init__()\n        self.d_model = d_model\n        self.d_inner = d_model * expand\n        self.d_state = d_state\n        self.d_conv = d_conv\n\n        self.norm = nn.RMSNorm(d_model)\n        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)\n        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, d_conv,\n                                padding=d_conv - 1, groups=self.d_inner, bias=True)\n        self.activation = nn.SiLU()\n\n        self.A_log = nn.Parameter(torch.randn(self.d_inner, d_state))\n        self.proj_B = nn.Linear(self.d_inner, d_state, bias=False)\n        self.proj_C = nn.Linear(self.d_inner, d_state, bias=False)\n        self.proj_delta = nn.Linear(self.d_inner, self.d_inner, bias=True)\n        self.D = nn.Parameter(torch.ones(self.d_inner))\n\n        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)\n\n    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        if fused_scan is None:\n            return self._fallback_forward(x)\n        B, L, D = x.shape\n        residual = x\n        x = self.norm(x)\n\n        xz = self.in_proj(x)\n        x_branch, z = xz.chunk(2, dim=-1)\n\n        x_branch = x_branch.transpose(1, 2)\n        x_branch = self.conv1d(x_branch)[..., :L]\n        x_branch = x_branch.transpose(1, 2)\n        x_branch = self.activation(x_branch)\n\n        delta = torch.nn.functional.softplus(self.proj_delta(x_branch))\n        B_t = self.proj_B(x_branch)\n        C_t = self.proj_C(x_branch)\n\n        y = fused_scan(\n            x_branch.contiguous(),\n            delta.contiguous(),\n            B_t.contiguous(),\n            C_t.contiguous(),\n            self.A_log.contiguous(),\n            self.D.contiguous()\n        )\n\n        z = self.activation(z)\n        y = y * z\n        y = self.out_proj(y)\n        y = y + residual\n        return y\n\n    def _fallback_forward(self, x: torch.Tensor) -&gt; torch.Tensor:\n        return x\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
