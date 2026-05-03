@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 88</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 21:12:30 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 88</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 21:17:49 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">88_MinGPTNewGelu.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -51,5 +51,224 @@ def get_inputs():
     return [torch.rand(batch_size, dim)]
 
 def get_init_inputs():
-    return []</pre></details></div>
+    return []</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 67.3s · 19,395 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 67.3s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to write a custom CUDA kernel that implements the GELU activation function as defined in the reference, and runs faster than the PyTorch reference. The operation is elementwise for a large tensor (batch_size=8192, dim=8192), so total elements = 67,108,864 (~67M). The PyTorch reference computes: `0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))`. This is the tanh approximation of GELU.
+
+We need to write a CUDA kernel using `torch.utils.cpp_extension.load_inline` and define `ModelNew` class. The kernel should be efficient: likely memory bandwidth bound since it&#x27;s elementwise. We can write a simple fused kernel that reads x, computes the GELU approximation, and writes output. Since it&#x27;s elementwise, using a simple CUDA kernel with each thread processing one or more elements, using vectorized loads/stores (e.g., float4), would maximize bandwidth.
+
+We must check correctness and performance. Let&#x27;s design the kernel.
+
+We can define a kernel like:
+
+```
+__global__ void gelu_kernel(const float* __restrict__ x, float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        float v = x[idx];
+        float v3 = v * v * v;
+        float inner = 0.044715f * v3 + v;
+        float tanh_arg = 0.7978845608f * inner; // sqrt(2/pi)
+        float t = tanhf(tanh_arg);
+        out[idx] = 0.5f * v * (1.0f + t);
+    }
+}
+```
+
+But we can also process 4 elements per thread using float4 to increase memory throughput.
+
+Given the size is 8192x8192 = 67,108,864 elements. If we use float4 (4 floats per thread), we need 16,777,216 threads. With 256 threads per block, that&#x27;s 65536 blocks. That&#x27;s fine. Using vectorized loads and stores should improve bandwidth.
+
+However, we need to be careful about alignment. Since the tensor is contiguous and size is multiple of 4, we can safely use float4. But to be safe, we can also use `__builtin_assume_aligned` or just cast.
+
+CUDA code for float4:
+
+```
+__global__ void gelu_kernel_float4(const float* __restrict__ x, float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n4 = n &gt;&gt; 2;
+    if (idx &lt; n4) {
+        float4 vx = reinterpret_cast&lt;const float4*&gt;(x)[idx];
+        float4 vout;
+        #pragma unroll
+        for (int i = 0; i &lt; 4; ++i) {
+            float v = (&amp;vx.x)[i];
+            float v3 = v * v * v;
+            float inner = 0.044715f * v3 + v;
+            float tanh_arg = 0.7978845608f * inner;
+            float t = tanhf(tanh_arg);
+            (&amp;vout.x)[i] = 0.5f * v * (1.0f + t);
+        }
+        reinterpret_cast&lt;float4*&gt;(out)[idx] = vout;
+    }
+}
+```
+
+We need to ensure `x` and `out` are aligned to 16 bytes. PyTorch allocates tensors aligned to 256 bytes typically, so it&#x27;s safe. But we can also have a tail loop for remaining elements not divisible by 4. However, here the total size is divisible by 4 (8192*8192 is divisible by 4). Actually 8192*8192 = 67,108,864 which is divisible by 4. So we can just use the float4 path.
+
+We also need to handle cases where n is not divisible by 4 in general, but the test might use the defined dimensions. But to be robust we can include a tail loop or a scalar kernel for the remainder.
+
+Alternatively, since the operation is elementwise and the kernel is memory-bound, using `__launch_bounds__` or tuning block size might help. 256 threads per block is typical.
+
+Also, we can use `fast_math` tanhf? `tanhf` is already fast. We can compile with `-use_fast_math` to replace tanhf with a faster intrinsic. But doing so might reduce precision. The tolerance is 1e-4 for fp32. We need to see if fast math is safe. The tanh approximation in fast math might have slightly different results but likely within 1e-4. However, to be safe, we can use `tanhf` from standard math. The compiler will likely generate an instruction sequence.
+
+We can also try using the `erf` based formula if it&#x27;s faster? Probably not, since the reference uses tanh. We must reproduce the reference. The reference computes `tanh( sqrt(2/pi) * (x + 0.044715 * x^3) )`. So we need to match that exactly. Using `tanhf` in CUDA should match PyTorch&#x27;s `torch.tanh` fairly closely. PyTorch likely uses the same tanh approximation on GPU via CUDA&#x27;s `tanh` intrinsic. So using `tanhf` is fine.
+
+We could also consider using `__half` or tensor cores? Not necessary for elementwise fp32. The bottleneck is memory bandwidth. The theoretical peak DRAM bandwidth is likely around 1.5-2 TB/s on A100/H100. The kernel reads 4 bytes per element and writes 4 bytes per element: 8 bytes per element. For 67M elements, total memory traffic is ~536 MB. At 1.5 TB/s, that&#x27;s ~0.35 ms. So the kernel should be very fast, maybe around 0.3-0.5 ms. The PyTorch reference might also be fast because it&#x27;s elementwise, but it might construct intermediate tensors (pow, mul, add, tanh, mul, add, mul) causing multiple memory passes. So a fused kernel should easily beat it.
+
+We need to write the Python code defining `ModelNew`. The module-level code will compile the CUDA extension. We must not define our own pybind11 module. We use `load_inline`.
+
+We need to think about the number of thread blocks. If we launch one block per 256 threads, and each thread handles 4 elements, we need `ceil(n/4/256)` blocks. That is `ceil(67108864 / 4 / 256) = ceil(65536) = 65536` blocks. That&#x27;s exactly 65536 blocks, which is fine. On A100, we have 108 SMs, so occupancy is high.
+
+Alternatively, we can have each thread handle a single element and launch 262144 blocks, but using float4 is better.
+
+We should also consider grid-stride loops. With float4 and 65536 blocks, each block has 256 threads, total threads = 16,777,216, which exactly matches n/4. So no grid-stride needed.
+
+But for generality, we can write a kernel that handles any size:
+
+```
+__global__ void gelu_kernel(const float* __restrict__ x, float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n4 = n / 4;
+    if (idx &lt; n4) {
+        float4 vx = reinterpret_cast&lt;const float4*&gt;(x)[idx];
+        float4 vout;
+        #pragma unroll
+        for (int i = 0; i &lt; 4; ++i) {
+            float v = (&amp;vx.x)[i];
+            float v3 = v * v * v;
+            float t = tanhf(0.7978845608f * (v + 0.044715f * v3));
+            (&amp;vout.x)[i] = 0.5f * v * (1.0f + t);
+        }
+        reinterpret_cast&lt;float4*&gt;(out)[idx] = vout;
+    }
+    // scalar tail
+    int idx_tail = n4 * 4 + idx;
+    if (idx_tail &lt; n) {
+        float v = x[idx_tail];
+        float v3 = v * v * v;
+        float t = tanhf(0.7978845608f * (v + 0.044715f * v3));
+        out[idx_tail] = 0.5f * v * (1.0f + t);
+    }
+}
+```
+
+But the tail part might cause out-of-bounds for the float4 path if n is not divisible by 4, but since we use `n4 = n / 4`, the float4 path only processes up to n4*4 elements. Then we need a separate scalar kernel or have the same threads handle the tail. However, if we have exactly n4 threads, the tail will be handled by the same threads because `idx` goes from 0 to n4-1. So `idx_tail = n4*4 + idx` goes from n4*4 to n4*4 + n4 - 1. But n - n4*4 = n % 4, which is &lt; 4. So only the first `n % 4` threads should handle the tail. The other threads will have `idx_tail &gt;= n`, so the condition `idx_tail &lt; n` guards it. However, we are launching `ceil(n4 / blockDim.x)` blocks. If n4 is exactly the number of threads launched, then some threads will have idx &gt;= n4 (if total threads &gt; n4) and will skip the float4 path but might execute the tail if `idx_tail &lt; n`. Wait, if we launch `ceil(n4 / blockDim.x)` blocks, then total threads = blocks * blockDim.x &gt;= n4. For threads with idx &gt;= n4, `idx_tail = n4*4 + idx &gt;= n4*4 + n4 &gt; n` (since n4*4 &lt;= n &lt; n4*4 + 4). Actually n4*4 + n4 is &gt; n for large n. For n=67M, n4=16.7M, n4*4 + n4 = 83.8M &gt; n. So for threads with idx &gt;= n4, idx_tail &gt;= n4*4 + n4 &gt; n, so they won&#x27;t do the tail either. So it&#x27;s safe. But what if n is small? Let&#x27;s say n=5. n4=1. Launch 1 block with say 256 threads. idx=0 does float4 for elements 0-3. For idx=1..255, idx &gt;= n4 so skip float4. idx_tail = 4 + idx. For idx=1, idx_tail=5 which is &lt; n? n=5, so idx_tail=5 is not &lt;5. So none do tail. But element 4 is not processed! Actually n=5, n4=1, tail elements are {4}. idx_tail for idx=0 is 4, which is &lt;5, so element 4 is processed by thread 0. Good. For idx=1..255, idx_tail &gt;=5, so they skip. So all good. What about n=6? n4=1. idx=0 processes elements 0-3 via float4, and element 4 via tail. idx=1 processes element 5 via tail (idx_tail=5 &lt; 6). So thread 1 handles one tail element. Good.
+
+Thus the combined kernel works. But we need to be careful about performance: the tail might cause divergence if n%4 != 0, but for our case n%4==0 so no tail. So performance is unaffected.
+
+However, using reinterpret_cast with float4 requires 16-byte alignment. PyTorch ensures alignment for CUDA tensors (usually 256 bytes). So it&#x27;s safe.
+
+Alternatively, we could use `__restrict__` to help the compiler.
+
+We can also compile with extra flags like `-O3` and maybe `--use_fast_math`. Let&#x27;s consider if `--use_fast_math` is safe. The tolerance is 1e-4. PyTorch&#x27;s CUDA implementation of tanh uses a custom approximation that might not be exactly `tanhf`. But typically, `torch.tanh` on CUDA calls `thrust::tanh` or a custom kernel that uses `tanh` from CUDA&#x27;s math library. I think the standard `tanhf` matches PyTorch&#x27;s tanh fairly well. The difference might be on the order of 1e-7. However, with `--use_fast_math`, the relative error can be larger (maybe 1e-5 or 1e-4?). I&#x27;d rather not risk it and compile without `--use_fast_math`. The overhead of `tanhf` without fast math is not huge, and the kernel is bandwidth bound anyway. So the compute part is negligible. Even if `tanhf` is slightly slower, the memory bandwidth is the bottleneck. Let&#x27;s run without fast math first.
+
+We have 50 tool calls. We need to compile, run correctness, maybe profile. Let&#x27;s write the code and compile.
+
+One more detail: the reference uses `math.sqrt(2.0 / math.pi)` which is a Python float (double precision) and then multiplied by a tensor. In CUDA, we should use `float` constants. `sqrt(2.0f / M_PI)` or constant `0.7978845608028654`. But using `0.7978845608f` is fine.
+
+Let&#x27;s draft the kernel code.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void gelu_kernel(const float* __restrict__ x, float* __restrict__ out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n4 = n &gt;&gt; 2;
+    if (idx &lt; n4) {
+        float4 vx = reinterpret_cast&lt;const float4*&gt;(x)[idx];
+        float4 vout;
+        #pragma unroll
+        for (int i = 0; i &lt; 4; ++i) {
+            float v = (&amp;vx.x)[i];
+            float v3 = v * v * v;
+            float t = tanhf(0.7978845608f * (v + 0.044715f * v3));
+            (&amp;vout.x)[i] = 0.5f * v * (1.0f + t);
+        }
+        reinterpret_cast&lt;float4*&gt;(out)[idx] = vout;
+    }
+    int idx_tail = (n4 &lt;&lt; 2) + idx;
+    if (idx_tail &lt; n) {
+        float v = x[idx_tail];
+        float v3 = v * v * v;
+        float t = tanhf(0.7978845608f * (v + 0.044715f * v3));
+        out[idx_tail] = 0.5f * v * (1.0f + t);
+    }
+}
+
+torch::Tensor gelu_forward(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    int n = x.numel();
+    const float* x_ptr = x.data_ptr&lt;float&gt;();
+    float* out_ptr = out.data_ptr&lt;float&gt;();
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    gelu_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(x_ptr, out_ptr, n);
+    return out;
+}
+&quot;&quot;&quot;
+
+cpp_sources = &quot;torch::Tensor gelu_forward(torch::Tensor x);&quot;
+
+module = load_inline(
+    name=&quot;gelu_cuda&quot;,
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_source,
+    functions=[&quot;gelu_forward&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x):
+        return module.gelu_forward(x)
+```
+
+Wait, `cpp_sources` in `load_inline` should contain the C++ wrapper declarations (function signatures) that pybind11 will use to generate bindings. Actually, according to PyTorch docs, `cpp_sources` should contain the C++ source code, and `functions` list the names of functions to bind. The CUDA source is in `cuda_sources`. The function `gelu_forward` is defined in the CUDA source (`.cu` file) and we need its declaration in the C++ source (`.cpp` file) or we can just put everything in `cuda_sources` and provide an empty `cpp_sources`? Actually `load_inline` requires `cpp_sources` to be a string. It generates a `.cpp` file with the given `cpp_sources` and a `.cu` file with `cuda_sources`. The function `gelu_forward` is defined in the `.cu` file (since it calls CUDA kernels). But we need a declaration in the `.cpp` file for the pybind11 binding. The docs say:
+
+```
+mod = torch.utils.cpp_extension.load_inline(
+    name=&quot;inline_extension&quot;,
+    cpp_sources=&quot;torch::Tensor foo(torch::Tensor x);&quot;,
+    cuda_sources=&quot;...&quot;,  # contains definition of foo
+    functions=[&quot;foo&quot;],
+    ...
+)
+```
+
+So the `cpp_sources` should contain declarations (or actual inline C++ code) and the `cuda_sources` should contain the CUDA definitions. In our case, `cpp_sources` can just be the declaration of `gelu_forward`. Or we can put a forward declaration: `torch::Tensor gelu_forward(torch::Tensor x);`. That&#x27;s correct.
+
+However, we might need to include `&lt;torch/extension.h&gt;` in `cpp_sources` too? Actually the generated `.cpp` file includes it automatically. But we need to make sure the function signature uses `torch::Tensor`. So the declaration is enough.
+
+Let&#x27;s make sure there are no issues with `math.h` vs `&lt;cmath&gt;`. In CUDA, `tanhf` is available in `&lt;math.h&gt;` and `&lt;cmath&gt;`. Using `tanhf` is fine.
+
+Let&#x27;s test compile.
+
+But there might be a subtlety: `float4` load from `const float*` via `reinterpret_cast&lt;const float4*&gt;(x)[idx]`. If `x` is not 16-byte aligned for the last block? Actually the pointer itself is 16-byte aligned, so `reinterpret_cast&lt;const float4*&gt;(x)` is aligned. Since `idx` is just an integer offset, `&amp;reinterpret_cast&lt;const float4*&gt;(x)[idx]` is `x + 4*idx`, which is always 16-byte aligned because `x` is 16-byte aligned and `4*idx*4` = `16*idx`. So each load is aligned. Good.
+
+Potential issue: if `n` is not a multiple of 4, the float4 load from `reinterpret_cast&lt;const float4*&gt;(x)[n4-1]` reads beyond the end of the array if we launch threads for n4. Wait, we only launch threads for `n4` float4 elements. The last float4 element covers indices `4*(n4-1)` to `4*n4-1`. If `n` is a multiple of 4, `4*n4 == n`, so it&#x27;s exactly the last element. If `n` is not a multiple of 4, `4*n4 &lt; n`, and the last float4 would cover indices beyond `n` if we loaded it. However, we only load `n4` float4s, where `n4 = n / 4` (integer division). So the last loaded float4 has index `n4 - 1`, covering `4*(n4-1)` to `4*n4 - 1`. Since `4*n4 &lt;= n`, the last loaded float4 covers up to `4*n4 - 1` which is `&lt; n`. So we never load beyond the array. The remaining elements (`n%4`) are handled by the scalar tail, reading from `x[idx_tail]` where `idx_tail &gt;= 4*n4`. So no out-of-bounds loads. But what about stores? The float4 store writes to `out` at `idx &lt; n4`, which covers `0` to `4*n4 - 1`, all valid. The scalar tail writes to `idx_tail` which is `&lt; n`. So safe.
+
+But we must ensure that the float4 path is not executed by threads with `idx &gt;= n4`; those skip it, and the tail condition ensures they don&#x27;t write out of bounds. Good.
+
+Now, compile.
+
+One more thought: `torch.utils.cpp_extension.load_inline` may need `with_cuda=True` or it infers from `cuda_sources`. It should infer. Also `extra_cuda_cflags` is for CUDA source compilation flags. We can add `-O3`. We might also want `--use_fast_math` but we decided against it.
+
+Let&#x27;s compile and check correctness.
+
+I will write the full kernel code and compile it.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n__global__ void gelu_kernel(const float* __restrict__ x, float* __restrict__ out, int n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int n4 = n &gt;&gt; 2;\n    if (idx &lt; n4) {\n        float4 vx = reinterpret_cast&lt;const float4*&gt;(x)[idx];\n        float4 vout;\n        #pragma unroll\n        for (int i = 0; i &lt; 4; ++i) {\n            float v = (&amp;vx.x)[i];\n            float v3 = v * v * v;\n            float t = tanhf(0.7978845608f * (v + 0.044715f * v3));\n            (&amp;vout.x)[i] = 0.5f * v * (1.0f + t);\n        }\n        reinterpret_cast&lt;float4*&gt;(out)[idx] = vout;\n    }\n    int idx_tail = (n4 &lt;&lt; 2) + idx;\n    if (idx_tail &lt; n) {\n        float v = x[idx_tail];\n        float v3 = v * v * v;\n        float t = tanhf(0.7978845608f * (v + 0.044715f * v3));\n        out[idx_tail] = 0.5f * v * (1.0f + t);\n    }\n}\n\ntorch::Tensor gelu_forward(torch::Tensor x) {\n    auto out = torch::empty_like(x);\n    int n = x.numel();\n    const float* x_ptr = x.data_ptr&lt;float&gt;();\n    float* out_ptr = out.data_ptr&lt;float&gt;();\n    int threads = 256;\n    int blocks = (n + threads * 4 - 1) / (threads * 4);\n    gelu_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(x_ptr, out_ptr, n);\n    return out;\n}\n\&quot;\&quot;\&quot;\n\ncpp_sources = \&quot;\&quot;\&quot;\ntorch::Tensor gelu_forward(torch::Tensor x);\n\&quot;\&quot;\&quot;\n\ngelu_cuda = load_inline(\n    name=\&quot;gelu_cuda\&quot;,\n    cpp_sources=cpp_sources,\n    cuda_sources=cuda_source,\n    functions=[\&quot;gelu_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super(ModelNew, self).__init__()\n\n    def forward(self, x):\n        return gelu_cuda.gelu_forward(x)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ImportError.
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15&#x27; not found (required by /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_1_problem_88_cache/k_48246bd834f4/gelu_cuda/gelu_cuda.so)</div></details></div></details></div>
 </body></html>
