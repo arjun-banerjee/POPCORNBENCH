@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 2</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 22:00:35 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 2</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 22:05:57 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">2_FusedMultiStepDiffusionSolver.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 8</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">3 / 8</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">3</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -138,5 +138,1451 @@ def get_inputs():
 
 def get_init_inputs():
     return [dim, num_fused_steps, total_timesteps]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 176.9s · 82,632 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 176.9s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to write a custom CUDA kernel that replaces the forward computation of the given PyTorch model. The model is a fused multi-step diffusion denoising. It has a small MLP `eps_net` (Linear+SiLU+Linear+SiLU+Linear). The forward loop runs `num_fused_steps` times (default 16). In each step, it normalizes the time index `t_idx = t_start - k` as float divided by total_timesteps, concatenates with `x_cur`, runs through `eps_net`, then computes `x_cur = c1 * (x_cur - c2 * eps)` where `c1` and `c2` are looked up from buffers based on `t_idx`.
+
+The goal: write a custom CUDA kernel that does this more efficiently. We need to preserve the weights `eps_net` as PyTorch parameters (or copy them). Since the model is small, maybe we can fuse the MLP with the loop inside a single kernel. The kernel will take x, t_start, and the weights (3 linear layers: W1,b1; W2,b2; W3,b3), and buffers `sqrt_recip_alphas` and `coef_eps`. It will compute the final output after `num_fused_steps` iterations.
+
+Because `num_fused_steps` is small (16) and batch size is 8, dim is 64, hidden is dim*4 = 256. This is tiny. The kernel should be lightweight but optimized. However, for maximum speed on GPU, we might want to launch one thread block per batch element, or one thread per element, etc.
+
+But we need to write in C++ (CUDA) and compile via torch.utils.cpp_extension.load_inline.
+
+First, let&#x27;s think about the PyTorch reference overhead: Python loop of 16 steps, each step does a MLP (3 linears with SiLU). That&#x27;s 16 * (Linear(65-&gt;256) + SiLU + Linear(256-&gt;256) + SiLU + Linear(256-&gt;64)). Each linear is a GEMM. With B=8, these GEMMs are extremely small (e.g., 8x65 * 65x256 = tiny). So the GPU might be underutilized, and Python/launch overhead dominates. A fused kernel that does everything in one launch will be much faster.
+
+We should write a kernel that handles one batch element per thread block or per warp. Since B is small, maybe each thread block handles one sample, and threads within the block compute the MLP.
+
+The MLP dimensions:
+
+- Input: dim+1 = 65
+- Hidden: dim*4 = 256
+- Output: dim = 64
+
+The loop: for k in 0..num_fused_steps-1:
+
+1. t_idx = t_start - k
+2. t_norm = t_idx / total_timesteps (float)
+3. x_cur (dim) and t_norm form input vector of size dim+1.
+4. Compute hidden1 = W1 * input + b1 (size 256)
+5. Apply SiLU: x * sigmoid(x). (or PyTorch&#x27;s SiLU which is x * sigmoid(x))
+6. Compute hidden2 = W2 * hidden1 + b2 (size 256)
+7. Apply SiLU.
+8. Compute eps = W3 * hidden2 + b3 (size 64)
+9. c1 = sqrt_recip_alphas[t_idx]
+10. c2 = coef_eps[t_idx]
+11. x_cur = c1 * (x_cur - c2 * eps)
+
+We need to store x_cur in registers/shared memory.
+
+Since B=8 and hidden=256, we can process each batch element with a block of e.g., 256 threads. But 256 threads might be okay. Or we can process each sample with a block of 64 threads.
+
+Given the tiny sizes, we probably want each block to handle one sample and use shared memory for intermediate vectors (e.g., hidden1, hidden2). Since hidden is 256 and dim is 64, we can store hidden in shared memory (256 floats = 1KB). For B=8, total shared memory per block is small.
+
+Alternatively, each thread can compute one element of the hidden vector, doing the dot product with the input vector. That might be efficient if we load input into shared memory and weights from global memory. But weights are small (65*256 + 256*256 + 256*64 ≈ 16K + 65K + 16K = ~97K floats ~ 388KB). They could reside in L2 cache.
+
+Given the small problem size, the simplest approach: one thread block per sample, threads = hidden_size (256) for the first two layers, then maybe 64 for the last. But having different thread counts per layer is tricky. Alternatively, we can have each block contain e.g., 256 threads, and for output layers with smaller dimensions, some threads are idle.
+
+Better: use 256 threads per block. For each layer, each thread computes one output element (if output size &lt;= 256). For the final output (64), only first 64 threads compute.
+
+For matrix multiplication of a vector (size in) with weight matrix (out x in), each thread computes a dot product over in. Since in is small (65 or 256), each thread does a small loop.
+
+Because the weights are stored in global memory (as contiguous tensors), each thread reads its row of weights. To improve coalescing, we should store weights in column-major or row-major depending on layout. PyTorch&#x27;s Linear weight is stored as (out_features, in_features) in row-major (i.e., contiguous along in_features). So weight[row * in_features + col]. Each thread reads a row (i.e., in_features consecutive elements). That&#x27;s good coalescing across threads (each thread reads its own contiguous block). So we can just have each thread read its row.
+
+So kernel design:
+
+- Launch B blocks (one per sample).
+- Each block has H threads, where H = max(hidden_size, dim) = 256. Let&#x27;s use 256 threads.
+- Use shared memory for:
+  - `x_cur` (dim floats)
+  - `input` (dim+1 floats)
+  - `hidden1` (hidden floats)
+  - `hidden2` (hidden floats)
+  - `eps` (dim floats)
+  - maybe also `t_start` (one int) per block.
+  
+  Total shared memory: (64 + 65 + 256 + 256 + 64) * 4 = ~2.8KB. Well within limits.
+
+But wait: if each block processes one sample, we need to loop over `k`. In each iteration:
+
+1. Thread 0 loads `t_start` for this block (from global memory) into a register or shared memory. Actually `t_start` is per sample: `t_start[sample_idx]`. We can load it in thread 0.
+2. Compute `t_idx = t_start - k`.
+3. Compute `t_norm = float(t_idx) / total_timesteps`.
+4. Threads collaboratively fill `input` shared memory: first `dim` elements from `x_cur`, last element = `t_norm`. Since there are 256 threads, we can have threads 0..dim-1 copy `x_cur`, thread dim copy `t_norm`.
+5. __syncthreads().
+6. Compute `hidden1[i] = sum_j(W1[i][j] * input[j]) + b1[i]` for i = threadIdx.x if threadIdx.x &lt; hidden_size.
+   Each thread loops over `in=dim+1` and accumulates.
+7. Apply SiLU in-place: `hidden1[i] = hidden1[i] * sigmoid(hidden1[i])`.
+8. __syncthreads().
+9. Compute `hidden2[i] = sum_j(W2[i][j] * hidden1[j]) + b2[i]` for i = threadIdx.x if &lt; hidden_size. Loop over `hidden_size`.
+10. Apply SiLU.
+11. __syncthreads().
+12. Compute `eps[i] = sum_j(W3[i][j] * hidden2[j]) + b3[i]` for i = threadIdx.x if &lt; dim. Loop over `hidden_size`.
+13. __syncthreads().
+14. Compute new `x_cur[i] = c1 * (x_cur[i] - c2 * eps[i])` for i = threadIdx.x if &lt; dim.
+   `c1` and `c2` are scalar floats looked up from global buffers at index `t_idx`. Thread 0 can load them, or all threads can load (broadcast from L1/L2). Since t_idx is same for all threads in the block, it&#x27;s fine if everyone loads.
+15. __syncthreads().
+
+After loop, write `x_cur` back to global output.
+
+But there is a subtlety: `t_idx` may differ across blocks (since each block handles a different sample). That&#x27;s fine.
+
+Because the weights are small, we can pass them as `torch::Tensor` to the kernel. We need to extract pointers.
+
+Let&#x27;s consider if we can further optimize by unrolling the loop (since num_fused_steps is compile-time constant or runtime). It&#x27;s runtime (constructor arg), but in the harness it&#x27;s fixed at 16. We can pass it as a template parameter if we want to unroll, but it&#x27;s easier to pass as a runtime integer. Since it&#x27;s small, the loop overhead inside the kernel is negligible.
+
+But there might be a better approach: we can process multiple samples within a block to increase occupancy. Since B=8, launching 8 blocks of 256 threads each might be okay, but occupancy could be low if the kernel uses a lot of registers or shared memory. With 256 threads per block and 2.8KB shared memory, occupancy is limited by thread count: on an SM with max 2048 threads, we can have 8 blocks per SM. With 8 blocks total, we only use 1 SM. But that&#x27;s fine because the problem is tiny; the speedup will come from fusing everything into a single kernel, eliminating Python loop and kernel launch overhead.
+
+Actually, the Python reference does 16 iterations of a small MLP. Each iteration involves multiple PyTorch ops (cat, linear, silu, etc.), each launching a kernel. That&#x27;s ~16 * ~6 = ~96 kernel launches. Our fused kernel does 1 launch. This alone will be a massive speedup.
+
+But to get even more speedup, we should ensure the kernel is well-written.
+
+Potential issues: correctness of SiLU. PyTorch SiLU is `x * sigmoid(x)`. We can implement `1.0f / (1.0f + expf(-x))`. For x large negative, expf overflows? `expf(-x)` for x = -100 gives `expf(100)` which is huge (float overflow to inf). `1/(1+inf) = 0`, which is fine. For x = 100, `expf(-100) ~ 0`, `1/(1+0) = 1`, fine. So standard sigmoid is okay. However, we can also use the intrinsic `fmaxf` or fast math? Let&#x27;s just use standard `1.0f / (1.0f + expf(-x))`. Use float functions.
+
+Alternatively, we can compute SiLU as `x / (1.0f + expf(-x))`. That&#x27;s `x * sigmoid(x)`. Good.
+
+Now, we need to define the Python file with `ModelNew`. The `ModelNew` class should store the same parameters as `Model` (the weights and buffers). The reference `ModelNew` delegates to `Model`. We need to create our own `ModelNew` that copies the weights from the reference or defines them itself.
+
+In the evaluation harness, I think they instantiate `Model` and `ModelNew` separately using `get_init_inputs()`. They will compare the outputs. So `ModelNew` must have its own parameters. We can initialize them similarly: create `nn.Linear` layers, copy the weights from the reference? No, the harness will instantiate `ModelNew` from scratch and then load state dict? Actually, I&#x27;m not sure how the weights are set. Usually in KernelBench, the reference model is instantiated and then `ModelNew` is instantiated with the same constructor args. If the weights are randomly initialized, the harness may copy the reference model&#x27;s state dict to `ModelNew` if we don&#x27;t set it, or they may compare outputs of both with random weights. The important thing is that `ModelNew` must have the same architecture so that if weights are copied, it works.
+
+Wait, looking at the default `ModelNew`, it delegates to `Model` by storing `_impl = Model(...)`. That ensures same weights if initialized from scratch. But if we write our own `ModelNew`, we need to ensure that the weights are accessible and have the same names as the reference. The harness likely does something like:
+
+```
+model = Model(*get_init_inputs())
+model_new = ModelNew(*get_init_inputs())
+# maybe copy state_dict? Or compare outputs with same inputs but different weights?
+# Actually they might just compare using the model&#x27;s own weights.
+```
+
+In many KernelBench tasks, the harness takes the reference model, generates inputs, runs forward, then replaces the module with ModelNew, copies weights, and expects same output. But I need to be careful.
+
+Let&#x27;s look at the task description: &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel.&quot; &quot;Your ModelNew class must accept the same constructor arguments.&quot; The evaluation likely creates both models, and either copies the state dict from the reference to ModelNew or ensures they are initialized the same. To be safe, we can define `ModelNew` to call the reference `Model`&#x27;s `__init__` to get the parameters, then in forward call the custom kernel using those parameters. That way we guarantee same parameters.
+
+But the reference `Model` registers buffers `betas`, `alphas`, `alphas_cumprod`, `sqrt_recip_alphas`, `coef_eps`, and parameters `eps_net.0.weight/bias`, `eps_net.2.weight/bias`, `eps_net.4.weight/bias`. We can simply call `super().__init__(...)`? Actually `ModelNew` inherits from `nn.Module`. We could instantiate a `Model` inside and store it, but then we could just call its forward. But we want to avoid that because the point is to replace forward. However, we can still store the submodules and buffers from `Model` for convenience.
+
+Simpler: In `ModelNew.__init__`, construct the same layers as `Model`. In fact, we can call the same code:
+
+```
+self.dim = dim
+self.num_fused_steps = num_fused_steps
+self.total_timesteps = total_timesteps
+self.eps_net = nn.Sequential(
+    nn.Linear(dim + 1, dim * 4),
+    nn.SiLU(),
+    nn.Linear(dim * 4, dim * 4),
+    nn.SiLU(),
+    nn.Linear(dim * 4, dim),
+)
+# register buffers
+...
+```
+
+But we need to ensure weight initialization matches. If the harness copies state dict, we need matching keys. If we define modules with same names, the state dict keys will match. However, if the harness uses random weights, both will have random weights and outputs won&#x27;t match unless we copy the reference state dict. Usually KernelBench copies the state dict from the reference to the candidate automatically, or it runs get_inputs and checks that the candidate&#x27;s output matches the reference&#x27;s output for the same model instance? Actually, looking at the typical KernelBench harness, they do something like:
+
+```
+model = Model(...)
+model_new = ModelNew(...)
+model_new.load_state_dict(model.state_dict())
+# then compare forward
+```
+
+I think they do copy state dict. So we just need matching state dict keys.
+
+But the default `ModelNew` delegates to `_impl = Model(...)`. That is safe. We can do something similar: store a `Model` instance in `self.ref = Model(...)` but then write a custom forward that uses the parameters from `self.ref`. That way we don&#x27;t have to recreate the buffers and parameters manually, and the state dict will be nested under `ref.*`. Wait, if they do `model_new.load_state_dict(model.state_dict())`, the keys of `model_new` must match `model`. If `model_new` has attribute `ref`, the keys would be `ref.eps_net.0.weight`, etc., while `model` has `eps_net.0.weight`. The state dict keys won&#x27;t match unless they are flattened and prefixed. `nn.Module.load_state_dict` expects matching keys. So if we nest the reference model inside, the keys will have the `ref.` prefix, and loading will fail (missing keys, unexpected keys). Unless we override `load_state_dict` or `state_dict`, but that&#x27;s messy.
+
+Better to define the layers directly in `ModelNew` with the same names. So:
+
+```
+class ModelNew(nn.Module):
+    def __init__(self, dim, num_fused_steps, total_timesteps=1000):
+        super().__init__()
+        self.dim = dim
+        self.num_fused_steps = num_fused_steps
+        self.total_timesteps = total_timesteps
+        self.eps_net = nn.Sequential(
+            nn.Linear(dim + 1, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer(&quot;betas&quot;, betas)
+        self.register_buffer(&quot;alphas&quot;, alphas)
+        self.register_buffer(&quot;alphas_cumprod&quot;, alphas_cumprod)
+        self.register_buffer(&quot;sqrt_recip_alphas&quot;, torch.sqrt(1.0 / alphas))
+        self.register_buffer(&quot;coef_eps&quot;, betas / torch.sqrt(1.0 - alphas_cumprod))
+```
+
+This matches the reference exactly. Then in `forward`, we call the custom CUDA kernel, passing the tensors directly.
+
+Now, we need to compile the inline CUDA extension.
+
+Let&#x27;s design the kernel.
+
+**Kernel signature** (C++ host wrapper):
+
+```
+torch::Tensor fused_diffusion_forward(
+    torch::Tensor x,
+    torch::Tensor t_start,
+    torch::Tensor w1,
+    torch::Tensor b1,
+    torch::Tensor w2,
+    torch::Tensor b2,
+    torch::Tensor w3,
+    torch::Tensor b3,
+    torch::Tensor sqrt_recip_alphas,
+    torch::Tensor coef_eps,
+    int num_fused_steps,
+    int total_timesteps);
+```
+
+Where:
+- x: (B, dim)
+- t_start: (B,)
+- w1: (hidden, dim+1)
+- b1: (hidden,)
+- w2: (hidden, hidden)
+- b2: (hidden,)
+- w3: (dim, hidden)
+- b3: (dim,)
+- sqrt_recip_alphas: (total_timesteps,)
+- coef_eps: (total_timesteps,)
+
+**CUDA kernel**:
+
+```
+template &lt;int DIM, int HIDDEN&gt;
+__global__ void diffusion_kernel(
+    const float* __restrict__ x_in,
+    const int64_t* __restrict__ t_start,
+    float* __restrict__ x_out,
+    const float* __restrict__ w1,
+    const float* __restrict__ b1,
+    const float* __restrict__ w2,
+    const float* __restrict__ b2,
+    const float* __restrict__ w3,
+    const float* __restrict__ b3,
+    const float* __restrict__ sqrt_recip_alphas,
+    const float* __restrict__ coef_eps,
+    int num_fused_steps,
+    int total_timesteps,
+    int B)
+```
+
+But since we know DIM=64, HIDDEN=256 at runtime, we can pass them as arguments and use them in loops. For tiny loops, the compiler will unroll if we use constexpr? We can pass as template parameters, but they are dynamic (dim is constructor arg). In the harness, dim is fixed at 64, but could be changed by evaluator? The task says use constructor args, but the kernel should handle arbitrary dim? It might be safer to pass dim and hidden as runtime ints. The loop sizes are small (&lt;=256), so no issue.
+
+Alternatively, we can have the kernel read dimensions from arguments, and the compiler will handle the loops. This is fine.
+
+**Shared memory** per block:
+
+Since B is small, one block per batch element is fine. But we could also process multiple elements per block. Let&#x27;s think about occupancy. If we launch B blocks, each with 256 threads, and we have e.g., an A100 (108 SMs), then only 8 blocks are launched. This means at most 8 SMs are used (1 block per SM if limited by threads), or up to 8 blocks per SM if registers/shared memory allow. So total utilization is tiny, but the problem is tiny too.
+
+But maybe we can process all B elements in a single block? Then we have 256 threads, each processing a slice across B? Or maybe one warp per sample? B=8, so we could have 8 warps (256 threads) per block, each warp handling one sample. This might be better because we increase occupancy? Actually occupancy per SM is about active warps. With one block of 256 threads (8 warps), we get 1 block per SM. With 8 blocks of 256 threads, we also get 1 block per SM (since max 2048 threads = 8 blocks of 256, but only if there are enough SMs). Actually, if we have 108 SMs, we can have 108 blocks concurrently. With only 8 blocks, only 8 SMs will have a block. So utilization is low. But the kernel will finish so quickly it might not matter.
+
+However, to be safe and potentially get better performance on whatever GPU they test (maybe a smaller one), we can process all B samples in a single block. Or we can process each sample in its own block, but with fewer threads per block to allow more blocks per SM? Wait, the number of blocks is B. If B &lt; SM count, we can&#x27;t fill all SMs. But if we use multiple blocks per sample? Not necessary.
+
+I think one block per sample is simplest and will be sufficiently faster than the reference. Let&#x27;s stick with that.
+
+But there is another consideration: register usage. Each thread loops over input dimensions. For the first layer, input size = dim+1 = 65. Each thread reads a row of w1 (65 floats). It can read them sequentially from global memory. Since each thread reads its own row, there is no bank conflict. Register usage per thread: a loop counter, an accumulator, maybe a few pointers. That&#x27;s low.
+
+For the second layer, input size = hidden = 256. Each thread reads 256 floats from w2. That&#x27;s okay.
+
+For the third layer, input size = hidden = 256. Each thread reads 256 floats from w3.
+
+Total registers per thread maybe ~32. So per block 256 threads * 32 regs = 8192 regs. SM register file is 64KB (A100) or 256KB. So we can have multiple blocks.
+
+Let&#x27;s write the kernel.
+
+**Details:**
+
+We need to be careful about `t_start` dtype: `int64_t` (long). In the reference, `t_start.long()` is used.
+
+The buffers `sqrt_recip_alphas` and `coef_eps` are float tensors of size `total_timesteps`.
+
+**Kernel code:**
+
+```
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float silu(float x) {
+    return x * sigmoid(x);
+}
+```
+
+**Shared memory layout:**
+
+We can allocate a single shared memory array and partition it:
+
+- `x_cur` : dim floats
+- `input` : dim+1 floats
+- `hidden` : hidden floats (we can reuse for hidden1 and hidden2)
+- `eps` : dim floats
+
+Actually we need hidden1 and hidden2 simultaneously only between layer 1 and 2, and 2 and 3. So we can reuse a single `hidden` buffer.
+
+Total shared memory = (dim + (dim+1) + hidden + dim) * sizeof(float) = (64 + 65 + 256 + 64)*4 = 1796 bytes. Very small.
+
+So:
+
+```
+extern __shared__ float s_mem[];
+float* s_x = s_mem;
+float* s_in = s_x + dim;
+float* s_hid = s_in + (dim + 1);
+float* s_eps = s_hid + hidden;
+```
+
+But `dim` and `hidden` are not compile-time constants in the generic kernel. However, we can compute the shared memory size per block at launch: `shared_mem_size = (dim + (dim+1) + hidden + dim) * sizeof(float)`. Then we can use dynamic shared memory. Since we pass pointers based on offsets, it&#x27;s fine. But if dim/hidden are template parameters, we could allocate static shared memory. But we don&#x27;t know them at compile time? Actually we could make them template parameters and instantiate for the known sizes (64,256). But to be generic, dynamic shared memory is fine.
+
+Wait, in the kernel we need to know dim and hidden. They are passed as ints. So we can do:
+
+```
+int dim = ...;
+int hidden = ...;
+float* s_x = s_mem;
+float* s_in = s_x + dim;
+float* s_hid = s_in + dim + 1;
+float* s_eps = s_hid + hidden;
+```
+
+But we need to compute the total shared memory size per block when launching: `shared_mem_size = (dim + dim + 1 + hidden + dim) * sizeof(float)`. That is known on host side.
+
+Actually, using dynamic shared memory with offsets based on runtime variables is fine.
+
+**Kernel body:**
+
+```
+const int b = blockIdx.x;
+if (b &gt;= B) return;
+const int tid = threadIdx.x;
+
+// Load initial x
+if (tid &lt; dim) {
+    s_x[tid] = x_in[b * dim + tid];
+}
+__syncthreads();
+
+int t0 = static_cast&lt;int&gt;(t_start[b]);
+
+for (int k = 0; k &lt; num_fused_steps; ++k) {
+    int t_idx = t0 - k;
+    float t_norm = static_cast&lt;float&gt;(t_idx) / static_cast&lt;float&gt;(total_timesteps);
+
+    // Build input
+    if (tid &lt; dim) {
+        s_in[tid] = s_x[tid];
+    }
+    if (tid == dim) {
+        s_in[tid] = t_norm;
+    }
+    __syncthreads();
+
+    // Layer 1
+    if (tid &lt; hidden) {
+        const float* w_row = w1 + tid * (dim + 1);
+        float acc = b1[tid];
+        #pragma unroll
+        for (int i = 0; i &lt; dim + 1; ++i) {
+            acc += w_row[i] * s_in[i];
+        }
+        s_hid[tid] = silu(acc);
+    }
+    __syncthreads();
+
+    // Layer 2
+    if (tid &lt; hidden) {
+        const float* w_row = w2 + tid * hidden;
+        float acc = b2[tid];
+        #pragma unroll
+        for (int i = 0; i &lt; hidden; ++i) {
+            acc += w_row[i] * s_hid[i];
+        }
+        s_hid[tid] = silu(acc);
+    }
+    __syncthreads();
+
+    // Layer 3
+    if (tid &lt; dim) {
+        const float* w_row = w3 + tid * hidden;
+        float acc = b3[tid];
+        for (int i = 0; i &lt; hidden; ++i) {
+            acc += w_row[i] * s_hid[i];
+        }
+        s_eps[tid] = acc;
+    }
+    __syncthreads();
+
+    // Update x
+    if (tid &lt; dim) {
+        float c1 = sqrt_recip_alphas[t_idx];
+        float c2 = coef_eps[t_idx];
+        s_x[tid] = c1 * (s_x[tid] - c2 * s_eps[tid]);
+    }
+    __syncthreads();
+}
+
+// Write output
+if (tid &lt; dim) {
+    x_out[b * dim + tid] = s_x[tid];
+}
+```
+
+But there&#x27;s a problem: `t_idx` may be out of bounds for the buffers if `t_idx` is negative? The reference asserts `t_start &gt;= num_fused_steps` so `t_idx &gt;= 1` always. Since total_timesteps &gt;= num_fused_steps+1, t_idx is at most total_timesteps-1. So safe.
+
+Wait: `t_start` is in `[num_fused_steps, total_timesteps-1]`. So `t_idx = t_start - k` ranges down to `t_start - (num_fused_steps - 1) &gt;= 1`. So indices are 1..total_timesteps-1. `sqrt_recip_alphas` and `coef_eps` have length `total_timesteps`, index 0..total_timesteps-1. So valid.
+
+But in C++ we need to be careful: `t_idx` is `int`, `sqrt_recip_alphas` is a float pointer. `sqrt_recip_alphas[t_idx]` is fine.
+
+Potential issue: `t_idx = t0 - k`. `t0` is `int`, `k` is `int`. `t0` might be up to 999. Fine.
+
+Are we missing any `__syncthreads()`? Let&#x27;s check.
+
+- After loading initial x: yes.
+- After building input: yes.
+- After layer1: yes.
+- After layer2: yes.
+- After layer3: yes (needed before reading s_eps).
+- After update x: yes (needed for next iteration&#x27;s input build).
+
+Looks good.
+
+But there is a subtle bug: In the layer 2 computation, `s_hid` is being overwritten by all threads. But `s_hid` is also being read by all threads for the dot product. We have `__syncthreads()` before layer2, so all threads have finished writing layer1 output? Yes. But during the dot product in layer2, threads read `s_hid[i]`. Since all threads write their own element after computing, there is no race while reading because `__syncthreads()` ensures all writes from previous step are visible. So it&#x27;s fine.
+
+Wait, in layer1, thread `tid` writes `s_hid[tid]`. Then `__syncthreads()`. In layer2, thread `tid` reads all `s_hid[i]`. That&#x27;s fine.
+
+Similarly for layer3: `s_hid` contains hidden2. Thread `tid` writes `s_eps[tid]`. Then `__syncthreads()`. Then update reads `s_eps[tid]`. Good.
+
+One more thing: In the input build, `if (tid == dim) s_in[tid] = t_norm;`. This means that if `dim` is 64 and `hidden` is 256, `tid` ranges 0..255. So `tid == 64` is valid. But what if `dim` is e.g., 300 and `hidden` is 256? Then no thread has `tid == dim`. That would be a problem. However, the harness has `dim=64` and `hidden=256`. But we want to be generic. We could do:
+
+```
+if (tid &lt; dim) {
+    s_in[tid] = s_x[tid];
+}
+if (tid == 0) {
+    s_in[dim] = t_norm;
+}
+```
+
+That ensures the last element is written regardless of thread count. But then we must ensure `dim` doesn&#x27;t exceed `num_threads`. Since we plan to set `num_threads = hidden`, and `hidden = dim * 4`, `hidden` &gt;= `dim` for dim&gt;=1. So `tid &lt; dim` covers all x elements. But `tid == dim` is only true if `hidden &gt; dim`, which is true. However, if `dim` is larger than `hidden`, it&#x27;s not. But in this specific architecture, hidden = dim*4, so it&#x27;s fine. To be safe, we can use `if (tid == 0) s_in[dim] = t_norm;`. That&#x27;s safe for any configuration as long as `num_threads &gt;= 1`. But `tid == 0` will cause warp divergence? Not really, it&#x27;s just one thread. But it&#x27;s safe. Actually, better to do:
+
+```
+if (tid &lt; dim) {
+    s_in[tid] = s_x[tid];
+} else if (tid == dim) {
+    s_in[tid] = t_norm;
+}
+```
+
+But if dim &gt;= num_threads, no thread writes t_norm. So to be generic, use `if (tid == 0) s_in[dim] = t_norm;`. That works as long as we have at least 1 thread. And since `hidden &gt;= dim`, we&#x27;ll have enough threads.
+
+Alternatively, we can always set `s_in[dim] = t_norm` in thread 0:
+
+```
+if (tid == 0) {
+    s_in[dim] = t_norm;
+}
+if (tid &lt; dim) {
+    s_in[tid] = s_x[tid];
+}
+__syncthreads();
+```
+
+But wait, if `tid == 0` also writes `s_in[0] = s_x[0]`, we need to not overwrite t_norm. So:
+
+```
+if (tid &lt; dim) {
+    s_in[tid] = s_x[tid];
+}
+if (tid == 0) {
+    s_in[dim] = t_norm;
+}
+__syncthreads();
+```
+
+That&#x27;s fine because thread 0 writes `s_in[0]` and `s_in[dim]`. No conflict.
+
+However, in our case `dim=64`, `hidden=256`. `tid==dim` (64) is a valid thread. We can keep it. But to be safe for generic hidden/dim, I&#x27;ll use `tid == 0`.
+
+Actually, the number of threads will be `max(hidden, dim)`. Since hidden = dim*4, it&#x27;s hidden. So `num_threads = hidden`. So `tid &lt; dim` covers x, `tid == dim` is valid. I think it&#x27;s safe.
+
+Let&#x27;s think about performance. Each thread in layer1 does a dot product of length 65. Unrolling might help. We can add `#pragma unroll` but with dynamic loop bound it won&#x27;t unroll. Since 65 is small and constant if we pass as template parameter, but we can also just leave it. The compiler might not unroll a loop with unknown bound. We can manually unroll using a switch or template if we want. But for tiny sizes, memory latency is more important.
+
+We could store w1, w2, w3 in shared memory? Weights are small. Let&#x27;s compute sizes:
+- w1: hidden * (dim+1) = 256 * 65 = 16640 floats = 64KB.
+- w2: 256 * 256 = 65536 floats = 256KB.
+- w3: 64 * 256 = 16384 floats = 64KB.
+Total = 384KB. This is larger than shared memory per SM (usually 164KB or 100KB depending on config). So we cannot store all weights in shared memory.
+
+But we can store input vectors (65, 256) in shared memory, which we already do.
+
+Another optimization: Since each thread reads a row of weight, it reads contiguous memory. That&#x27;s good. But there might be broadcast reads from `s_in[i]` or `s_hid[i]`. Those are shared memory reads, which are very fast. So the bottleneck is reading weights from global memory. Since weights are read repeatedly (16 times per block), they&#x27;ll be in L1/L2 cache. So performance should be decent.
+
+Wait, each block processes one sample, and loops 16 times. In each iteration, it reads the entire weight matrices again. With w1=64KB, w2=256KB, w3=64KB, total per iteration = 384KB. Over 16 iterations = 6MB per block. With B=8, total = 48MB. The L2 cache on A100 is 40MB. So weights might stay in L2 for the most part. But L1 per SM is smaller (192KB). So w1 and w3 might stay in L1, but w2 is 256KB, which might exceed L1. But L1 is shared by all blocks on the SM. Still, reading from L2 is fast.
+
+This kernel is compute-bound? Let&#x27;s check: each iteration per thread:
+- Layer1: 65 mult-adds + bias + silu.
+- Layer2: 256 mult-adds + bias + silu.
+- Layer3: 256 mult-adds + bias.
+Total MACs per thread per iteration ≈ 577. For hidden threads (256), total MACs per sample per iteration ≈ 256*577 ≈ 147K. For 16 iterations, 2.36M MACs. For B=8, total 19M MACs. At 312 TFLOPS (A100 fp32), this would take ~0.06 microseconds if fully utilized. In practice, memory bandwidth or latency will dominate. But compared to Python overhead of 96 kernel launches, our single kernel will be orders of magnitude faster.
+
+Now, writing the host wrapper:
+
+We need to check that inputs are contiguous and on CUDA. We&#x27;ll do that.
+
+```cpp
+torch::Tensor fused_diffusion_forward(
+    torch::Tensor x,
+    torch::Tensor t_start,
+    torch::Tensor w1,
+    torch::Tensor b1,
+    torch::Tensor w2,
+    torch::Tensor b2,
+    torch::Tensor w3,
+    torch::Tensor b3,
+    torch::Tensor sqrt_recip_alphas,
+    torch::Tensor coef_eps,
+    int num_fused_steps,
+    int total_timesteps) {
+    
+    int B = x.size(0);
+    int dim = x.size(1);
+    int hidden = w1.size(0); // hidden
+    // assume all are contiguous float32 on cuda
+    
+    auto x_out = torch::empty_like(x);
+    
+    const int threads = hidden; // 256
+    const int blocks = B;
+    size_t shared_mem = (dim + (dim + 1) + hidden + dim) * sizeof(float);
+    
+    diffusion_kernel&lt;&lt;&lt;blocks, threads, shared_mem&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        t_start.data_ptr&lt;int64_t&gt;(),
+        x_out.data_ptr&lt;float&gt;(),
+        w1.data_ptr&lt;float&gt;(),
+        b1.data_ptr&lt;float&gt;(),
+        w2.data_ptr&lt;float&gt;(),
+        b2.data_ptr&lt;float&gt;(),
+        w3.data_ptr&lt;float&gt;(),
+        b3.data_ptr&lt;float&gt;(),
+        sqrt_recip_alphas.data_ptr&lt;float&gt;(),
+        coef_eps.data_ptr&lt;float&gt;(),
+        num_fused_steps,
+        total_timesteps,
+        B,
+        dim,
+        hidden);
+    
+    return x_out;
+}
+```
+
+But we need to handle cases where `x` might be on CPU. The reference `forward` may be called with CPU tensors? The harness likely moves to CUDA. We can check `x.is_cuda()`. If not, we can fall back to a CPU implementation? The reference model runs on CPU if input is CPU. But the harness uses `backend=cuda`. I think inputs will be on CUDA. But to be safe, we can add a check and maybe move to CUDA or do a PyTorch fallback. However, fallback to reference model in Python is tricky because we don&#x27;t have access to `_impl` if we define our own. But we can just call the kernel and let it fail if not CUDA, which is okay for the harness.
+
+Alternatively, we can keep a reference `Model` inside `ModelNew` for fallback. But the state dict issue... Actually, we can keep a reference `self._fallback = Model(dim, num_fused_steps, total_timesteps)` and if `x` is not CUDA, call `self._fallback(x, t_start)`. But then state dict loading won&#x27;t match. Unless we don&#x27;t need fallback. I think it&#x27;s safe to assume CUDA.
+
+But the `run_correctness` tool might test on CPU? The description says &quot;backend=cuda&quot;. But the reference says &quot;Harness paths (measure_ref_program_time / eval) cast activations to fp32&quot;. It likely moves to CUDA device.
+
+Let&#x27;s check the GPU specs. We need to call `get_gpu_specs()` to calibrate. But we haven&#x27;t called it yet. Let&#x27;s do that first. Actually, let&#x27;s just start writing the kernel and test. We&#x27;ll call `get_gpu_specs` and then write kernel.
+
+Wait, we have limited tool calls (24 total). Each iteration uses compile, correctness, etc. We should be efficient. Let&#x27;s write the kernel carefully, compile, and test.
+
+One thing: Because `cpp_extension.load_inline` compiles at module load time, we need to write the CUDA code in a string. The Python file will define `ModelNew`. The `load_inline` call will happen at module import.
+
+We should make sure to include `#include &lt;torch/extension.h&gt;` and `using namespace torch;` or similar.
+
+We must not include a `PYBIND11_MODULE`. We list the function names in `functions=...`.
+
+**Potential issue:** In the CUDA kernel, we need to pass `dim` and `hidden`. But we need to compute `threads = hidden`. What if `hidden` is not a multiple of warp size? 256 is multiple of 32, so okay.
+
+**Vectorization:** We could use `float4` to load weights or inputs to speed up. Since `dim=64` and `hidden=256`, they are multiples of 4. We could read 4 floats at a time. But for simplicity, let&#x27;s first write a straightforward kernel and see if it compiles and passes.
+
+**Another thought:** The reference concatenates `x_cur` and `t_norm`. Instead of concatenation, we can just keep them separate and compute the MLP as two parts: first part = W1_x * x_cur + W1_t * t_norm + b1. That avoids the need to build the concatenated vector. But building it in shared memory is cheap. However, we can compute the dot product more efficiently by splitting the weight matrix.
+
+Specifically, w1 is (hidden, dim+1). We can split into w1_x (hidden, dim) and w1_t (hidden, 1). Then:
+
+`hidden1 = w1_x @ x_cur + w1_t * t_norm + b1`.
+
+Similarly for w2 and w3, no split needed.
+
+Since `x_cur` is already in shared memory, we can compute the dot product over dim and add the t component. This might be slightly faster because we avoid writing/reading `s_in`. But the difference is negligible. However, it also avoids needing `s_in` shared memory. But we can keep it simple with `s_in`.
+
+Wait, but if we use `s_in`, we also need to write `t_norm` into it. That&#x27;s trivial.
+
+Let&#x27;s think about register pressure. Each thread in layer1 loops over 65 elements. If we read `s_in[i]` each time, it&#x27;s a shared memory load. Good.
+
+**Another optimization:** Since `num_fused_steps` is 16, we can inline/loop. The compiler will keep `s_x` in shared memory. The weight pointers are global.
+
+But there is another issue: The kernel will be compiled with optimization, but if we don&#x27;t mark pointers as `__restrict__`, the compiler may assume aliasing. We should mark them `__restrict__`.
+
+Let&#x27;s write the kernel with `__restrict__`.
+
+**Thread blocks and occupancy:** We could consider using `dim` threads per block (64), and having each thread compute multiple outputs in layer1 and layer2 via reduction or strided loops? For example, with 64 threads, we could compute 256 outputs by having each thread compute 4 outputs. That reduces the thread count per block to 64, which might allow more blocks per SM (but we only have B blocks anyway). However, the dot product for each output is independent, so more threads is better for parallelism within the block.
+
+But if we have B=8 blocks of 256 threads, it&#x27;s fine.
+
+**One more thing:** `expf` might be slower than `__expf` (intrinsic). We can use `expf`. If we compile with `-use_fast_math`, it will be replaced. But we probably want accurate SiLU. Let&#x27;s see tolerance: fp32 atol=rtol=1e-4. `expf` is accurate enough. `__expf` is less accurate but might still be within 1e-4? Not sure. Let&#x27;s stick with `expf`.
+
+Actually, we can also implement SiLU using the `tanh` softplus approximation? No, PyTorch uses exact `x * sigmoid(x)`. So we should too.
+
+**Implementation plan:**
+
+Write the Python module as a string. Use `torch.utils.cpp_extension.load_inline`.
+
+Wait, we need to output a complete Python file. The file will contain the `ModelNew` class. It will also contain the `load_inline` call at module level.
+
+We need to make sure the compiled extension&#x27;s function is accessible. Usually `load_inline` returns a module. You can assign it to a global variable and call it.
+
+Example:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float silu(float x) {
+    return x * sigmoid(x);
+}
+
+__global__ void diffusion_kernel(
+    const float* __restrict__ x_in,
+    const int64_t* __restrict__ t_start,
+    float* __restrict__ x_out,
+    const float* __restrict__ w1,
+    const float* __restrict__ b1,
+    const float* __restrict__ w2,
+    const float* __restrict__ b2,
+    const float* __restrict__ w3,
+    const float* __restrict__ b3,
+    const float* __restrict__ sqrt_recip_alphas,
+    const float* __restrict__ coef_eps,
+    int num_fused_steps,
+    int total_timesteps,
+    int B,
+    int dim,
+    int hidden)
+{
+    const int b = blockIdx.x;
+    if (b &gt;= B) return;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float s_mem[];
+    float* s_x = s_mem;
+    float* s_in = s_x + dim;
+    float* s_hid = s_in + (dim + 1);
+    float* s_eps = s_hid + hidden;
+
+    // Load x
+    if (tid &lt; dim) {
+        s_x[tid] = x_in[b * dim + tid];
+    }
+    __syncthreads();
+
+    int t0 = static_cast&lt;int&gt;(t_start[b]);
+
+    for (int k = 0; k &lt; num_fused_steps; ++k) {
+        int t_idx = t0 - k;
+        float t_norm = static_cast&lt;float&gt;(t_idx) / static_cast&lt;float&gt;(total_timesteps);
+
+        if (tid &lt; dim) {
+            s_in[tid] = s_x[tid];
+        }
+        if (tid == 0) {
+            s_in[dim] = t_norm;
+        }
+        __syncthreads();
+
+        // Layer 1
+        if (tid &lt; hidden) {
+            const float* w_row = w1 + tid * (dim + 1);
+            float acc = b1[tid];
+            // Unroll hint
+            #pragma unroll 4
+            for (int i = 0; i &lt; dim + 1; ++i) {
+                acc += w_row[i] * s_in[i];
+            }
+            s_hid[tid] = silu(acc);
+        }
+        __syncthreads();
+
+        // Layer 2
+        if (tid &lt; hidden) {
+            const float* w_row = w2 + tid * hidden;
+            float acc = b2[tid];
+            #pragma unroll 4
+            for (int i = 0; i &lt; hidden; ++i) {
+                acc += w_row[i] * s_hid[i];
+            }
+            s_hid[tid] = silu(acc);
+        }
+        __syncthreads();
+
+        // Layer 3
+        if (tid &lt; dim) {
+            const float* w_row = w3 + tid * hidden;
+            float acc = b3[tid];
+            #pragma unroll 4
+            for (int i = 0; i &lt; hidden; ++i) {
+                acc += w_row[i] * s_hid[i];
+            }
+            s_eps[tid] = acc;
+        }
+        __syncthreads();
+
+        // Update x
+        if (tid &lt; dim) {
+            float c1 = sqrt_recip_alphas[t_idx];
+            float c2 = coef_eps[t_idx];
+            s_x[tid] = c1 * (s_x[tid] - c2 * s_eps[tid]);
+        }
+        __syncthreads();
+    }
+
+    if (tid &lt; dim) {
+        x_out[b * dim + tid] = s_x[tid];
+    }
+}
+
+torch::Tensor fused_diffusion_forward(
+    torch::Tensor x,
+    torch::Tensor t_start,
+    torch::Tensor w1,
+    torch::Tensor b1,
+    torch::Tensor w2,
+    torch::Tensor b2,
+    torch::Tensor w3,
+    torch::Tensor b3,
+    torch::Tensor sqrt_recip_alphas,
+    torch::Tensor coef_eps,
+    int num_fused_steps,
+    int total_timesteps)
+{
+    int B = x.size(0);
+    int dim = x.size(1);
+    int hidden = w1.size(0);
+
+    auto x_out = torch::empty_like(x);
+
+    const int threads = hidden;
+    const int blocks = B;
+    size_t shared_mem_size = (dim + (dim + 1) + hidden + dim) * sizeof(float);
+
+    diffusion_kernel&lt;&lt;&lt;blocks, threads, shared_mem_size&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        t_start.data_ptr&lt;int64_t&gt;(),
+        x_out.data_ptr&lt;float&gt;(),
+        w1.data_ptr&lt;float&gt;(),
+        b1.data_ptr&lt;float&gt;(),
+        w2.data_ptr&lt;float&gt;(),
+        b2.data_ptr&lt;float&gt;(),
+        w3.data_ptr&lt;float&gt;(),
+        b3.data_ptr&lt;float&gt;(),
+        sqrt_recip_alphas.data_ptr&lt;float&gt;(),
+        coef_eps.data_ptr&lt;float&gt;(),
+        num_fused_steps,
+        total_timesteps,
+        B,
+        dim,
+        hidden);
+
+    return x_out;
+}
+&quot;&quot;&quot;
+
+_fused_diffusion = load_inline(
+    name=&quot;fused_diffusion&quot;,
+    cpp_sources=cpp_source,
+    functions=[&quot;fused_diffusion_forward&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+```
+
+Then `ModelNew`:
+
+```python
+def _linear_beta_schedule(num_timesteps: int, beta_start: float, beta_end: float) -&gt; torch.Tensor:
+    return torch.linspace(beta_start, beta_end, num_timesteps)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):
+        super().__init__()
+        self.dim = dim
+        self.num_fused_steps = num_fused_steps
+        self.total_timesteps = total_timesteps
+
+        self.eps_net = nn.Sequential(
+            nn.Linear(dim + 1, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer(&quot;betas&quot;, betas)
+        self.register_buffer(&quot;alphas&quot;, alphas)
+        self.register_buffer(&quot;alphas_cumprod&quot;, alphas_cumprod)
+        self.register_buffer(&quot;sqrt_recip_alphas&quot;, torch.sqrt(1.0 / alphas))
+        self.register_buffer(&quot;coef_eps&quot;, betas / torch.sqrt(1.0 - alphas_cumprod))
+
+    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        # Ensure contiguous float32 on cuda
+        # If not cuda, fall back to a reference path? We can do a CPU path using PyTorch ops.
+        if not x.is_cuda:
+            # fallback to reference-like computation
+            return self._pytorch_forward(x, t_start)
+        
+        # Extract weights
+        w1 = self.eps_net[0].weight.contiguous()
+        b1 = self.eps_net[0].bias.contiguous()
+        w2 = self.eps_net[2].weight.contiguous()
+        b2 = self.eps_net[2].bias.contiguous()
+        w3 = self.eps_net[4].weight.contiguous()
+        b3 = self.eps_net[4].bias.contiguous()
+        
+        return _fused_diffusion.fused_diffusion_forward(
+            x.contiguous().float(),
+            t_start.contiguous().long(),
+            w1,
+            b1,
+            w2,
+            b2,
+            w3,
+            b3,
+            self.sqrt_recip_alphas.contiguous(),
+            self.coef_eps.contiguous(),
+            self.num_fused_steps,
+            self.total_timesteps,
+        )
+    
+    def _pytorch_forward(self, x, t_start):
+        # matches reference exactly
+        B, d = x.shape
+        t_start = t_start.long()
+        x_cur = x
+        for k in range(self.num_fused_steps):
+            t_idx = t_start - k
+            t_norm = t_idx.float() / float(self.total_timesteps)
+            eps = self.eps_net(torch.cat([x_cur, t_norm.unsqueeze(-1)], dim=-1))
+            c1 = self.sqrt_recip_alphas[t_idx].view(B, 1)
+            c2 = self.coef_eps[t_idx].view(B, 1)
+            x_cur = c1 * (x_cur - c2 * eps)
+        return x_cur
+```
+
+But wait: The harness casts activations to fp32 before calling forward. So x should be float32. But `t_start` is int64. We pass `t_start.long()` to kernel. In the kernel we cast `int64_t` to `int`. That&#x27;s fine.
+
+However, the weights might be on CPU if the model is on CPU. But if x is on CPU, we fallback. If x is on CUDA and model weights are on CPU, we need to move them. But the harness will likely put the model on CUDA with `.cuda()` or `.to(device)`. In KernelBench, they typically call `model = ModelNew(...).cuda()` and `x = x.cuda()`. So weights will be CUDA.
+
+But in `forward`, if the weights are not contiguous or not float32, we call `.contiguous().float()`. However, if they are already float32 and contiguous, that&#x27;s cheap. If x is already float32 contiguous, also cheap. This is fine.
+
+One issue: The kernel&#x27;s `threads` is `hidden`. But we need to make sure `hidden` is not too large. It&#x27;s `dim*4`. For `dim=64`, `hidden=256`. That&#x27;s fine. But what if `dim` is large? We might exceed max threads per block (1024). But the harness params are fixed. We can assert `hidden &lt;= 1024` or use a different kernel strategy. Let&#x27;s add a check and maybe fallback to PyTorch if hidden &gt; 1024. But it&#x27;s not needed for the harness.
+
+Wait, there is a potential issue: The `cuda_c_sources` vs `cpp_sources`. `load_inline` takes `cpp_sources` for C++ source code containing CUDA kernels. Actually, `load_inline` takes `cpp_sources` and compiles with nvcc if CUDA code is present? Let&#x27;s check.
+
+`torch.utils.cpp_extension.load_inline` signature:
+```
+load_inline(name,
+            cpp_sources,
+            cuda_sources=None,
+            functions=None,
+            extra_cflags=None,
+            extra_cuda_cflags=None,
+            extra_ldflags=None,
+            extra_include_paths=None,
+            build_directory=None,
+            verbose=False)
+```
+
+Wait, there are two arguments: `cpp_sources` and `cuda_sources`. If we have CUDA code, we should put it in `cuda_sources`? Actually, you can put CUDA code in `cpp_sources` if you include the `.cu` file content. But `load_inline` uses `is_standalone` logic. The docs say: &quot;In the case of CUDA extensions, the CUDA code can be passed as a string to `cuda_sources`.&quot; But actually, I think we can just put everything in `cpp_sources` because the function is compiled with nvcc when CUDA is present. Let&#x27;s see typical usage.
+
+From PyTorch docs:
+
+```python
+from torch.utils.cpp_extension import load_inline
+
+source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void kernel(...) { ... }
+
+torch::Tensor my_func(torch::Tensor x) {
+   ...
+}
+&quot;&quot;&quot;
+
+my_module = load_inline(
+    name=&quot;my_module&quot;,
+    cpp_sources=source,
+    functions=[&quot;my_func&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=True,
+)
+```
+
+Wait, I think `cpp_sources` is for C++ source that also contains CUDA. But I&#x27;m not 100% sure. Let&#x27;s look up typical KernelBench solutions. Usually they do something like:
+
+```python
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+...
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&quot;...&quot;,
+    cpp_sources=&quot;&quot;,  # or cuda_sources?
+    cuda_sources=cuda_source,
+    functions=[&quot;...&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+```
+
+Actually, looking at the PyTorch `cpp_extension.py` source, `load_inline` creates a `.cpp` file for `cpp_sources` and a `.cu` file for `cuda_sources`. The `.cu` file is compiled with nvcc. If you put CUDA code (e.g., `__global__`) in `cpp_sources`, it will be compiled as C++ by the host compiler (which might not support `__global__`), causing error. So we must put CUDA code in `cuda_sources`.
+
+But there is a host wrapper (the C++ function that calls the kernel) that can be in `cpp_sources` or `cuda_sources`. If we put it in `cuda_sources`, it&#x27;s compiled by nvcc, which can handle both host and device code. So we can put everything in `cuda_sources` and leave `cpp_sources` empty.
+
+Wait, but `load_inline` passes `cpp_sources` to the C++ compiler and `cuda_sources` to nvcc. If the host wrapper uses ATen/Torch, it needs `torch/extension.h`, which is fine for nvcc as well. So we can put everything in `cuda_sources`.
+
+Let&#x27;s check: In many examples, people use `cpp_sources` for the C++ file and `cuda_sources` for the `.cu` file. But the C++ file can also include `ATen/ATen.h` and call `cudaLaunchKernel` if it includes `cuda_runtime.h`. But `__global__` must be in a `.cu` file.
+
+To be safe, we can put all source code in `cuda_sources`. The `cpp_sources` can be empty or omitted.
+
+But some versions of `load_inline` require `cpp_sources` to be a string. We can set `cpp_sources=&quot;&quot;`.
+
+Actually, looking at the source:
+
+```python
+def load_inline(name,
+                cpp_sources,
+                cuda_sources=None,
+                functions=None,
+                extra_cflags=None,
+                extra_cuda_cflags=None,
+                extra_ldflags=None,
+                extra_include_paths=None,
+                build_directory=None,
+                is_python_module=True,
+                keep_intermediates=True,
+                verbose=False,
+                with_cuda=None,
+                is_standalone=False):
+```
+
+So yes, we can pass `cuda_sources=cuda_code` and `cpp_sources=&quot;&quot;`.
+
+However, there is a nuance: If we put everything in `cuda_sources`, the pybind11 wrapper is still generated and will look for the functions in the compiled module. Since nvcc compiles `.cu` file into the library, it should be fine.
+
+Let&#x27;s use `cuda_sources` for all CUDA code.
+
+**Potential compilation errors:** We need to be careful with `torch::Tensor` and `.data_ptr&lt;float&gt;()`. If the tensor is not contiguous or not the right type, this is undefined behavior. But we ensure contiguous and float in Python.
+
+**Device pointer:** We should ensure the tensors are on CUDA. In Python, we check `x.is_cuda`. If x is CUDA, we assume all parameters are CUDA.
+
+**Precision:** The SiLU in the kernel uses `expf(-x)`. PyTorch&#x27;s `SiLU` backward uses `sigmoid` which might be implemented using `exp` with some stabilization. The forward is `x * sigmoid(x)`. For x=0, sigmoid(0)=0.5, silu(0)=0. For large positive x, sigmoid(x)=1, silu(x)=x. For large negative x, sigmoid(x)=0, silu(x)=0. This matches PyTorch.
+
+Potential numerical difference: For large negative x, `expf(-x)` could overflow to inf if x is very negative (e.g., x = -100, `expf(100)` is huge but within float range? `expf(88.7) ≈ 1.6e38`, max float is 3.4e38. So for x &lt; -88, `expf(-x)` overflows to inf. Then `1/(1+inf)=0`. That&#x27;s fine. For x = -90, `expf(90)` is maybe inf? Actually `expf(88.72)` is max float. For x=-100, `expf(100)` is inf? `expf(100)` is 2.688e43, which is &gt; max float, so overflow to inf. `1/(1+inf) = 0`. `x * 0 = -100 * 0 = -0.0`. In PyTorch, `sigmoid(-100)` is `0.0` (maybe subnormal but likely 0). `silu(-100) = -100 * 0 = -0`. Since the tolerance is 1e-4, `-0` vs `0` is fine. For x close to -88, `expf` may be slightly different from PyTorch&#x27;s implementation. But values in the network are likely within a moderate range. So it should pass.
+
+To be safer, we could implement a numerically stable sigmoid:
+
+```cpp
+__device__ __forceinline__ float sigmoid(float x) {
+    if (x &gt;= 0) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
+}
+```
+
+This avoids overflow for large negative x and improves accuracy for large positive x. Let&#x27;s use this. It&#x27;s cheap.
+
+Similarly, SiLU:
+
+```cpp
+__device__ __forceinline__ float silu(float x) {
+    return x * sigmoid(x);
+}
+```
+
+This matches PyTorch.
+
+**Loop unrolling:** We can manually unroll loops with `#pragma unroll` but the loop bound is variable (`dim+1`, `hidden`). `#pragma unroll` only works with compile-time constant loop bounds. Actually, `pragma unroll` without a number hints the compiler to unroll if possible. With a number like `#pragma unroll 4`, it unrolls by 4. That works for any loop bound, it just does partial unrolling. It might help.
+
+**Fusing steps:** Another optimization: We can precompute `t_norm` for all steps? Not needed.
+
+**Register usage:** We need to make sure we don&#x27;t exceed register count. With `#pragma unroll 4`, the compiler might increase register usage. But since loops are small, it&#x27;s okay.
+
+**Shared memory bank conflicts:** When threads read `s_in[i]` in a loop, all threads read the same `i` sequentially. In shared memory, broadcasting the same address to all threads is fast (no bank conflict). When reading `s_hid[i]`, same thing (broadcast). The writes to `s_hid[tid]` are each thread writing to a different bank (assuming 32 banks, 4 bytes per bank; with 256 threads, each thread writes to bank = tid % 32, which is strided by 1, but consecutive threads write to consecutive banks, so no conflict). Actually, for 4-byte floats, thread 0 writes bank 0, thread 1 writes bank 1, ..., thread 31 writes bank 31, thread 32 writes bank 0, etc. No conflict. Good.
+
+**Fetching weights:** The weight matrix is stored row-major (out, in). Thread `tid` reads row `tid`. Coalescing across a warp: each thread reads its own row starting at `tid * in + 0`. Threads in a warp read addresses separated by `in` elements. That is strided access across threads, not coalesced. Actually, let&#x27;s analyze:
+
+Suppose warp has threads 0..31. They read weight addresses:
+- thread 0: `w + 0 * in + 0`
+- thread 1: `w + 1 * in + 0`
+- thread 2: `w + 2 * in + 0`
+- ...
+These addresses are separated by `in * sizeof(float)` bytes. If `in` is e.g., 65, then separation is 260 bytes. That&#x27;s more than a cache line (128 bytes). So each thread reads a different cache line. That&#x27;s not coalesced. It creates 32 memory transactions per load. That&#x27;s inefficient.
+
+However, within each thread, the loop reads `w_row[0], w_row[1], ...`, which is sequential and coalesced for that thread. The issue is that across threads, the reads are scattered.
+
+To improve coalescing, we could transpose the weight matrices so that each thread reads a column. But then the dot product becomes a reduction. Let&#x27;s think.
+
+Alternative memory layout: Store weights in column-major or transpose. If we transpose w1 to shape (dim+1, hidden), then threads in a warp reading the first element of their rows would read:
+- thread 0: `w + 0 * hidden + 0`
+- thread 1: `w + 0 * hidden + 1`
+...
+- thread 31: `w + 0 * hidden + 31`
+This is perfectly coalesced! Then each thread would need to accumulate over columns, and we would need a reduction to get the per-output result. But that would require atomic adds or shared memory reduction.
+
+Actually, with transposed weights, each thread can compute a partial product: thread `tid` loops over columns and computes `w[col][tid] * input[col]`. Then after all threads compute their partial dot products, we need to sum across the warp? Wait, no. If we want `output[i] = sum_j w[i][j] * input[j]`, and we store `w` transposed as `w_T[j][i]`, then thread `tid` could be assigned to compute a partial sum for all `i`? No.
+
+Let&#x27;s think of a better approach: assign each thread to compute one output element (as before), but change the weight storage to be transposed. Then each thread reads `w_T[0][tid], w_T[1][tid], ...`. This is coalesced across threads within a warp for each `j`, because they read adjacent addresses. But each thread still loops over `j`, reading `w_T[j][tid]`. For each `j`, the warp reads a contiguous vector of length warpSize. That&#x27;s perfect coalescing! The downside is that the memory layout is transposed. PyTorch stores weights as (out, in). We can transpose them on the host (Python side) before passing to the kernel. That&#x27;s a good idea.
+
+So:
+
+- In Python `forward`, we can pass `w1.t().contiguous()` instead of `w1`. But then the kernel&#x27;s row pointer logic changes. Let&#x27;s define the kernel to expect transposed weights.
+
+If we transpose `w1` to shape `(dim+1, hidden)`, then in the kernel:
+
+```
+const float* w_col = w1 + tid; // points to column tid
+float acc = b1[tid];
+for (int j = 0; j &lt; dim+1; ++j) {
+    acc += w_col[j * hidden] * s_in[j];
+}
+```
+
+Wait, if `w1` is transposed, then `w1_T[j][i] = w1[i][j]`. So to compute output `i`, we need `sum_j w1_T[j][i] * input[j]`. If thread `tid` computes output `tid`, it needs to read `w1_T[0][tid], w1_T[1][tid], ...`. The address of `w1_T[j][tid]` is `w1_T + j * hidden + tid`. So:
+
+```
+for (int j = 0; j &lt; dim+1; ++j) {
+    acc += w1_T[j * hidden + tid] * s_in[j];
+}
+```
+
+This is perfectly coalesced: for a given `j`, threads 0..31 read `w1_T + j*hidden + 0..31`, which is contiguous. Excellent.
+
+Similarly for w2: transposed to (hidden, hidden). Kernel:
+
+```
+for (int j = 0; j &lt; hidden; ++j) {
+    acc += w2_T[j * hidden + tid] * s_hid[j];
+}
+```
+
+Coalesced.
+
+And w3: transposed to (hidden, dim). Kernel:
+
+```
+for (int j = 0; j &lt; hidden; ++j) {
+    acc += w3_T[j * dim + tid] * s_hid[j];
+}
+```
+
+Coalesced.
+
+So the plan: transpose the weights on the host and pass them. That will significantly improve memory throughput for reading weights.
+
+But transposing the weights on the host involves a `transpose` op, which is cheap (O(num_params)) and done once per forward. The cost is negligible compared to the loop.
+
+Let&#x27;s update the kernel to expect transposed weights.
+
+We need to verify that `w1_t = w1.t().contiguous()`. The shape of `w1_t` is `(dim+1, hidden)`. In the kernel, we compute:
+
+```
+if (tid &lt; hidden) {
+    float acc = b1[tid];
+    for (int j = 0; j &lt; dim + 1; ++j) {
+        acc += w1[j * hidden + tid] * s_in[j];
+    }
+    s_hid[tid] = silu(acc);
+}
+```
+
+Similarly for w2 (shape `(hidden, hidden)`):
+
+```
+if (tid &lt; hidden) {
+    float acc = b2[tid];
+    for (int j = 0; j &lt; hidden; ++j) {
+        acc += w2[j * hidden + tid] * s_hid[j];
+    }
+    s_hid[tid] = silu(acc);
+}
+```
+
+For w3 (shape `(hidden, dim)`):
+
+```
+if (tid &lt; dim) {
+    float acc = b3[tid];
+    for (int j = 0; j &lt; hidden; ++j) {
+        acc += w3[j * dim + tid] * s_hid[j];
+    }
+    s_eps[tid] = acc;
+}
+```
+
+Wait, the weight `w3` originally is `(dim, hidden)`. Its transpose is `(hidden, dim)`. So `w3_T[j][i] = w3[i][j]`. Then `w3_T + j * dim + tid` is correct.
+
+This is good.
+
+Now, about `b1`, `b2`, `b3`. They are read as `b1[tid]`, which is coalesced across threads.
+
+**Shared memory reduction:** Since we use transposed weights, do we need more shared memory? No.
+
+**Another micro-optimization:** For the first layer, `s_in` is only 65 floats. We could keep it in registers or just read from shared. It&#x27;s fine.
+
+**One-block-per-sample vs other:** Let&#x27;s stick with one block per sample.
+
+But wait, there is another idea: Since B=8 and hidden=256, we could process all samples in one block using warps. For example, assign 32 threads per sample (one warp). Then a block of 256 threads can process 8 samples simultaneously. This would allow interleaving of memory instructions across warps, potentially hiding latency better. But the code becomes more complex: each warp handles one sample, uses warp-wide registers, and shared memory can be partitioned per warp.
+
+However, with the problem being so small, the simpler approach is likely sufficient. Let&#x27;s see if we can get it to pass correctness first.
+
+**Compilation:** We need to be careful with `load_inline`. We will use `cuda_sources`. Let&#x27;s double-check the exact signature: `load_inline` may have `cuda_sources` parameter. Yes.
+
+**Complete Python file structure:**
+
+```python
+import math
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+__device__ __forceinline__ float sigmoid(float x) {
+    if (x &gt;= 0.0f) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
+}
+
+__device__ __forceinline__ float silu(float x) {
+    return x * sigmoid(x);
+}
+
+__global__ void diffusion_kernel(
+    const float* __restrict__ x_in,
+    const int64_t* __restrict__ t_start,
+    float* __restrict__ x_out,
+    const float* __restrict__ w1,   // shape (dim+1, hidden)
+    const float* __restrict__ b1,   // shape (hidden,)
+    const float* __restrict__ w2,   // shape (hidden, hidden)
+    const float* __restrict__ b2,
+    const float* __restrict__ w3,   // shape (hidden, dim)
+    const float* __restrict__ b3,
+    const float* __restrict__ sqrt_recip_alphas,
+    const float* __restrict__ coef_eps,
+    int num_fused_steps,
+    int total_timesteps,
+    int B,
+    int dim,
+    int hidden)
+{
+    const int b = blockIdx.x;
+    if (b &gt;= B) return;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float s_mem[];
+    float* s_x = s_mem;
+    float* s_in = s_x + dim;
+    float* s_hid = s_in + (dim + 1);
+    float* s_eps = s_hid + hidden;
+
+    // Load initial x
+    if (tid &lt; dim) {
+        s_x[tid] = x_in[b * dim + tid];
+    }
+    __syncthreads();
+
+    int t0 = static_cast&lt;int&gt;(t_start[b]);
+
+    for (int k = 0; k &lt; num_fused_steps; ++k) {
+        int t_idx = t0 - k;
+        float t_norm = static_cast&lt;float&gt;(t_idx) / static_cast&lt;float&gt;(total_timesteps);
+
+        // Build network input
+        if (tid &lt; dim) {
+            s_in[tid] = s_x[tid];
+        }
+        if (tid == 0) {
+            s_in[dim] = t_norm;
+        }
+        __syncthreads();
+
+        // Layer 1: hidden = w1 @ input + b1, SiLU
+        if (tid &lt; hidden) {
+            float acc = b1[tid];
+            for (int i = 0; i &lt; dim + 1; ++i) {
+                acc += w1[i * hidden + tid] * s_in[i];
+            }
+            s_hid[tid] = silu(acc);
+        }
+        __syncthreads();
+
+        // Layer 2: hidden = w2 @ hidden + b2, SiLU
+        if (tid &lt; hidden) {
+            float acc = b2[tid];
+            for (int i = 0; i &lt; hidden; ++i) {
+                acc += w2[i * hidden + tid] * s_hid[i];
+            }
+            s_hid[tid] = silu(acc);
+        }
+        __syncthreads();
+
+        // Layer 3: eps = w3 @ hidden + b3
+        if (tid &lt; dim) {
+            float acc = b3[tid];
+            for (int i = 0; i &lt; hidden; ++i) {
+                acc += w3[i * dim + tid] * s_hid[i];
+            }
+            s_eps[tid] = acc;
+        }
+        __syncthreads();
+
+        // Update x
+        if (tid &lt; dim) {
+            float c1 = sqrt_recip_alphas[t_idx];
+            float c2 = coef_eps[t_idx];
+            s_x[tid] = c1 * (s_x[tid] - c2 * s_eps[tid]);
+        }
+        __syncthreads();
+    }
+
+    if (tid &lt; dim) {
+        x_out[b * dim + tid] = s_x[tid];
+    }
+}
+
+torch::Tensor fused_diffusion_forward(
+    torch::Tensor x,
+    torch::Tensor t_start,
+    torch::Tensor w1_t,
+    torch::Tensor b1,
+    torch::Tensor w2_t,
+    torch::Tensor b2,
+    torch::Tensor w3_t,
+    torch::Tensor b3,
+    torch::Tensor sqrt_recip_alphas,
+    torch::Tensor coef_eps,
+    int num_fused_steps,
+    int total_timesteps)
+{
+    int B = x.size(0);
+    int dim = x.size(1);
+    int hidden = b1.size(0);
+
+    auto x_out = torch::empty_like(x);
+
+    const int threads = hidden;
+    const int blocks = B;
+    size_t shared_mem_size = (dim + (dim + 1) + hidden + dim) * sizeof(float);
+
+    diffusion_kernel&lt;&lt;&lt;blocks, threads, shared_mem_size&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        t_start.data_ptr&lt;int64_t&gt;(),
+        x_out.data_ptr&lt;float&gt;(),
+        w1_t.data_ptr&lt;float&gt;(),
+        b1.data_ptr&lt;float&gt;(),
+        w2_t.data_ptr&lt;float&gt;(),
+        b2.data_ptr&lt;float&gt;(),
+        w3_t.data_ptr&lt;float&gt;(),
+        b3.data_ptr&lt;float&gt;(),
+        sqrt_recip_alphas.data_ptr&lt;float&gt;(),
+        coef_eps.data_ptr&lt;float&gt;(),
+        num_fused_steps,
+        total_timesteps,
+        B,
+        dim,
+        hidden);
+
+    return x_out;
+}
+&quot;&quot;&quot;
+
+fused_module = load_inline(
+    name=&quot;fused_diffusion&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;fused_diffusion_forward&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    verbose=False,
+)
+
+def _linear_beta_schedule(num_timesteps: int, beta_start: float, beta_end: float) -&gt; torch.Tensor:
+    return torch.linspace(beta_start, beta_end, num_timesteps)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):
+        super().__init__()
+        assert num_fused_steps &gt;= 1
+        assert total_timesteps &gt;= num_fused_steps + 1
+        self.dim = dim
+        self.num_fused_steps = num_fused_steps
+        self.total_timesteps = total_timesteps
+
+        self.eps_net = nn.Sequential(
+            nn.Linear(dim + 1, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer(&quot;betas&quot;, betas)
+        self.register_buffer(&quot;alphas&quot;, alphas)
+        self.register_buffer(&quot;alphas_cumprod&quot;, alphas_cumprod)
+        self.register_buffer(&quot;sqrt_recip_alphas&quot;, torch.sqrt(1.0 / alphas))
+        self.register_buffer(&quot;coef_eps&quot;, betas / torch.sqrt(1.0 - alphas_cumprod))
+
+    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        if not x.is_cuda:
+            return self._pytorch_forward(x, t_start)
+
+        # Transpose weights for coalesced access
+        w1_t = self.eps_net[0].weight.t().contiguous()
+        b1 = self.eps_net[0].bias.contiguous()
+        w2_t = self.eps_net[2].weight.t().contiguous()
+        b2 = self.eps_net[2].bias.contiguous()
+        w3_t = self.eps_net[4].weight.t().contiguous()
+        b3 = self.eps_net[4].bias.contiguous()
+
+        return fused_module.fused_diffusion_forward(
+            x.contiguous(),
+            t_start.contiguous(),
+            w1_t,
+            b1,
+            w2_t,
+            b2,
+            w3_t,
+            b3,
+            self.sqrt_recip_alphas.contiguous(),
+            self.coef_eps.contiguous(),
+            self.num_fused_steps,
+            self.total_timesteps,
+        )
+
+    def _pytorch_forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:
+        B, d = x.shape
+        assert d == self.dim
+        assert t_start.shape == (B,)
+        t_start = t_start.long()
+        x_cur = x
+        for k in range(self.num_fused_steps):
+            t_idx = t_start - k
+            t_norm = t_idx.float() / float(self.total_timesteps)
+            eps = self.eps_net(torch.cat([x_cur, t_norm.unsqueeze(-1)], dim=-1))
+            c1 = self.sqrt_recip_alphas[t_idx].view(B, 1)
+            c2 = self.coef_eps[t_idx].view(B, 1)
+            x_cur = c1 * (x_cur - c2 * eps)
+        return x_cur
+```
+
+Wait, we need to make sure `t_start` is `long` before passing to kernel. The kernel expects `int64_t`. `t_start` might be float or int. In the harness, it&#x27;s generated as `torch.randint(low, high, (batch_size,), dtype=torch.long)`. So it&#x27;s already long. But we call `.contiguous()` which preserves dtype. Good.
+
+But `x.contiguous()` might be float. Good.
+
+One thing: `load_inline` compiles at module load time. If there is a compilation error, we need to fix it. Let&#x27;s do a compile check first. We&#x27;ll write the kernel code string and call `compile_kernel`. Actually `compile_kernel` takes the full Python source and checks it. Let&#x27;s construct the full source as a Python string and call `compile_kernel`.
+
+But before that, we need to check if `load_inline` is allowed in module-level code. Yes, the file is executed with `exec()`, so module-level code runs. The compilation will happen at import time, which may take a few seconds but is okay.
+
+Let&#x27;s also consider using `constexpr` for dimensions? Not needed.
+
+Wait, there is a catch: `load_inline` on some systems may require a GPU to compile? Actually, it uses nvcc to compile .cu files; it doesn&#x27;t need a GPU to compile, but it needs CUDA toolkit. The compile check tool likely runs in an environment with CUDA toolkit.
+
+Now, consider the case where `b1.size(0)` is used in host wrapper. `b1` is the bias of first linear, shape (hidden,). In our kernel, `threads = hidden`. But what if `hidden` is not a multiple of 32? It doesn&#x27;t have to be. But it&#x27;s `dim*4 = 256`. Fine.
+
+Another micro-optimization: In the kernel, for layer 3, we have `if (tid &lt; dim)`. That introduces branch divergence for the first 64 threads vs the rest. That&#x27;s fine because the rest of the threads in the warp are idle. However, we could avoid the branch by having all threads compute but only the first `dim` write. But that wastes computation. Since `dim` is small, it&#x27;s fine.
+
+Alternatively, we could set `threads = hidden` and have all threads compute everything. But for layer3, only 64 outputs. We could have all 256 threads compute a partial product and reduce using warp shuffle or shared memory. That might actually be faster because it avoids divergence and better utilizes threads. Let&#x27;s think: For layer3, 256 threads could each compute `acc = sum_{i in subset} w3[i][tid] * s_hid[i]`. But since there are only 64 outputs, each output would be computed by multiple threads and then reduced. This is more complex.
+
+Given the small size and low occupancy, divergence is not a big deal.
+
+**Possible issue:** The `__syncthreads()` inside the loop may be overhead, but it&#x27;s necessary. For 16 steps, it&#x27;s fine.
+
+**Potential numerical issue:** The `sigmoid` we wrote uses branches. For `x &gt;= 0`, we compute `expf(-x)`. For `x` large positive, `expf(-x)` underflows to 0, `1/(1+0)=1`. Good. For `x` large negative, we compute `expf(x)` which underflows to 0, `0/(1+0)=0`. Good. This is stable.
+
+**Comparison with PyTorch:** PyTorch&#x27;s SiLU is `x * torch.sigmoid(x)`. `torch.sigmoid` is numerically stable. Our implementation should be close.
+
+**One more thought:** The buffers `sqrt_recip_alphas` and `coef_eps` have size `total_timesteps`. In our kernel, we index by `t_idx` directly. In the reference, `t_idx` is a 1D tensor of indices, and indexing is batched. Our direct indexing is fine.
+
+**Compilation and testing:** Let&#x27;s write the code and compile.
+
+I will write the full Python source as a string and call `compile_kernel`. Then `run_correctness`. Let&#x27;s do that.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n__device__ __forceinline__ float sigmoid(float x) {\n    if (x &gt;= 0.0f) {\n        float z = expf(-x);\n        return 1.0f / (1.0f + z);\n    } else {\n        float z = expf(x);\n        return z / (1.0f + z);\n    }\n}\n\n__device__ __forceinline__ float silu(float x) {\n    return x * sigmoid(x);\n}\n\n__global__ void diffusion_kernel(\n    const float* __restrict__ x_in,\n    const int64_t* __restrict__ t_start,\n    float* __restrict__ x_out,\n    const float* __restrict__ w1,   // (dim+1, hidden)\n    const float* __restrict__ b1,   // (hidden,)\n    const float* __restrict__ w2,   // (hidden, hidden)\n    const float* __restrict__ b2,\n    const float* __restrict__ w3,   // (hidden, dim)\n    const float* __restrict__ b3,\n    const float* __restrict__ sqrt_recip_alphas,\n    const float* __restrict__ coef_eps,\n    int num_fused_steps,\n    int total_timesteps,\n    int B,\n    int dim,\n    int hidden)\n{\n    const int b = blockIdx.x;\n    if (b &gt;= B) return;\n    const int tid = threadIdx.x;\n\n    extern __shared__ float s_mem[];\n    float* s_x   = s_mem;\n    float* s_in  = s_x + dim;\n    float* s_hid = s_in + (dim + 1);\n    float* s_eps = s_hid + hidden;\n\n    // load current x\n    if (tid &lt; dim) {\n        s_x[tid] = x_in[b * dim + tid];\n    }\n    __syncthreads();\n\n    int t0 = static_cast&lt;int&gt;(t_start[b]);\n\n    for (int k = 0; k &lt; num_fused_steps; ++k) {\n        int t_idx = t0 - k;\n        float t_norm = static_cast&lt;float&gt;(t_idx) / static_cast&lt;float&gt;(total_timesteps);\n\n        if (tid &lt; dim) {\n            s_in[tid] = s_x[tid];\n        }\n        if (tid == 0) {\n            s_in[dim] = t_norm;\n        }\n        __syncthreads();\n\n        // layer 1\n        if (tid &lt; hidden) {\n            float acc = b1[tid];\n            #pragma unroll 4\n            for (int i = 0; i &lt; dim + 1; ++i) {\n                acc += w1[i * hidden + tid] * s_in[i];\n            }\n            s_hid[tid] = silu(acc);\n        }\n        __syncthreads();\n\n        // layer 2\n        if (tid &lt; hidden) {\n            float acc = b2[tid];\n            #pragma unroll 4\n            for (int i = 0; i &lt; hidden; ++i) {\n                acc += w2[i * hidden + tid] * s_hid[i];\n            }\n            s_hid[tid] = silu(acc);\n        }\n        __syncthreads();\n\n        // layer 3\n        if (tid &lt; dim) {\n            float acc = b3[tid];\n            #pragma unroll 4\n            for (int i = 0; i &lt; hidden; ++i) {\n                acc += w3[i * dim + tid] * s_hid[i];\n            }\n            s_eps[tid] = acc;\n        }\n        __syncthreads();\n\n        // update x\n        if (tid &lt; dim) {\n            float c1 = sqrt_recip_alphas[t_idx];\n            float c2 = coef_eps[t_idx];\n            s_x[tid] = c1 * (s_x[tid] - c2 * s_eps[tid]);\n        }\n        __syncthreads();\n    }\n\n    if (tid &lt; dim) {\n        x_out[b * dim + tid] = s_x[tid];\n    }\n}\n\ntorch::Tensor fused_diffusion_forward(\n    torch::Tensor x,\n    torch::Tensor t_start,\n    torch::Tensor w1_t,\n    torch::Tensor b1,\n    torch::Tensor w2_t,\n    torch::Tensor b2,\n    torch::Tensor w3_t,\n    torch::Tensor b3,\n    torch::Tensor sqrt_recip_alphas,\n    torch::Tensor coef_eps,\n    int num_fused_steps,\n    int total_timesteps)\n{\n    int B = x.size(0);\n    int dim = x.size(1);\n    int hidden = b1.size(0);\n\n    auto x_out = torch::empty_like(x);\n\n    const int threads = hidden;\n    const int blocks = B;\n    size_t shared_mem_size = (dim + (dim + 1) + hidden + dim) * sizeof(float);\n\n    diffusion_kernel&lt;&lt;&lt;blocks, threads, shared_mem_size&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        t_start.data_ptr&lt;int64_t&gt;(),\n        x_out.data_ptr&lt;float&gt;(),\n        w1_t.data_ptr&lt;float&gt;(),\n        b1.data_ptr&lt;float&gt;(),\n        w2_t.data_ptr&lt;float&gt;(),\n        b2.data_ptr&lt;float&gt;(),\n        w3_t.data_ptr&lt;float&gt;(),\n        b3.data_ptr&lt;float&gt;(),\n        sqrt_recip_alphas.data_ptr&lt;float&gt;(),\n        coef_eps.data_ptr&lt;float&gt;(),\n        num_fused_steps,\n        total_timesteps,\n        B,\n        dim,\n        hidden);\n\n    return x_out;\n}\n\&quot;\&quot;\&quot;\n\n_fused_module = load_inline(\n    name=\&quot;fused_diffusion\&quot;,\n    cpp_sources=\&quot;\&quot;,\n    cuda_sources=cuda_source,\n    functions=[\&quot;fused_diffusion_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    verbose=False,\n)\n\n\ndef _linear_beta_schedule(num_timesteps: int, beta_start: float, beta_end: float) -&gt; torch.Tensor:\n    return torch.linspace(beta_start, beta_end, num_timesteps)\n\n\nclass ModelNew(nn.Module):\n    \&quot;\&quot;\&quot;Fused diffusion denoising with custom CUDA kernel.\&quot;\&quot;\&quot;\n\n    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):\n        super().__init__()\n        assert num_fused_steps &gt;= 1\n        assert total_timesteps &gt;= num_fused_steps + 1\n        self.dim = dim\n        self.num_fused_steps = num_fused_steps\n        self.total_timesteps = total_timesteps\n\n        self.eps_net = nn.Sequential(\n            nn.Linear(dim + 1, dim * 4),\n            nn.SiLU(),\n            nn.Linear(dim * 4, dim * 4),\n            nn.SiLU(),\n            nn.Linear(dim * 4, dim),\n        )\n\n        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)\n        alphas = 1.0 - betas\n        alphas_cumprod = torch.cumprod(alphas, dim=0)\n        self.register_buffer(\&quot;betas\&quot;, betas)\n        self.register_buffer(\&quot;alphas\&quot;, alphas)\n        self.register_buffer(\&quot;alphas_cumprod\&quot;, alphas_cumprod)\n        self.register_buffer(\&quot;sqrt_recip_alphas\&quot;, torch.sqrt(1.0 / alphas))\n        self.register_buffer(\&quot;coef_eps\&quot;, betas / torch.sqrt(1.0 - alphas_cumprod))\n\n    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:\n        if not x.is_cuda:\n            return self._pytorch_forward(x, t_start)\n\n        w1_t = self.eps_net[0].weight.t().contiguous()\n        b1 = self.eps_net[0].bias.contiguous()\n        w2_t = self.eps_net[2].weight.t().contiguous()\n        b2 = self.eps_net[2].bias.contiguous()\n        w3_t = self.eps_net[4].weight.t().contiguous()\n        b3 = self.eps_net[4].bias.contiguous()\n\n        return _fused_module.fused_diffusion_forward(\n            x.contiguous(),\n            t_start.contiguous(),\n            w1_t,\n            b1,\n            w2_t,\n            b2,\n            w3_t,\n            b3,\n            self.sqrt_recip_alphas.contiguous(),\n            self.coef_eps.contiguous(),\n            self.num_fused_steps,\n            self.total_timesteps,\n        )\n\n    def _pytorch_forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:\n        B, d = x.shape\n        assert d == self.dim\n        assert t_start.shape == (B,)\n        t_start = t_start.long()\n        x_cur = x\n        for k in range(self.num_fused_steps):\n            t_idx = t_start - k\n            t_norm = t_idx.float() / float(self.total_timesteps)\n            eps = self.eps_net(torch.cat([x_cur, t_norm.unsqueeze(-1)], dim=-1))\n            c1 = self.sqrt_recip_alphas[t_idx].view(B, 1)\n            c2 = self.coef_eps[t_idx].view(B, 1)\n            x_cur = c1 * (x_cur - c2 * eps)\n        return x_cur\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;fused_diffusion&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_diffusion -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_2_cache/k_baedf5ca874c/fused_diffusion/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_diffusion -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_2_cache/k_baedf5ca874c/fused_diffusion/main.cpp -o main.o 
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_2_cache/k_baedf5ca874c/fused_diffusion/main.cpp: In function &#x27;void pybind11_init_fused_diffusion(pybind11::module_&amp;)&#x27;:
+/scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_2_cache/k_baedf5ca874c/fused_diffusion/main.cpp:4:62: error: &#x27;fused_diffusion_forward&#x27; was not declared in this scope
+    4 | m.def(&quot;fused_diffusion_forward&quot;, torch::wrap_pybind_function(fused_diffusion_forward), &quot;fused_diffusion_forward&quot;);
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=fused_diffusion -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/adalal542/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 --use_fast_math -std=c++17 -c /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_2_cache/k_baedf5ca874c/fused_diffusion/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details><details class="turn-collapse"><summary><b>turn 1</b> · 1 tool call(s) · 10.0s · 9,399 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 1</span><span>llm latency: 10.0s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The error is `fused_diffusion_forward` was not declared in scope for the .cpp file. This is because `load_inline` generates a `main.cpp` that includes the CUDA file, but the function needs a declaration in the header for C++. Actually, the issue is that `cpp_sources` is empty, so the generated `main.cpp` doesn&#x27;t have a declaration of `fused_diffusion_forward`. The CUDA source is compiled as a `.cu` file, but the generated pybind wrapper is in `.cpp` and tries to reference the function. The declaration is needed in the C++ code.
+
+I need to provide a `cpp_sources` string with a forward declaration of `fused_diffusion_forward`. Let me do that.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = r\&quot;\&quot;\&quot;\ntorch::Tensor fused_diffusion_forward(\n    torch::Tensor x,\n    torch::Tensor t_start,\n    torch::Tensor w1_t,\n    torch::Tensor b1,\n    torch::Tensor w2_t,\n    torch::Tensor b2,\n    torch::Tensor w3_t,\n    torch::Tensor b3,\n    torch::Tensor sqrt_recip_alphas,\n    torch::Tensor coef_eps,\n    int num_fused_steps,\n    int total_timesteps);\n\&quot;\&quot;\&quot;\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n__device__ __forceinline__ float sigmoid(float x) {\n    if (x &gt;= 0.0f) {\n        float z = expf(-x);\n        return 1.0f / (1.0f + z);\n    } else {\n        float z = expf(x);\n        return z / (1.0f + z);\n    }\n}\n\n__device__ __forceinline__ float silu(float x) {\n    return x * sigmoid(x);\n}\n\n__global__ void diffusion_kernel(\n    const float* __restrict__ x_in,\n    const int64_t* __restrict__ t_start,\n    float* __restrict__ x_out,\n    const float* __restrict__ w1,   // (dim+1, hidden)\n    const float* __restrict__ b1,   // (hidden,)\n    const float* __restrict__ w2,   // (hidden, hidden)\n    const float* __restrict__ b2,\n    const float* __restrict__ w3,   // (hidden, dim)\n    const float* __restrict__ b3,\n    const float* __restrict__ sqrt_recip_alphas,\n    const float* __restrict__ coef_eps,\n    int num_fused_steps,\n    int total_timesteps,\n    int B,\n    int dim,\n    int hidden)\n{\n    const int b = blockIdx.x;\n    if (b &gt;= B) return;\n    const int tid = threadIdx.x;\n\n    extern __shared__ float s_mem[];\n    float* s_x   = s_mem;\n    float* s_in  = s_x + dim;\n    float* s_hid = s_in + (dim + 1);\n    float* s_eps = s_hid + hidden;\n\n    if (tid &lt; dim) {\n        s_x[tid] = x_in[b * dim + tid];\n    }\n    __syncthreads();\n\n    int t0 = static_cast&lt;int&gt;(t_start[b]);\n\n    for (int k = 0; k &lt; num_fused_steps; ++k) {\n        int t_idx = t0 - k;\n        float t_norm = static_cast&lt;float&gt;(t_idx) / static_cast&lt;float&gt;(total_timesteps);\n\n        if (tid &lt; dim) {\n            s_in[tid] = s_x[tid];\n        }\n        if (tid == 0) {\n            s_in[dim] = t_norm;\n        }\n        __syncthreads();\n\n        if (tid &lt; hidden) {\n            float acc = b1[tid];\n            #pragma unroll 4\n            for (int i = 0; i &lt; dim + 1; ++i) {\n                acc += w1[i * hidden + tid] * s_in[i];\n            }\n            s_hid[tid] = silu(acc);\n        }\n        __syncthreads();\n\n        if (tid &lt; hidden) {\n            float acc = b2[tid];\n            #pragma unroll 4\n            for (int i = 0; i &lt; hidden; ++i) {\n                acc += w2[i * hidden + tid] * s_hid[i];\n            }\n            s_hid[tid] = silu(acc);\n        }\n        __syncthreads();\n\n        if (tid &lt; dim) {\n            float acc = b3[tid];\n            #pragma unroll 4\n            for (int i = 0; i &lt; hidden; ++i) {\n                acc += w3[i * dim + tid] * s_hid[i];\n            }\n            s_eps[tid] = acc;\n        }\n        __syncthreads();\n\n        if (tid &lt; dim) {\n            float c1 = sqrt_recip_alphas[t_idx];\n            float c2 = coef_eps[t_idx];\n            s_x[tid] = c1 * (s_x[tid] - c2 * s_eps[tid]);\n        }\n        __syncthreads();\n    }\n\n    if (tid &lt; dim) {\n        x_out[b * dim + tid] = s_x[tid];\n    }\n}\n\ntorch::Tensor fused_diffusion_forward(\n    torch::Tensor x,\n    torch::Tensor t_start,\n    torch::Tensor w1_t,\n    torch::Tensor b1,\n    torch::Tensor w2_t,\n    torch::Tensor b2,\n    torch::Tensor w3_t,\n    torch::Tensor b3,\n    torch::Tensor sqrt_recip_alphas,\n    torch::Tensor coef_eps,\n    int num_fused_steps,\n    int total_timesteps)\n{\n    int B = x.size(0);\n    int dim = x.size(1);\n    int hidden = b1.size(0);\n\n    auto x_out = torch::empty_like(x);\n\n    const int threads = hidden;\n    const int blocks = B;\n    size_t shared_mem_size = (dim + (dim + 1) + hidden + dim) * sizeof(float);\n\n    diffusion_kernel&lt;&lt;&lt;blocks, threads, shared_mem_size&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        t_start.data_ptr&lt;int64_t&gt;(),\n        x_out.data_ptr&lt;float&gt;(),\n        w1_t.data_ptr&lt;float&gt;(),\n        b1.data_ptr&lt;float&gt;(),\n        w2_t.data_ptr&lt;float&gt;(),\n        b2.data_ptr&lt;float&gt;(),\n        w3_t.data_ptr&lt;float&gt;(),\n        b3.data_ptr&lt;float&gt;(),\n        sqrt_recip_alphas.data_ptr&lt;float&gt;(),\n        coef_eps.data_ptr&lt;float&gt;(),\n        num_fused_steps,\n        total_timesteps,\n        B,\n        dim,\n        hidden);\n\n    return x_out;\n}\n\&quot;\&quot;\&quot;\n\n_fused_module = load_inline(\n    name=\&quot;fused_diffusion\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;fused_diffusion_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    verbose=False,\n)\n\n\ndef _linear_beta_schedule(num_timesteps: int, beta_start: float, beta_end: float) -&gt; torch.Tensor:\n    return torch.linspace(beta_start, beta_end, num_timesteps)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int, num_fused_steps: int, total_timesteps: int = 1000):\n        super().__init__()\n        assert num_fused_steps &gt;= 1\n        assert total_timesteps &gt;= num_fused_steps + 1\n        self.dim = dim\n        self.num_fused_steps = num_fused_steps\n        self.total_timesteps = total_timesteps\n\n        self.eps_net = nn.Sequential(\n            nn.Linear(dim + 1, dim * 4),\n            nn.SiLU(),\n            nn.Linear(dim * 4, dim * 4),\n            nn.SiLU(),\n            nn.Linear(dim * 4, dim),\n        )\n\n        betas = _linear_beta_schedule(total_timesteps, 1e-4, 0.02)\n        alphas = 1.0 - betas\n        alphas_cumprod = torch.cumprod(alphas, dim=0)\n        self.register_buffer(\&quot;betas\&quot;, betas)\n        self.register_buffer(\&quot;alphas\&quot;, alphas)\n        self.register_buffer(\&quot;alphas_cumprod\&quot;, alphas_cumprod)\n        self.register_buffer(\&quot;sqrt_recip_alphas\&quot;, torch.sqrt(1.0 / alphas))\n        self.register_buffer(\&quot;coef_eps\&quot;, betas / torch.sqrt(1.0 - alphas_cumprod))\n\n    def forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:\n        if not x.is_cuda:\n            return self._pytorch_forward(x, t_start)\n\n        w1_t = self.eps_net[0].weight.t().contiguous()\n        b1 = self.eps_net[0].bias.contiguous()\n        w2_t = self.eps_net[2].weight.t().contiguous()\n        b2 = self.eps_net[2].bias.contiguous()\n        w3_t = self.eps_net[4].weight.t().contiguous()\n        b3 = self.eps_net[4].bias.contiguous()\n\n        return _fused_module.fused_diffusion_forward(\n            x.contiguous(),\n            t_start.contiguous(),\n            w1_t,\n            b1,\n            w2_t,\n            b2,\n            w3_t,\n            b3,\n            self.sqrt_recip_alphas.contiguous(),\n            self.coef_eps.contiguous(),\n            self.num_fused_steps,\n            self.total_timesteps,\n        )\n\n    def _pytorch_forward(self, x: torch.Tensor, t_start: torch.Tensor) -&gt; torch.Tensor:\n        B, d = x.shape\n        assert d == self.dim\n        assert t_start.shape == (B,)\n        t_start = t_start.long()\n        x_cur = x\n        for k in range(self.num_fused_steps):\n            t_idx = t_start - k\n            t_norm = t_idx.float() / float(self.total_timesteps)\n            eps = self.eps_net(torch.cat([x_cur, t_norm.unsqueeze(-1)], dim=-1))\n            c1 = self.sqrt_recip_alphas[t_idx].view(B, 1)\n            c2 = self.coef_eps[t_idx].view(B, 1)\n            x_cur = c1 * (x_cur - c2 * eps)\n        return x_cur\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ImportError.
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15&#x27; not found (required by /scratch/adalal542/KernelBench/runs/l34_default__gpu0_3/popcorn/Kimi-K2.6/level_3_problem_2_cache/k_65cbc97053d1/fused_diffusion/fused_diffusion_v1.so)</div></details></div></details><div class="turn"><div class="turn-head"><span class="turn-id">turn 2</span><span>llm latency: 3.6s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The CXXABI issue is an environment level issue. Let me try `extra_cflags=[&#x27;-D_GLIBCXX_USE_CXX11_ABI=0&#x27;]` and `extra_cuda_cflags=[&#x27;-D_GLIBCXX_USE_CXX11_ABI=0&#x27;]` to avoid the new C++ ABI. Also, I&#x27;ll remove `extra_cuda_cflags` that only includes `-O3 --use_fast_math`, because the `--use_fast_math` might be fine.
+Let me check the GPU specs too while at it.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></div>
 </body></html>
