@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 56</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:21:02 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 56</a></div><div class="site-subtitle">Kimi-K2.6 · original · l12_all__gpu4_7</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-03 23:26:24 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">56_Matmul_Sigmoid_Sum.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -58,5 +58,1154 @@ def get_inputs():
     return [torch.rand(batch_size, input_size)]
 
 def get_init_inputs():
-    return [input_size, hidden_size]</pre></details></div>
+    return [input_size, hidden_size]</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 176.4s · 95,488 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 176.4s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to write a custom CUDA kernel replacing the reference model: x (B, I) -&gt; linear (weights [O, I], bias [O]) -&gt; sigmoid -&gt; sum over dim=1 (output [B,1]).
+
+The dimensions: batch_size=128, input_size=32768, hidden_size=32768. So weight matrix is 32768x32768 (~1B parameters, 4GB in fp32). That&#x27;s huge. The linear x @ weight.T + bias, then sigmoid, then sum across hidden dimension.
+
+We need a custom CUDA kernel that fuses these operations: matrix multiply + sigmoid + sum. However matrix multiply with 32768x32768 is huge; cuBLAS highly optimized. We likely cannot beat cuBLAS for the GEMM alone by writing naive CUDA. But we can fuse the sigmoid and sum reduction, which reduces memory traffic. Possibly still beneficial: we compute x @ W^T + b (output [B,O]), then elementwise sigmoid, then sum over O. If we use cuBLAS for GEMM to a temp buffer, then a custom kernel for sigmoid+sum, memory traffic is O(B*O) extra. Fusing might be limited by compute; but perhaps we can use a custom kernel that does the reduction in shared memory after loading the GEMM output.
+
+Given the huge sizes, GEMM dominates. Even if we just call cuBLAS for the matmul and then a custom fused kernel for sigmoid+sum, that&#x27;s likely close to reference speed because PyTorch likely does the same: cuBLAS for linear, then elementwise sigmoid (kernel), then sum (reduction kernel). Our custom fused kernel reduces two kernel launches and memory round trips. That may give speedup. But we might get more by using CUTLASS or a custom warpgroup-level GEMM fused with sigmoid+sum. However writing a custom GEMM for 32768x32768 that beats cuBLAS is extremely hard. But maybe the evaluation doesn&#x27;t heavily penalize if we just fuse the elementwise+reduction after cuBLAS.
+
+However, maybe we can avoid materializing the full output and do a custom reduction that processes the GEMM output row by row using tensor cores? That&#x27;s too complex for a simple inline load.
+
+Alternatively, we can compute sum_j sigmoid( sum_i x_i * W_{j,i} + b_j ). That&#x27;s basically a vector-matrix multiply followed by a reduction. We could use a custom kernel where each block processes one row of W (one output neuron) across the batch? Wait, the inner dimension for matmul is input_size (32768) and output is hidden_size (32768). If we think of the operation as y_j = sum_i x_{b,i} * W_{j,i} + b_j for each batch b and output j. Then sum_j sigmoid(y_j). That&#x27;s like for each batch, dot product of x with each row of W, then sigmoid, then sum. We could launch one block per batch element, and within the block compute all dot products and accumulate sigmoid. Each block would need to read the entire weight matrix (4GB), which is too much per block. But if each thread computes a subset of outputs, we can partition hidden_size across threads. E.g., each block processes one batch, with threads processing chunks of hidden_size. But reading the full weight matrix from global memory B times (128 times) = 512 GB memory reads, which is too much (DRAM bandwidth is ~1-2 TB/s, but still 512GB reads plus input reads etc). Wait: weight matrix is 32768*32768*4 = 4GB. Reading it 128 times = 512GB. At ~1.5TB/s that&#x27;s ~0.34 seconds. That&#x27;s too slow. cuBLAS GEMM is compute-bound (or near compute bound) with good tiling and reuse.
+
+So we definitely need to leverage cuBLAS for the GEMM, and then fuse the rest. That seems like the best practical approach.
+
+But maybe we can do better by avoiding writing the full output to global memory. We can call cublasGemmEx to compute into a temporary buffer (or into a workspace), and then launch a custom kernel to apply sigmoid and sum. However the temporary buffer is 128*32768*4 = 16MB, small relative to 4GB weights. So memory traffic for writing it is negligible compared to reading weights. Actually the GEMM reads weights and input; writing output is minor. So fusing the elementwise and reduction after GEMM saves reading 16MB and writing 16MB (if PyTorch does it as separate kernels). Probably not huge, but maybe enough for a modest speedup.
+
+But we might also fuse bias addition with the GEMM if we tell cublas to use beta=0 and then add bias ourselves? Actually cublas can compute C = alpha*A*B + beta*C; if we provide a C matrix initialized with bias broadcast? There&#x27;s no bias in cublas. We can compute C = A*B (beta=0), then add bias and sigmoid and sum in one kernel.
+
+Alternatively, we can compute y = x @ W.T; then do a custom reduction kernel that loads a row of y, adds bias, applies sigmoid, and accumulates. That is what we will do.
+
+But we want speed. Let&#x27;s think if there are other tricks. Could we use &quot;cublasGemm&quot; to compute into output directly, and then a custom kernel? Yes.
+
+We can also consider using TF32 or FP16? The reference uses fp32. We must produce numerically equivalent outputs at fp32 precision. That means we should compute in fp32. However we could use tensor cores with FP16 accumulation? That might not match fp32 numerically. Tolerance is 1e-4. Tensor core FP16 is lower precision; likely will fail. So stick to FP32.
+
+Maybe we can use a custom kernel that does block-wise reduction and uses vectorized loads (float4) to improve memory bandwidth for the post-GEMM processing.
+
+Given the huge problem size (32768), the reference time might be dominated by the GEMM (~2N^3? Actually it&#x27;s B x I x O = 128*32768*32768 = 137 billion multiply-adds = 274 GFLOPs. On an A100 (312 TFLOPS FP32) that&#x27;s ~0.88 ms if compute bound. But memory bandwidth for reading weights: 4GB. At 2TB/s = 2ms. So likely memory bound or near. Let&#x27;s compute arithmetic intensity: 274 GFLOPs / (4GB weights + 0.5MB input + 16MB output) ≈ 274e9 / 4.016e9 ≈ 68 FLOP/byte. For A100 FP32 TC is 156 TFLOPS? Actually A100 FP32 is 19.5 TFLOPS, but with TC it&#x27;s 156 TFLOPS for FP16/TF32. But for FP32 non-TC it&#x27;s 19.5 TFLOPS. Ridge point for 19.5 TFLOPS and 2 TB/s is ~9.75 FLOP/byte. So 68 &gt; 9.75, thus compute bound on FP32 non-TC. Actually wait, 19.5 TFLOPS is the theoretical peak for FP32 on A100 (without sparsity). At 2 TB/s, ridge point = 19.5/2 = 9.75 FLOP/byte. With 68 FLOP/byte, it&#x27;s compute bound (if using full FP32 throughput). However cuBLAS may not reach peak FP32; but still compute bound. So GEMM dominates.
+
+Given that, any savings from fusing the final steps might be small but could still yield some speedup because we avoid kernel launch overhead and memory round-trip for the 16MB buffer. We could also use cutlass or a custom GEMM kernel that fuses the bias+sigmoid+sum into the GEMM epilogue, but that&#x27;s too complex.
+
+Actually, wait: The problem statement says &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel.&quot; It may be acceptable to call cuBLAS inside our CUDA kernel (or in host code) and then a custom kernel for the rest. The reference implementation uses `nn.Linear` + `sigmoid` + `sum`. In PyTorch, `nn.Linear` calls `addmm` which may be fused with bias? Actually PyTorch&#x27;s linear calls `torch._C._nn.linear`, which might use cuBLAS for GEMM and then a separate bias vector addition kernel (or fused addmm if bias is present? Let&#x27;s check). In PyTorch, `F.linear` is `input.matmul(weight.t()) + bias` if bias is not None. It often does a GEMM and then a bias addition via a separate kernel (or via broadcasting add). Then sigmoid is another kernel, then sum is another reduction kernel. So three or four kernel launches after GEMM. Our approach: cuBLAS GEMM (one kernel), then custom fused kernel for bias+sigmoid+sum (one kernel). That reduces overhead and memory round trips.
+
+But can we do even better by fusing bias into the GEMM? No,cuBLAS doesn&#x27;t support bias addition but we can pre-add bias to output in the same kernel after GEMM. Actually we can allocate output buffer for GEMM, then launch our custom kernel that reads the buffer, adds bias, applies sigmoid, and writes back to output. But that still reads and writes the buffer. Wait, we can&#x27;t avoid reading the GEMM output because we need to reduce it. But PyTorch&#x27;s approach also reads it for sigmoid and writes it, then reads it again for sum. So we save one write and one read of 16MB. At 2TB/s, that&#x27;s 16MB read + 16MB write saved = 32MB total, which is ~16 microseconds. Not huge, but plus kernel launch overhead (~5 us each) maybe total 30 us saved. Reference time might be ~1-2 ms. So speedup of maybe 1-2%. Might not be enough? The reference may be slower if PyTorch uses separate kernels and perhaps not optimal reduction. But with 128 rows and 32768 columns, reduction over columns for 128 rows is straightforward.
+
+Alternatively, we can launch a custom kernel that computes the sum without materializing the full output: after GEMM, each block reads a chunk of the output, applies bias and sigmoid, and accumulates in shared memory, writing one float per batch. This reads 16MB once, writes 0.5KB. That&#x27;s optimal.
+
+What about the GEMM itself? Could we call `cublasSgemm` from within our host code using `torch.utils.cpp_extension.load_inline`? Yes, we can write a custom CUDA function that takes the tensors, calls `cublasSgemm` via `cublasHandle_t` from ATen/cublas, or we can use `at::cuda::getCurrentCUDABlasHandle()`. Then we allocate a temporary tensor, do the GEMM, and then call our custom kernel. That is straightforward.
+
+But we need to make sure we handle the weight layout correctly. In PyTorch, `nn.Linear` weight is shape `(hidden_size, input_size)` (O x I). The operation is `x @ weight.T`. In cuBLAS, we can compute `C = A * B^T` where A = x (B, I), B = weight (O, I). Actually we can set `transa=&#x27;N&#x27;`, `transb=&#x27;T&#x27;`: `C = alpha * A * B^T + beta * C`. A is (B, I), B is (O, I). Then C is (B, O). Good.
+
+We can get pointers from tensors: `x.data_ptr&lt;float&gt;()`, `weight.data_ptr&lt;float&gt;()`, `bias.data_ptr&lt;float&gt;()`.
+
+We need to create a temporary `gemm_out` tensor of shape (B, O) using `torch::empty({batch_size, hidden_size}, x.options())` in C++.
+
+Then call our custom kernel: each thread block handles one batch element (one row). Or each warp handles a chunk. For 32768 columns, we can have each block process one row with e.g. 1024 threads, each thread processes 32 elements (with float4 loads). That gives good memory bandwidth. We reduce within the block using shared memory, then write out sum.
+
+Let&#x27;s design the kernel:
+
+```
+__global__ void fused_sigmoid_sum_kernel(const float* __restrict__ gemm_out,
+                                         const float* __restrict__ bias,
+                                         float* __restrict__ out,
+                                         int batch_size,
+                                         int hidden_size) {
+    int b = blockIdx.x;
+    if (b &gt;= batch_size) return;
+    int tid = threadIdx.x;
+    int blockDim = blockDim.x;
+    
+    const float* row = gemm_out + b * hidden_size;
+    
+    float sum = 0.0f;
+    // Process elements with float4 vectorization
+    int vec_size = 4;
+    int n_vec = hidden_size / vec_size;
+    for (int i = tid; i &lt; n_vec; i += blockDim) {
+        float4 val = reinterpret_cast&lt;const float4*&gt;(row)[i];
+        // Add bias: need to load bias in chunks. bias is length hidden_size.
+        float4 bval = reinterpret_cast&lt;const float4*&gt;(bias)[i];
+        // apply sigmoid to each element
+        float v0 = 1.0f / (1.0f + expf(-(val.x + bval.x)));
+        float v1 = 1.0f / (1.0f + expf(-(val.y + bval.y)));
+        float v2 = 1.0f / (1.0f + expf(-(val.z + bval.z)));
+        float v3 = 1.0f / (1.0f + expf(-(val.w + bval.w)));
+        sum += v0 + v1 + v2 + v3;
+    }
+    // Handle remainder if hidden_size % 4 != 0
+    // ...
+    
+    // Reduction in shared memory
+    __shared__ float sdata[1024]; // or dynamic
+    sdata[tid] = sum;
+    __syncthreads();
+    // tree reduction
+    for (int s = blockDim/2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[b] = sdata[0];
+    }
+}
+```
+
+But there is a subtlety: hidden_size may not be divisible by 4 (though it is 32768, which is divisible by 4). So fine.
+
+However, bias broadcasting: we need to add bias to each row. Bias is shape (hidden_size). We can load bias per thread using the same indexing. Since all threads load the same bias values? Actually each thread processes different elements, so each loads its own chunk of bias. That&#x27;s fine. But we need to be careful with vectorized loads of bias: bias pointer may be aligned (since hidden_size is multiple of 4, and allocation is contiguous, bias should be aligned for float4). We can use `reinterpret_cast&lt;const float4*&gt;(bias)[i]`.
+
+But wait: when we load `float4` from bias, each thread loads a different float4. That&#x27;s fine.
+
+Potential issue: `expf` might be slower than using `__expf` (intrinsic). But `__expf` is less accurate. Since tolerance is 1e-4, `__expf` might be okay. However, to be safe, use `expf` or maybe an approximation? `expf` is fast enough for 32768 elements per row, 128 rows -&gt; 4.2M elements. Each `expf` is somewhat expensive but still memory bound because we read 16MB. Actually per row 32768 elements, 128 rows = 4,194,304 elements. For each element, we do an add, expf, add to sum. The bandwidth is reading 16MB + reading bias 4*32k=128KB. The compute is light. So expf is fine.
+
+We need to create the C++ source for `load_inline`. The function signature should be something like:
+
+```
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias)
+```
+
+Inside, we check tensors are contiguous, on CUDA, float32.
+
+Compute batch_size, input_size, hidden_size.
+
+Create `gemm_out = torch::empty({batch_size, hidden_size}, x.options());`
+
+Get cublas handle: `auto handle = at::cuda::getCurrentCUDABlasHandle();`
+
+Set stream accordingly: `cublasSetStream(handle, at::cuda::getCurrentCUDAStream().stream());` Actually `at::cuda::getCurrentCUDABlasHandle()` returns handle for current stream already. But we can be safe.
+
+Call `cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, hidden_size, batch_size, input_size, &amp;alpha, weight.data_ptr&lt;float&gt;(), input_size, x.data_ptr&lt;float&gt;(), input_size, &amp;beta, gemm_out.data_ptr&lt;float&gt;(), hidden_size);`
+
+Wait, cuBLAS is column-major. PyTorch tensors are row-major. So we need to be careful. cuBLAS expects matrices in column-major order.
+
+PyTorch&#x27;s `torch.mm` calls cuBLAS by swapping transposes appropriately.
+
+Let&#x27;s derive: We want `C = X * W^T`, where X is (B, I), W is (O, I). In row-major, C is (B, O).
+
+If we view these as column-major, then X^T is (I, B), W^T is (I, O). The product X * W^T in row-major corresponds to (W^T)^T * X^T = W * X^T in column-major. That is, in column-major terms, we compute `C_col = W_col * X_col` where W_col is (I, O)? Let&#x27;s be precise.
+
+Better to use the standard trick:
+
+cuBLAS computes `C = op(A) * op(B)` in column-major. If we set `op(A) = W^T` (dimensions O x I), `op(B) = X^T` (dimensions I x B), then product is O x B in column-major. That corresponds to C_row = X * W^T (B x O). Wait, let&#x27;s verify.
+
+In column-major, matrix M of size (m, n) has leading dimension m. So if we have a row-major matrix X of size (B, I), we can interpret it as column-major matrix X&#x27; of size (I, B) with transposed entries. Similarly, W (O, I) row-major -&gt; W&#x27; of size (I, O) column-major.
+
+We want C_row = X_row * W_row^T = (B, O).
+
+In column-major, C&#x27; = W_row * X_row^T? Actually if C_row = A_row * B_row, then C&#x27;_col = B&#x27;_col * A&#x27;_col? Let&#x27;s derive properly.
+
+Let X be row-major B x I. W be row-major O x I. Then element (b,o) of C = sum_i X[b,i] * W[o,i].
+
+In column-major, X&#x27; is I x B (same memory layout). W&#x27; is I x O. The product W&#x27;^T * X&#x27; is O x B: (W&#x27;^T is O x I, X&#x27; is I x B). Element (o,b) = sum_i W&#x27;[i,o] * X&#x27;[i,b] = sum_i W[o,i] * X[b,i] = C[b,o]. So C in column-major is O x B, which corresponds to row-major B x O if we transpose. Wait, if we store C as O x B column-major, reading it as row-major gives B x O transposed? Actually a matrix stored in column-major of size (O, B) is the same memory layout as a row-major matrix of size (B, O). Because row-major (B,O) has elements stored as B rows of O columns; column-major (O,B) has elements stored as O columns of B rows. The order of elements in memory is the same? Let&#x27;s check: Row-major index = b*O + o. Column-major index = o*B + b. These are not the same. So we need to be careful.
+
+Alternative approach: Use `cublasSgemm` with `transa = CUBLAS_OP_N`, `transb = CUBLAS_OP_T`. Then A is m x k, B is n x k. Wait, cuBLAS signature:
+
+`cublasSgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)`
+
+computes `C = alpha * op(A) * op(B) + beta * C`.
+
+Set:
+- op(A) = W^T? Let&#x27;s see.
+
+We want C (B x O) = X (B x I) * W^T (I x O). In standard BLAS (column-major), if we treat X as A and W^T as B, then op(A) is B x I, op(B) is I x O. The product is B x O. So m = B, n = O, k = I. op(A) is X (B x I). But X is stored row-major (B x I). In column-major, a matrix with the same memory layout as X is size (I, B) with leading dimension I. So if we pass it as A with no transpose (`transa = N`), cuBLAS interprets A as column-major with dimensions m x k = B x I. That means A is stored as B rows, I columns in column-major =&gt; memory layout is column-major (I,B). But our memory is row-major (B,I). So that does not match.
+
+If we pass `transa = T`, then op(A) = A^T column-major. If A&#x27;s memory layout is row-major (B,I) and we interpret A as column-major (I,B), then A^T is B x I, which is what we want for op(A). So we can pass `transa = T`, with A being the memory of X, and `lda = I`. Then op(A) is B x I.
+
+Similarly, for W: we want op(B) = W^T (I x O). W is row-major (O,I). If we interpret its memory as column-major (I,O), then op(B) with `transb = N` gives I x O. Perfect. So we can pass `transb = N`, B = weight, `ldb = I`. Then op(B) is I x O.
+
+Thus: `transa = T`, `transb = N`, m = B, n = O, k = I.
+A = x.data_ptr&lt;float&gt;(), lda = I.
+B = weight.data_ptr&lt;float&gt;(), ldb = I.
+C = gemm_out.data_ptr&lt;float&gt;(), ldc = O.
+
+Check: `op(A)` is (lda rows?) Actually if transa=T, op(A) = A^T, A has dimensions k x m in column-major? Wait, if transa=T, then A is k x m (since op(A)=m x k, so A itself is k x m). The leading dimension of A is lda. Here A is X memory interpreted as column-major (I, B). So k=I, m=B. lda = I (number of rows of A). Good.
+
+If transb=N, then B is k x n (since op(B)=k x n). B memory is weight interpreted as column-major (I, O). So k=I, n=O. ldb = I. Good.
+
+C is m x n = B x O. Since we want C to be row-major B x O, we need to interpret C&#x27;s memory. If C is allocated as row-major B x O, its memory layout is (B,O) row-major. If we interpret this memory as column-major, it is (O,B). But cuBLAS writes C in column-major: C is m x n = B x O, stored column-major with leading dimension m = B. Wait, column-major storage of a B x O matrix means element (i,j) is at i + j*B. Row-major storage of a B x O matrix means element (i,j) is at i*O + j. These differ. So if we allocate C as a PyTorch tensor (row-major) of shape (B,O) and pass it to cuBLAS as C with ldc = m = B, cuBLAS will write in column-major order into that memory. That means the resulting tensor will be transposed: it will be O x B in row-major? Let&#x27;s see: cuBLAS writes element (i,j) of C (0&lt;=i&lt;B, 0&lt;=j&lt;O) at memory offset i + j*B. If we later interpret the memory as a row-major tensor of shape (B,O), element (i,j) would be at i*O + j. That&#x27;s wrong.
+
+Wait, but in PyTorch&#x27;s `addmm` implementation, they handle this by passing appropriate transposes. Let&#x27;s see how PyTorch calls cuBLAS for `torch.mm`.
+
+In PyTorch, `mm` for [B,I] x [I,O] (actually weight is [O,I]) yields [B,O]. For linear(weight.T), it calls `addmm` with `mat1=x` (B,I), `mat2=weight.t()` (I,O). So it&#x27;s effectively X * W.t(). In cuBLAS, to compute X * W.t() where both are row-major, PyTorch likely sets transa=N, transb=N but with swapped dimensions? Actually let&#x27;s recall: In `aten/src/ATen/native/cuda/Blas.cpp`, the function `addmm_out_cuda` computes C = beta*C + alpha*(A @ B). It handles row-major by adjusting transposes: `opA = transpose? CUBLAS_OP_T : CUBLAS_OP_N`, etc. There is a standard mapping: to compute C_row = A_row * B_row in cuBLAS, you can set transa = CUBLAS_OP_N, transb = CUBLAS_OP_N, but then A and B are interpreted as column-major. So the memory layout of A_row is equivalent to A_col^T. Thus op(A) should be A^T, i.e., transa = T. Similarly for B. Then you compute C = A^T * B^T? Wait.
+
+Let&#x27;s use the known mapping: In row-major, C = A * B. In column-major, C^T = B^T * A^T. So `C_row = A_row * B_row` is equivalent to `C_col^T = B_col * A_col`? Let&#x27;s be systematic.
+
+Given memory layout is row-major. To use column-major BLAS, we can note that a row-major matrix M is the transpose of the column-major matrix with the same memory layout. So if we have row-major A (m x k) and row-major B (k x n), then A = A_col^T, B = B_col^T, where A_col is k x m (same memory), B_col is n x k. Then C_row = A_row * B_row = A_col^T * B_col^T = (B_col * A_col)^T. So the resulting C in row-major is the transpose of the column-major product D = B_col * A_col. So to compute C_row, we can compute D = B_col * A_col using BLAS with no transposes: D = B * A. Then D is column-major n x m. Interpreting D&#x27;s memory as row-major gives m x n? Let&#x27;s see: D_col (n x m) has memory layout that corresponds to row-major C_row (m x n) transposed? Actually if we allocate an array of size m*n, and treat it as D_col (n,m), then D[j,i] is stored at i + j*m. If we treat the same memory as C_row (m,n), then C[i,j] is at i*n + j. These are different unless m=n. So computing D = B_col * A_col and interpreting memory as row-major does not give the right layout.
+
+Better to just use the parameters to make cuBLAS write in the right order. There is a known trick: set `transa = CUBLAS_OP_N`, `transb = CUBLAS_OP_N`, but treat A as k x m and B as n x k. Then `op(A)` is m x k? No, op(A) is A^T if transa=T, A if transa=N. If transa=N, A is m x k. But our memory layout is row-major (m x k). We can pass A as being column-major of size k x m, and set `transa = T` to get op(A) = m x k. Similarly for B: memory is row-major (k x n), pass as column-major n x k, set `transb = T` to get op(B) = k x n. Then compute C = op(A)*op(B) = A^T * B^T? Wait, A is column-major k x m, so A^T is m x k. B is column-major n x k, so B^T is k x n. Then C = A^T * B^T is m x n. But cuBLAS computes column-major C = A^T * B^T, which means C is m x n column-major. But we want C row-major m x n. As we saw earlier, m x n column-major is not the same memory layout as m x n row-major. However, note that we passed A and B as the transposes of the row-major matrices, and we got C as A^T * B^T. But A^T is exactly the row-major A interpreted as column-major. Wait, let&#x27;s re-evaluate.
+
+Let M_row be a m x k row-major matrix. If we create a column-major matrix M_col of size k x m with the same data pointer, then M_col[i,j] = M_row[j,i]. So M_col = M_row^T. Now op(M_col) with trans=T is M_col^T = (M_row^T)^T = M_row. So op(A_col^T) = A_row (m x k). op(B_col^T) = B_row (k x n). Then C_col = op(A) * op(B) = A_row * B_row = C_row (m x n). But cuBLAS stores C_col as column-major m x n. Since C_row is row-major m x n, they are not the same memory layout. So if we allocate a tensor of size (m,n) in PyTorch (row-major) and pass its data pointer as C, cuBLAS will write column-major into it. That means the resulting memory layout corresponds to C_row^T (n x m row-major). So to get the correct result, we would need to interpret the output as transposed or allocate it as (n,m) in PyTorch.
+
+But PyTorch&#x27;s `addmm` does handle this. How? It typically sets the transpose flags such that cuBLAS writes directly into the row-major buffer without producing a logical transpose. Let&#x27;s look at the mapping used by PyTorch.
+
+From `aten/src/ATen/native/cuda/Blas.cpp`:
+
+```
+// cublas works with col-major data.
+// To perform a row-major multiplication, we can use the identity:
+// C_row = A_row * B_row
+// =&gt; C_col^T = A_col^T * B_col^T
+// =&gt; C_col = B_col * A_col
+// So we can compute C = B * A using cublas, where A and B are viewed as col-major.
+// But wait, that yields C_col = B_col * A_col. Since C_col is the transpose of C_row? Let&#x27;s see.
+// B_col is n x k (since B_row is k x n). A_col is k x m (since A_row is m x k).
+// Their product is n x m col-major, which is m x n row-major. So if we allocate output as m x n,
+// but cublas writes n x m col-major, the memory layout matches m x n row-major! Because
+// col-major n x m has elements at i + j*n (0&lt;=i&lt;n, 0&lt;=j&lt;m). If we interpret the same memory
+// as row-major m x n, element (p,q) is at p*n + q. That matches i + j*n with p=j, q=i.
+// So indeed, C_col (n x m) is memory-layout equivalent to C_row (m x n).
+```
+
+Yes! This is the key: `C_col` of size `n x m` has the same memory layout as `C_row` of size `m x n`.
+
+So to compute C_row = A_row * B_row, we can compute D_col = B_col * A_col, where D_col is n x m. Then D_col memory is exactly C_row memory.
+
+Thus, for our case: A_row = x (B x I), B_row = weight.T? Wait, our multiplication is x (B x I) * weight^T (I x O) = C (B x O). So A_row = x (m=B, k=I). B_row = weight^T (k=I, n=O). But weight is stored row-major as O x I. So weight^T is I x O. However, we can also think of using weight directly: we want C = x * W^T. That is A_row = x (B x I), B_row = W^T (I x O). In the mapping, we need to compute D_col = (B_row)_col * (A_row)_col. But B_row = W^T. What is (B_row)_col? B_row is I x O row-major. Its col-major equivalent is O x I (same memory as W). Because a row-major I x O matrix is the transpose of a col-major O x I matrix. Wait:
+
+Let M_row be I x O. Then M_col (same memory) is O x I, with M_col[i,j] = M_row[j,i]. So M_col = M_row^T. Since W is O x I row-major, W = (W^T)_col? Let&#x27;s check: W is row-major O x I. If we take B_row = W^T, which is I x O row-major. The col-major matrix with same memory as B_row is O x I, which is exactly W. So (B_row)_col = W. Good.
+
+Similarly, (A_row)_col = x_col (same memory as x row-major B x I) = I x B. So x_col is column-major I x B.
+
+Then D_col = (B_row)_col * (A_row)_col = W (O x I col-major) * x_col (I x B col-major) = O x B col-major.
+
+This D_col (O x B) has memory layout equivalent to C_row (B x O). Perfect.
+
+So we call cublasSgemm with:
+- transa = N, transb = N? Let&#x27;s see: D_col = (B_row)_col * (A_row)_col. Both are not transposed in col-major. So `transa = N`, `transb = N`.
+- A = weight.data_ptr&lt;float&gt;(), lda = O (since weight is O x I col-major? Wait, weight is O x I row-major, which we interpret as I x O col-major? No, we said (B_row)_col = W where W is O x I row-major. But in col-major, a matrix of size O x I has leading dimension O. However, here we are interpreting the memory of W as a col-major matrix. The shape of this col-major matrix is whatever we declare. Since W memory is O*I floats. If we declare A as col-major with dimensions m=O, n=I, then lda = O. And A[i,j] (col-major) corresponds to W_row[j,i]? Let&#x27;s verify: W_row[j,i] (0&lt;=j&lt;O, 0&lt;=i&lt;I) is at offset j*I + i. Col-major A[i,j] (0&lt;=i&lt;O, 0&lt;=j&lt;I) is at offset i + j*O. These do not match. So our identification that (B_row)_col = W is wrong if W is row-major O x I.
+
+Let&#x27;s correct this carefully.
+
+Memory layout of a 2D array is defined by the order of elements. Row-major (C/C++/Python) array `a[m][n]` has `a[i][j]` at `i*n + j`. Column-major (Fortran/BLAS) array `a[m][n]` has `a[i][j]` at `i + j*m`. The difference is purely in indexing: the same memory block can be interpreted as either a row-major matrix of some shape or a column-major matrix of some shape.
+
+Given a row-major matrix M_row of shape (m,k), we can define a column-major matrix M_col of shape (k,m) using the same memory pointer. Then M_col[i,j] (0&lt;=i&lt;k, 0&lt;=j&lt;m) is at offset i + j*k. M_row[j,i] is at offset j*k + i. So M_col[i,j] = M_row[j,i]. So M_col = M_row^T. Good.
+
+Now, we have x_row of shape (B, I). Then x_col (same memory) is shape (I, B) and x_col = x_row^T.
+
+We have weight_row of shape (O, I). Then weight_col (same memory) is shape (I, O) and weight_col = weight_row^T.
+
+We want C_row = x_row * weight_row^T. Note: weight_row^T is shape (I, O). So the multiplication is (B,I) * (I,O) = (B,O).
+
+Now, consider weight_row^T. Its col-major counterpart would be (weight_row^T)_col = (weight_row^T)^T = weight_row (shape O x I). But wait, weight_row^T is a row-major matrix of shape (I,O) (conceptually). Its col-major counterpart is (O,I). And that col-major counterpart is exactly weight_row? Let&#x27;s check: weight_row^T as a conceptual row-major matrix: element (i,o) = weight_row[o,i]. Its col-major counterpart of shape (O,I) has element (o,i) at offset o + i*O. But weight_row[o,i] in row-major is at offset o*I + i. These are not the same memory layout unless we change the memory. So weight_row^T as a distinct matrix is not stored in memory; we are just taking the transpose. However, the operation `x_row * weight_row^T` can be seen as BLAS `gemm` with appropriate flags.
+
+The standard approach: to compute C = A * B^T where A and B are row-major, you can call `cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)`. Here A is m x k, B is n x k. Wait, cuBLAS signature: `cublasSgemm(handle, transa, transb, m, n, k, ...)` computes `C = op(A) * op(B)`. If we set `transa = N`, then op(A) is m x k. If we set `transb = T`, then op(B) is k x n (since B is n x k in column-major, and op(B)=B^T is k x n). But our matrices are row-major. How does cuBLAS interpret the memory? It interprets the pointer as column-major. So if we pass A pointer with `transa = N`, cuBLAS treats A as column-major of size m x k. The memory layout of a column-major m x k matrix is NOT the same as a row-major m x k matrix. But we can pass the transpose flag to compensate.
+
+The standard PyTorch mapping for `addmm` on CUDA (from memory):
+```
+cublasOperation_t transa = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+cublasOperation_t transb = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+int64_t m = self.size(0); // rows of C
+int64_t n = self.size(1); // cols of C
+int64_t k = mat1.size(1); // inner dim
+
+// Actually, for C = mat1 @ mat2:
+// mat1 is (m,k), mat2 is (k,n)
+// In cuBLAS, to compute row-major C = A_row * B_row, you set:
+// transa = (mat1.strides()[0] == 1 &amp;&amp; mat1.strides()[1] == mat1.size(0)) ? CUBLAS_OP_N : CUBLAS_OP_T ...
+```
+But because PyTorch handles arbitrary strides, it is more complex.
+
+For contiguous row-major tensors, the mapping is:
+- `op(A)` corresponds to `A_row` if `transa = CUBLAS_OP_T`, because A_col (same memory) is k x m, and A_col^T = m x k = A_row. Wait: A is column-major k x m (same memory as row-major m x k). A^T is m x k. So op(A) = A^T = A_row if we set transa = T. But then m is the number of rows of op(A), which is m. And lda is the leading dimension of A (the non-transposed matrix). If transa=T, A has dimensions k x m, lda = k. So we set `transa = CUBLAS_OP_T`, `lda = k` (which is the stride of the last dimension of A_row? Actually for row-major m x k, the inner dimension is k, so lda = k). Wait, normally for row-major m x k, the offset is i*k + j. If we interpret this memory as column-major k x m, element (i,j) is at i + j*k. So the leading dimension (number of rows) is k. Yes, lda = k.
+
+Similarly, for B row-major k x n: to get op(B) = B_row, we set `transb = T`, `ldb = n`? Wait, B is row-major k x n. Interpreted as column-major n x k, element (i,j) at i + j*n. So its dimensions are n x k, leading dimension = n. If we set transb = T, op(B) = B^T = k x n = B_row. So ldb = n.
+
+Then C = op(A) * op(B) = A_row * B_row. C is m x n row-major. In cuBLAS, C is stored column-major. If we compute C_col = A_row * B_row, then C_col is m x n column-major? Wait, cuBLAS computes C = op(A) * op(B). The result C is stored in column-major with dimensions m x n. But A_row * B_row is m x n row-major. Column-major m x n is not the same memory layout as row-major m x n. So we still have a layout mismatch.
+
+Wait, but earlier we reasoned that C_col (n x m) is memory-layout-equivalent to C_row (m x n). So perhaps we need to compute D = B * A in column-major to get n x m, which matches C_row.
+
+Let&#x27;s re-derive with the transpose flags:
+
+We want C_row (m x n). Consider computing D_col = B_col * A_col (no transposes). B_col is n x k (since B_row is k x n). A_col is k x m (since A_row is m x k). D_col is n x m column-major. As we established, n x m column-major has memory layout equivalent to m x n row-major. So D_col memory = C_row memory. So we should compute `C = B * A` with no transposes, but we need to pass the pointers of B and A such that cuBLAS interprets them as B_col and A_col.
+
+Given A_row is m x k row-major, A_col (same memory) is k x m. B_row is k x n row-major, B_col (same memory) is n x k.
+
+Wait, this is the mapping: A_row (m x k) memory = A_col (k x m). B_row (k x n) memory = B_col (n x k).
+
+So to compute D_col = B_col * A_col, we call cublas with:
+- transa = N (op(A) = A, which is A_col = k x m? Actually in the call, the first matrix is A, second is B in cuBLAS notation? Let&#x27;s check: `cublasSgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)` computes `C = op(A) * op(B)`. The dimensions: op(A) is m x k, op(B) is k x n, C is m x n.
+Wait, I keep mixing up the cuBLAS definition. Let&#x27;s write it clearly.
+
+cuBLAS `gemm` computes `C = alpha * op(A) * op(B) + beta * C`.
+- `transa` and `transb` specify whether to transpose A and B.
+- `m`: number of rows of `op(A)` and `C`.
+- `n`: number of columns of `op(B)` and `C`.
+- `k`: number of columns of `op(A)` and rows of `op(B)`.
+- `lda`: leading dimension of A (the non-transposed matrix).
+- `ldb`: leading dimension of B.
+- `ldc`: leading dimension of C.
+
+The memory layout is column-major.
+
+Now, we want to compute `C_row = A_row * B_row`, where `A_row` is `m x k`, `B_row` is `k x n`.
+
+We can set `op(A)` to be `A_col` and `op(B)` to be `B_col`, and compute `C_col = op(A) * op(B)`. But then `C_col` will be `m x n` column-major, which is not `C_row`.
+
+Alternative: set `op(A) = B_row` (k x n) and `op(B) = A_row` (m x k) and compute `C = op(A) * op(B)`. Then `op(A)` is `k x n`, `op(B)` is `m x k`? That doesn&#x27;t match dimensions.
+
+Wait, we need `op(A)` to have dims `m x k` and `op(B)` to have dims `k x n` so their product is `m x n`. But we want the product of `A_row` and `B_row`. How can we get `op(A) = A_row` and `op(B) = B_row`?
+
+`A_row` is `m x k`. To represent `A_row` as `op(A)` in column-major, we need to pass a matrix `A` such that `op(A) = A_row`. If we set `transa = T`, then `op(A) = A^T`. We need `A^T = A_row`. So `A` must be `A_row^T = A_col` (k x m). And `A` is stored in column-major with dimensions k x m. Since `A_col` is stored column-major (by definition), its leading dimension is k. Wait, `A_col` is k x m column-major, so lda = k.
+
+Similarly, `B_row` is `k x n`. To get `op(B) = B_row`, set `transb = T`. Then `B` must be `B_row^T = B_col` (n x k). `B_col` is n x k column-major, so ldb = n.
+
+Then `C = op(A) * op(B) = A_row * B_row`. The resulting `C` is stored column-major with dimensions m x n. But `C_row` is row-major m x n. These are different memory layouts. So this still doesn&#x27;t match.
+
+PyTorch solves this by computing `C = B * A` with dimensions swapped. Let&#x27;s see: If we compute `C = B_col * A_col` with no transposes:
+- `op(A) = A_col` (k x m). But in cuBLAS, to have `op(A)` be k x m, we need to set `m = k`? No, `m` is rows of `op(A)`. So if we want `op(A)` to be `k x m`, we set `transa = N`, pass `A` as `A_col` (k x m), `lda = k`, and set cuBLAS parameter `m = k`? Wait, but `m` also determines rows of C. If `m = k`, C would be k x something. That&#x27;s not right.
+
+The trick is: instead of computing `C = A * B` with `C` as `m x n`, we compute `C = B^T * A^T` with `C` as `n x m`? Let&#x27;s think.
+
+We want a matrix stored in memory that is row-major m x n. That memory corresponds to column-major n x m. So if we can get cuBLAS to write a column-major matrix of size `n x m`, that will be exactly our desired row-major `m x n`.
+
+How to get a column-major `n x m` result? We set the cuBLAS `m` parameter to `n` and `n` parameter to `m`. Then `C` will be `n x m` column-major.
+
+Now, what product yields an `n x m` matrix? We need `op(A)` to be `n x k` and `op(B)` to be `k x m`.
+
+Can we set `op(A) = B_row^T`? `B_row` is `k x n`. `B_row^T` is `n x k`. That&#x27;s `n x k`. Good, that&#x27;s `op(A)` dimensions.
+
+Can we set `op(B) = A_row^T`? `A_row` is `m x k`. `A_row^T` is `k x m`. That&#x27;s `k x m`. Good.
+
+So `C_col (n x m) = B_row^T * A_row^T = (A_row * B_row)^T = C_row^T`. But since `C_col` is `n x m` column-major, its memory layout is the same as `C_row` (m x n) row-major. Let&#x27;s verify:
+
+`C_row` element (i,j) with 0&lt;=i&lt;m, 0&lt;=j&lt;n: memory offset = i*n + j.
+`C_col` element (p,q) with 0&lt;=p&lt;n, 0&lt;=q&lt;m: memory offset = p + q*n.
+If we map p=j, q=i: offset = j + i*n = i*n + j. Yes! So memory matches if we consider `C_col` as the transpose of `C_row`.
+
+Thus, to compute `C_row = A_row * B_row`, we can compute `C_col = B_row^T * A_row^T` using cuBLAS, and set the output dimensions to `n x m`. The resulting memory will be correct.
+
+Now, how to pass `B_row^T` and `A_row^T` to cuBLAS without explicitly transposing memory?
+
+`B_row^T` is `n x k`. We can represent it as `op(A)` where `A` is the memory of `B_row`. `B_row` is row-major `k x n`. Its col-major counterpart is `n x k`. Call it `B_col`. If we set `transa = N`, then `op(A) = A = B_col` which is `n x k`. But `B_col` is NOT `B_row^T`. Wait, `B_col` (n x k) has element (i,j) = B_row[j,i] = weight_row[j,i] (if B=weight). `B_row^T` (n x k) has element (i,j) = B_row[j,i]. Yes! `B_col = B_row^T`. Because `B_row` is `k x n` row-major. Its col counterpart of same memory is `n x k`. And `B_row^T` is also `n x k`. Are they equal element-wise? `B_col[i,j] = B_row[j,i]`. `B_row^T[i,j] = B_row[j,i]`. So `B_col = B_row^T`. Good! Because col-major of a row-major matrix is its transpose. So `B_col = B_row^T`. Similarly, `A_col = A_row^T`.
+
+Thus:
+- To get `op(A) = B_row^T = n x k`, we can pass `transa = N` and pointer to `B_row` memory. cuBLAS will interpret it as column-major `n x k`. That is exactly `B_row^T`. `lda = n` (rows of A).
+- To get `op(B) = A_row^T = k x m`, we pass `transb = N` and pointer to `A_row` memory. cuBLAS interprets it as column-major `k x m`. That is `A_row^T`. `ldb = k`.
+- We want `C` to be `n x m` column-major. So set `m = n`, `n = m` (in cuBLAS terms: the first dimension param is rows of op(A) = n, second is cols of op(B) = m).
+Wait, cuBLAS signature: `cublasSgemm(handle, transa, transb, m, n, k, ...)`. Here:
+  - `m` = rows of op(A) = n (since op(A) is `n x k`).
+  - `n` = cols of op(B) = m (since op(B) is `k x m`).
+  - `k` = cols of op(A) = rows of op(B) = k.
+- Pointer A = B_row memory (weight memory). `lda = n`? Wait, A is the non-transposed matrix in memory. Since transa=N, A is column-major `n x k`. The leading dimension of A (lda) is the number of rows of A = n. But what is n here? In our case, n (cols of C_row) = O. So `lda = O`. Wait, let&#x27;s map to our variables.
+
+Our variables:
+- A_row = x (B x I). m = B, k = I.
+- B_row = weight^T (I x O). But weight is stored as O x I. So B_row is the conceptual transpose of weight. However, we found that we can use the memory of weight directly.
+
+Let&#x27;s set:
+- op(A_cu) = weight^T? Actually we want op(A_cu) = B_row^T. But B_row = weight^T. So B_row^T = weight. Wait, B_row is `I x O` (the conceptual transpose of weight). Then B_row^T is `O x I`, which is exactly the stored weight row-major. So op(A_cu) should be `O x I`. But we also need op(A_cu) to be `n x k` where n = O, k = I. Yes.
+
+Wait, earlier we said op(A) = B_row^T. B_row is the second operand in the row-major multiplication: B_row = weight^T (I x O). B_row^T = weight (O x I). So op(A_cu) = weight (O x I). In cuBLAS, if we pass pointer to `weight` with `transa = N`, cuBLAS interprets it as column-major. But `weight` is row-major O x I. Its col-major counterpart is I x O, which is weight^T. That&#x27;s NOT weight. However, we want op(A_cu) to be weight (O x I). So we need to pass `transa = T` to get the transpose of the col-major interpretation.
+
+Let&#x27;s carefully map.
+
+We have two row-major matrices:
+- X_row: shape (B, I).
+- W_row: shape (O, I).
+
+We want C_row = X_row * W_row^T. Note W_row^T is shape (I, O).
+
+Now, using the identity: C_row = X_row * W_row^T  =&gt;  C_col^T = (W_row^T)_col^T * X_col^T? This is messy.
+
+Alternative standard mapping: In row-major, C = A * B^T (where A is m x k, B is n x k). This is a common BLAS call: `cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)`.
+
+Let&#x27;s test this with small matrices.
+
+Suppose A_row = [[1,2],[3,4]] (m=2,k=2). B_row = [[5,6],[7,8]] (n=2,k=2). We want C = A * B^T. B^T = [[5,7],[6,8]]. Then C = A * B^T = [[1*5+2*6, 1*7+2*8], [3*5+4*6, 3*7+4*8]] = [[17,23],[39,53]]? Let&#x27;s compute: Row0 dot col0 of B^T = dot([1,2],[5,6]) = 17. Row0 dot col1 of B^T = dot([1,2],[7,8]) = 23. Row1 dot col0 = dot([3,4],[5,6]) = 39. Row1 dot col1 = dot([3,4],[7,8]) = 53.
+
+Now, call `cublasSgemm` with `transa=N, transb=T, m=2, n=2, k=2`. Then op(A) is m x k = 2 x 2. op(B) is k x n = 2 x 2. C is 2 x 2.
+
+But cuBLAS sees pointers as column-major. So A pointer is interpreted as column-major 2x2. For A_row = [[1,2],[3,4]] row-major, memory = [1,2,3,4]. As col-major 2x2, it&#x27;s [[1,3],[2,4]]. So A_col = [[1,3],[2,4]]. op(A) = A_col = [[1,3],[2,4]] (since transa=N).
+
+B pointer is interpreted as column-major 2x2. B_row = [[5,6],[7,8]] row-major, memory = [5,6,7,8]. B_col = [[5,7],[6,8]]. op(B) = B_col^T (since transb=T) = [[5,6],[7,8]]? Wait, B_col^T = [[5,7]^T? B_col = [[5,7],[6,8]] (col-major). Its transpose is [[5,6],[7,8]] (row-major). In col-major terms, B_col^T is the matrix with elements (i,j) = B_col[j,i]. So B_col = [5,7,6,8] (col-major layout: column0 = 5,7; column1 = 6,8). B_col^T as a col-major matrix would have memory layout? Actually if we just transpose the matrix, the memory layout changes. cuBLAS handles this logically. op(B) = B_col^T, which as a mathematical matrix is [[5,6],[7,8]].
+
+Then C = op(A) * op(B) = [[1,3],[2,4]] * [[5,6],[7,8]] (matrix multiply). Let&#x27;s compute: element (0,0) = 1*5 + 3*7 = 5+21=26. (0,1) = 1*6 + 3*8 = 6+24=30. (1,0) = 2*5 + 4*7 = 10+28=38. (1,1) = 2*6 + 4*8 = 12+32=44. So C (math) = [[26,30],[38,44]].
+
+Now, cuBLAS writes C in column-major 2x2. So memory layout: column0 = [26,38], column1 = [30,44]. Memory = [26,38,30,44].
+
+If we interpret this memory as row-major 2x2, we get [[26,38],[30,44]]. That&#x27;s not our desired [[17,23],[39,53]].
+
+So `transa=N, transb=T` does not give the correct result for row-major A * B^T if we allocate C as row-major m x n.
+
+Let&#x27;s try `transa=T, transb=N`. op(A) = A_col^T = [[1,2],[3,4]] (since A_col = [[1,3],[2,4]], A_col^T = [[1,2],[3,4]] = A_row). op(B) = B_col = [[5,7],[6,8]]. C = A_row * B_col = [[1,2],[3,4]] * [[5,7],[6,8]] = [[1*5+2*6, 1*7+2*8], [3*5+4*6, 3*7+4*8]] = [[17,23],[39,53]]. This is the correct mathematical result!
+
+Now, cuBLAS writes C as column-major m x n = 2 x 2. Memory layout: column0 = [17,39], column1 = [23,53]. Memory = [17,39,23,53].
+
+If we interpret this memory as row-major 2x2, we get [[17,39],[23,53]]. That&#x27;s transposed! Because row-major (2,2) with memory [17,39,23,53] is [[17,39],[23,53]].
+
+So `transa=T, transb=N` computes the correct math but stores it in column-major, which is the transpose of row-major.
+
+Wait, but note: A_col is k x m (2x2). transa=T -&gt; op(A) is m x k (2x2). For contiguous row-major m x k, the leading dimension of A (non-transposed) is k (since A_col is k x m, lda = k). In our case, A_row is 2x2, so lda = 2. transb=N -&gt; op(B) is k x n (2x2). B_col is n x k (2x2). ldb = n = 2. C is m x n = 2x2. ldc = m = 2.
+
+Memory of C: [17,39,23,53] (col-major). As row-major it&#x27;s transposed.
+
+So how does PyTorch get the right layout? There are two options:
+1. Compute C_col = B_col * A_col (no transposes), with m=k, n=m? Wait, we saw that D_col = B_col * A_col yields n x m column-major, which is memory-equivalent to m x n row-major.
+
+Let&#x27;s test with our example:
+A_row = [[1,2],[3,4]] (m=2,k=2). B_row = [[5,6],[7,8]] (n=2,k=2). But note: in our problem, B_row is weight^T (I x O), but let&#x27;s just test the general case.
+
+We want C_row = A_row * B_row^T. But for the standard `addmm` case without transpose on B, it&#x27;s A_row * B_row. Let&#x27;s test D_col = B_col * A_col.
+
+B_col (n x k) = [[5,7],[6,8]] (since B_row = [[5,6],[7,8]]). A_col (k x m) = [[1,3],[2,4]].
+
+D_col = B_col * A_col = [[5,7],[6,8]] * [[1,3],[2,4]] = [[5*1+7*2, 5*3+7*4], [6*1+8*2, 6*3+8*4]] = [[5+14,15+28],[6+16,18+32]] = [[19,43],[22,50]].
+
+Wait, that doesn&#x27;t match C_row = A_row * B_row = [[1,2],[3,4]]*[[5,6],[7,8]] = [[19,22],[43,50]]. Memory of D_col (col-major n x m = 2x2): column0=[19,22], column1=[43,50]. Memory=[19,22,43,50]. Interpreting as row-major m x n (2x2): [[19,22],[43,50]]. That exactly matches C_row!
+
+Great! So the trick is: compute D = B * A (using no transposes), where A and B are interpreted as column-major. The resulting D is n x m column-major, which is memory-equivalent to C_row (m x n row-major).
+
+So for our case, we want C_row = X_row * W_row^T. Let&#x27;s identify the matrices.
+
+We have X_row (B x I). We have W_row (O x I). The multiplication is X * W^T.
+
+But in standard BLAS terms, `C = A * B` where A = X (B x I), B = W^T (I x O). So m=B, k=I, n=O.
+
+To compute this using the trick, we compute D_col = B_col * A_col.
+
+What is B_col? B is W^T (I x O) row-major. B_col (same memory) is O x I. But this is exactly W_row (O x I). So B_col = W_row.
+
+What is A_col? A is X (B x I) row-major. A_col (same memory) is I x B. This is X^T.
+
+So D_col = W_row * X_col. But wait, dimensions: W_row interpreted as col-major is O x I. X_col interpreted as col-major is I x B. Their product is O x B column-major. This memory is equivalent to C_row (B x O) row-major. Let&#x27;s verify with small numbers:
+
+X_row = [[1,2,3]] (B=1, I=3). W_row = [[4,5,6],[7,8,9]] (O=2, I=3). C = X * W^T = [[1*4+2*5+3*6, 1*7+2*8+3*9]] = [[32,50]].
+
+Now W_row as col-major O x I: W_col = [[4,7],[5,8],[6,9]]? Wait, W_row is O x I = 2x3 row-major: memory [4,5,6,7,8,9]. As col-major O x I (2x3), columns are [4,7], [5,8], [6,9]. So W_col = [[4,7],[5,8],[6,9]] (shape 2x3). But earlier we said B_col = W_row. Yes, B is W^T (I x O = 3x2). B memory is W^T row-major: [4,7,5,8,6,9]. B_col (same memory) is O x I = 2x3: [[4,5,6],[7,8,9]]? Let&#x27;s compute: B_row (3x2) = W^T = [[4,7],[5,8],[6,9]]. Memory row-major = [4,7,5,8,6,9]. B_col of shape 2x3 (O x I) has elements B_col[i,j] = B_row[j,i]. So B_col[0,0]=B_row[0,0]=4; B_col[0,1]=B_row[1,0]=5; B_col[0,2]=B_row[2,0]=6; B_col[1,0]=7; B_col[1,1]=8; B_col[1,2]=9. So B_col = [[4,5,6],[7,8,9]], which is exactly W_row as a row-major matrix but stored in column-major order? Wait, W_row as row-major is [[4,5,6],[7,8,9]]. So B_col has the same elements as W_row, but stored in column-major (since it&#x27;s a col-major matrix). Good. So B_col = W_row (as a matrix, but storage is col-major). Good.
+
+A_col: X_row (1x3) row-major: memory [1,2,3]. A_col of shape 3x1 (I x B): [[1],[2],[3]].
+
+Now D_col = B_col * A_col = [[4,5,6],[7,8,9]] * [[1],[2],[3]] = [[4*1+5*2+6*3],[7*1+8*2+9*3]] = [[32],[50]].
+
+D_col is O x B = 2x1 column-major. Memory: column0 = [32,50]. Memory = [32,50].
+
+Interpret this as row-major B x O = 1x2: [[32,50]]. That&#x27;s exactly C_row.
+
+Great! So the mapping works.
+
+Thus, to compute `C_row = X_row * W_row^T`, we call cuBLAS `gemm` with:
+- transa = N, transb = N.
+- But the matrices we pass are swapped: we pass `B` pointer = W_row, `A` pointer = X_row? Wait, cuBLAS computes `C = op(A) * op(B)`. We want `D_col = B_col * A_col`. So we need to pass `A_cu = B_col` and `B_cu = A_col`. That means:
+  - The first matrix argument to cuBLAS (`A`) should be `W_row` (pointer to weight).
+  - The second matrix argument (`B`) should be `X_row` (pointer to x).
+  - `transa = N`, `transb = N`.
+  - Dimensions: `m` = rows of op(A) = rows of B_col = O.
+  - `n` = cols of op(B) = cols of A_col = B.
+  - `k` = cols of op(A) = rows of op(B) = I.
+  - `lda` = leading dimension of A (B_col) = O (since B_col is O x I col-major, lda = O).
+  - `ldb` = leading dimension of B (A_col) = I (since A_col is I x B col-major, ldb = I).
+  - `C` pointer to output tensor of shape (B, O) in PyTorch row-major. `ldc` = O (rows of C in column-major? Wait, C resulting from cuBLAS will be m x n = O x B column-major. The leading dimension of C (ldc) is the number of rows of C = O. For a column-major matrix, ldc is the first dimension. So ldc = O.
+
+Now, what is the memory layout of the output C tensor if we allocate it as (B, O) in PyTorch? It is row-major B x O. The cuBLAS call will write to it as if it&#x27;s O x B column-major. As we proved, these are memory-compatible. So after the call, the output tensor will correctly contain the row-major B x O result.
+
+Let&#x27;s verify with the small example: allocate C of shape (1,2) = [0,0] row-major. Pass as C pointer, ldc=2. cuBLAS writes D_col (2x1 col-major) into memory: column0 (2 elements) -&gt; C[0], C[1]. Memory = [32,50]. As row-major 1x2, it&#x27;s [[32,50]]. Correct.
+
+Great.
+
+So the parameters are:
+- cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, O, B, I, &amp;alpha, weight_ptr, O, x_ptr, I, &amp;beta, gemm_out_ptr, O);
+
+Wait, but we need to double-check `lda`. The first matrix is `weight_ptr`, which points to row-major O x I. cuBLAS interprets it as column-major O x I. For column-major O x I, the leading dimension is O. Since weight is row-major O x I, its stride between columns (in row-major terms) is I? Actually in row-major, the offset of element (o,i) is o*I + i. In column-major interpretation, element (o,i) is at offset o + i*O. For this to match memory, we need o*I + i = o + i*O for all o,i, which is false unless O=1 or I=1. Wait, this is the key: the memory layout of a row-major O x I matrix is not the same as a column-major O x I matrix. They are transposes of each other.
+
+But earlier we said B_col (which is O x I col-major) has the same memory as B_row (I x O row-major). Not as W_row (O x I row-major). Let&#x27;s revisit.
+
+We identified B = W^T (I x O row-major). B_col (same memory) is O x I col-major. And we said B_col = W_row as a matrix, but with different storage order? Let&#x27;s carefully examine.
+
+Weight is stored as row-major O x I: memory[ o*I + i ] = W[o,i].
+
+B = W^T is conceptual I x O row-major: B[i,o] = W[o,i]. If we were to store B in row-major, memory would be [ B[0,0], B[0,1], ..., B[0,O-1], B[1,0], ... ] = [ W[0,0], W[1,0], ..., W[O-1,0], W[0,1], ... ]. That is not the same memory as weight.
+
+But we don&#x27;t have B stored separately; we only have weight. However, in cuBLAS we can pass weight with a transpose flag to represent B. Let&#x27;s see: if we pass `weight_ptr` with `transa = T`, then op(A) = weight^T col-major. If weight is interpreted as column-major O x I, then weight^T is I x O. But we want op(A) to be B_col = O x I col-major. Hmm.
+
+Wait, earlier we said B_col (which is O x I col-major) has the same memory as W_row (O x I row-major)? No, we need to be precise.
+
+We have:
+- W_row: shape (O, I), row-major. Memory layout: W[o,i] at offset o*I + i.
+- We want B_col: shape (O, I), column-major. Memory layout: B[o,i] at offset o + i*O.
+
+For B_col to share memory with W_row, we need o*I + i = o + i*O for all o,i, which is false. So they do NOT share memory.
+
+But earlier, we established that B_col shares memory with B_row (conceptual W^T row-major). Since B_row is I x O row-major, its memory layout is B[i,o] at offset i*O + o. B_col (O x I col-major) has element (o,i) at offset o + i*O. So B_col[o,i] is at offset o + i*O. B_row[i,o] is at offset i*O + o. These are the same offset! So B_col[o,i] = B_row[i,o]. And since B_row is W^T, B_row[i,o] = W[o,i]. So B_col[o,i] = W[o,i]. Thus B_col (O x I col-major) contains the same elements as W_row (O x I row-major). But the memory layout of B_col is offset = o + i*O, while the memory layout of W_row is offset = o*I + i. These are different! Wait, offset o + i*O vs o*I + i. Are they the same? Only if O=I and specifically if O=I and the mapping is a transpose? No.
+
+Hold on: B_row is I x O row-major. Its memory offset for (i,o) is i*O + o.
+B_col is O x I col-major. Its memory offset for (o,i) is o + i*O.
+These are the same offset for the same pair (i,o) if we map (o,i) in B_col to (i,o) in B_row. So the element at B_col[o,i] is at the same memory location as B_row[i,o]. That means the memory array for B_col is exactly the array for B_row (just indexed differently). And since B_row[i,o] = W[o,i], the memory array contains W[o,i] at offset i*O + o. But W_row&#x27;s memory array has W[o,i] at offset o*I + i. So the memory arrays are transposes of each other. B_col does NOT share memory with W_row. It shares memory with a conceptual B_row that is the transpose of W_row.
+
+But we only have W_row in memory. So we cannot directly use B_col memory without transposing.
+
+However, we can use W_row itself by setting appropriate transpose flags. We need to find the flags such that op(A) = B_col = O x I. Since B_col is the transpose of B_row (I x O), and B_row is the transpose of W_row (O x I). So B_col = (W_row^T)^T = W_row. Wait! Let&#x27;s think in terms of matrix equality.
+
+As mathematical matrices (abstract), W_row is O x I. Its transpose W_row^T is I x O. B_row is I x O, so B_row = W_row^T. B_col is the column-major matrix with the same memory as B_row. But as a mathematical matrix, B_col is O x I (since it&#x27;s col-major O x I). What is the relationship between B_col and W_row as abstract matrices?
+
+B_col[o,i] = B_row[i,o] = W_row[o,i]. So as abstract matrices, B_col = W_row. They have the same entries in the same positions (o,i)! Wait, B_col[o,i] = W_row[o,i]. So yes, B_col as an abstract matrix equals W_row. But the memory layout of B_col is column-major, while W_row is row-major. Since they are the same abstract matrix but stored differently, the memory offsets differ.
+
+Therefore, if we want to pass a pointer to cuBLAS such that it interprets it as B_col (O x I col-major), we need to pass the memory of B_row, which is the transpose of W_row&#x27;s memory. But we don&#x27;t have B_row memory; we have W_row memory. However, we can pass W_row memory and tell cuBLAS to transpose it. If we pass W_row memory and set `transa = T`, then cuBLAS interprets the memory as column-major O x I (which is W_col), and then transposes it to get op(A) = W_col^T = I x O row-major? Wait, W_col is O x I col-major. W_col^T is I x O row-major? In abstract terms, transpose of O x I is I x O. The memory layout of W_col^T is row-major I x O, which is exactly B_row. But we want op(A) = B_col = O x I. So `transa = T` gives op(A) = I x O, not O x I.
+
+If we pass W_row memory with `transa = N`, cuBLAS interprets it as W_col (O x I col-major). W_col as an abstract matrix is the transpose of W_row. Because W_col[o,i] (col-major) = W_row[i,o] (row-major)? No. Let&#x27;s check: W_row is O x I. W_col (same memory) is I x O? We said earlier: row-major m x k memory interpreted as col-major is k x m. So W_row (O x I) interpreted as col-major is I x O. So W_col is I x O. And W_col[i,o] = W_row[o,i]. So W_col = W_row^T = B_row.
+
+Thus, passing W_row memory with `transa = N` gives op(A) = B_row (I x O). That&#x27;s not what we want.
+
+What if we pass X_row memory with `transb = T`? X_row (B x I) interpreted as col-major is I x B. transb=T gives op(B) = (I x B)^T = B x I = X_row. That&#x27;s what we want for the second operand? Let&#x27;s see.
+
+Our target product is D_col = B_col * A_col, where B_col is O x I and A_col is I x B.
+
+We have W_row memory. We want op(something) = B_col (O x I). B_col is O x I col-major. But W_row memory is row-major O x I. Can we reinterpret W_row memory as col-major I x O? That&#x27;s W_col = B_row. Not B_col.
+
+Since B_col as an abstract matrix equals W_row, but stored in column-major. The memory of B_col is the transpose of W_row memory? Let&#x27;s verify:
+
+W_row memory offset for (o,i): o*I + i.
+B_col memory offset for (o,i): o + i*O.
+
+If we transpose W_row memory (i.e., treat it as I x O and read it in some order), we get offset i*O + o, which matches B_col. Indeed, B_col memory is the transpose of W_row memory. Since we don&#x27;t have B_col memory, we need to use a transpose flag.
+
+cuBLAS can read a matrix with transpose, which effectively reads it in transposed order without moving memory. If we pass W_row memory and set `transa = T`, then op(A) = W_row^T as read from column-major memory. W_row memory interpreted as column-major is W_col (I x O). Then W_col^T is O x I. And W_col^T[o,i] = W_col[i,o] = W_row[o,i]. So op(A) = O x I and its entries are W_row[o,i]. And it is stored in column-major? Actually op(A) is a matrix that cuBLAS uses as column-major O x I. But since we used `transa = T`, cuBLAS reads the memory in a transposed way. The logical matrix op(A) has dimensions O x I, and its elements are W_row[o,i]. So op(A) = B_col. Great!
+
+Similarly, for X_row (B x I). We want op(B) = A_col (I x B). X_row memory interpreted as col-major is I x B. So if we pass X_row memory with `transb = N`, op(B) = X_col which is I x B. And X_col[i,b] = X_row[b,i] = A_col[i,b]. So op(B) = A_col. Good!
+
+Therefore, we should call:
+- transa = T, A = weight_ptr, lda = I? Wait, when transa = T, A is the non-transposed matrix in memory, which is interpreted as column-major. The dimensions of the non-transposed matrix A are `k x m`? No, the non-transposed matrix A has dimensions that correspond to the transpose of op(A). Since op(A) is O x I, A (in memory) is I x O col-major. But the memory we pass is W_row (O x I row-major), which is I x O col-major. So A is I x O. The leading dimension of A (lda) is the number of rows of A = I. Wait, in cuBLAS, for transa=T, the non-transposed matrix A is k x m, where k=I, m=O. The leading dimension lda is the number of rows of A = I. But W_row as row-major O x I has leading dimension in terms of row-major = I. So lda = I. Good.
+
+- transb = N, B = x_ptr. The non-transposed matrix B is interpreted as col-major. X_row (B x I) is I x B col-major. So B is I x B. The leading dimension ldb is the number of rows of B = I. X_row as row-major has leading dimension I. So ldb = I. Good.
+
+- m = O (rows of op(A)).
+- n = B (cols of op(B)).
+- k = I (inner dimension).
+- C = gemm_out_ptr. C will be O x B col-major. We allocate it as B x O row-major. `ldc = O` (rows of C). Good.
+
+Let&#x27;s test with the small example using this mapping:
+
+W_row = [[4,5,6],[7,8,9]] (O=2, I=3). Memory: [4,5,6,7,8,9].
+X_row = [[1,2,3]] (B=1, I=3). Memory: [1,2,3].
+
+Call cublasSgemm(transa=T, transb=N, m=2, n=1, k=3, A=W_ptr, lda=3, B=X_ptr, ldb=3, C=C_ptr, ldc=2).
+
+Interpretation:
+- A memory is W_row [4,5,6,7,8,9]. With transa=T, op(A) is the transpose of the col-major matrix A. A as col-major with lda=3: dimensions (3,2). A col-major 3x2:
+  column0: [4,5,6]
+  column1: [7,8,9]
+  A = [[4,7],[5,8],[6,9]] (3x2).
+  op(A) = A^T = [[4,5,6],[7,8,9]] (2x3). This matches W_row abstractly. Good.
+- B memory is X_row [1,2,3]. With transb=N, op(B) is B as col-major with ldb=3: dimensions (3,1).
+  column0: [1,2,3]
+  B = [[1],[2],[3]] (3x1).
+  op(B) = [[1],[2],[3]] (3x1). This matches X_row^T abstractly? Actually X_row is 1x3, X_col is 3x1. Yes.
+- C = op(A) * op(B) = [[4,5,6],[7,8,9]] * [[1],[2],[3]] = [[32],[50]] (2x1).
+- cuBLAS writes C as col-major 2x1: memory [32,50]. ldc=2.
+- We allocated C as row-major 1x2. Memory [32,50] -&gt; C_row = [[32,50]]. Correct!
+
+Great! So the correct cuBLAS call is:
+```
+cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, O, B, I, &amp;alpha, weight_ptr, I, x_ptr, I, &amp;beta, gemm_out_ptr, O);
+```
+Wait, lda = I? Let&#x27;s double-check: For A (weight), non-transposed dimensions are I x O (k x m). lda = k = I. Yes.
+For B (x), non-transposed dimensions are I x B (k x n). ldb = k = I. Yes.
+
+But wait, earlier I wrote `lda = O` in a previous thought. Let&#x27;s verify with the small example: lda = I = 3. That matched.
+
+What about `ldc`? C is O x B col-major. ldc = O = 2. Yes.
+
+So the call is:
+```
+cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            hidden_size, batch_size, input_size,
+            &amp;alpha,
+            weight.data_ptr&lt;float&gt;(), input_size,
+            x.data_ptr&lt;float&gt;(), input_size,
+            &amp;beta,
+            gemm_out.data_ptr&lt;float&gt;(), hidden_size);
+```
+
+Wait, but is `ldc` the leading dimension of C. Since C is column-major with m=hidden_size rows, ldc = m = hidden_size. Yes.
+
+So `gemm_out` should be allocated as `(batch_size, hidden_size)` in PyTorch. The cuBLAS call will write into it in the correct memory layout.
+
+Let&#x27;s test with a different mapping to be absolutely sure.
+
+Suppose B=2, O=3, I=4.
+X_row: 2x4.
+W_row: 3x4.
+
+We allocate gemm_out: 2x3 row-major.
+
+Call: transa=T, transb=N, m=3, n=2, k=4.
+A=W_ptr, lda=4.
+B=X_ptr, ldb=4.
+C=gemm_out_ptr, ldc=3.
+
+cuBLAS computes op(A) (3x4) * op(B) (4x2) = C (3x2 col-major).
+Memory of C (3x2 col-major) has elements:
+C[0,0], C[1,0], C[2,0], C[0,1], C[1,1], C[2,1].
+If interpreted as row-major 2x3:
+Row0: C[0,0], C[1,0], C[2,0] -&gt; these are columns of the first column of C? Wait, row-major 2x3 offset:
+(0,0):0, (0,1):1, (0,2):2, (1,0):3, (1,1):4, (1,2):5.
+Col-major 3x2 offset:
+(0,0):0, (1,0):1, (2,0):2, (0,1):3, (1,1):4, (2,1):5.
+Mapping: row-major (0,0) = col-major (0,0). (0,1) = (1,0). (0,2) = (2,0). (1,0) = (0,1). (1,1) = (1,1). (1,2) = (2,1).
+So row-major element (b,o) corresponds to col-major element (o,b). Thus the memory is indeed the transpose. Since C math = op(A)*op(B) = W_row * X_row^T? Wait, op(A) = W_row (3x4). op(B) = X_col (4x2). The product is 3x2. The transpose of that product is 2x3. And the math of C_row should be X_row * W_row^T (2x3). Indeed, (X * W^T)^T = W * X^T. So C_col = W * X^T = C_row^T. Since C_col is stored in memory, and we interpret memory as C_row, we get the correct result.
+
+Thus the mapping is solid.
+
+Now, after the GEMM, we have `gemm_out` tensor shape (batch_size, hidden_size). We need to add bias (hidden_size), apply sigmoid, sum over hidden_size.
+
+We can write a custom kernel that processes each row. For bandwidth, we should use float4 loads and vectorize. The kernel will read `gemm_out`, add `bias`, compute `sigmoid`, and reduce.
+
+Given that `hidden_size = 32768` is large, we can launch one block per batch element, with 256 or 1024 threads. Each thread processes multiple elements using float4 loops.
+
+Let&#x27;s design the kernel:
+
+```
+__global__ void reduce_sigmoid_kernel(const float* __restrict__ in,
+                                      const float* __restrict__ bias,
+                                      float* __restrict__ out,
+                                      int batch_size,
+                                      int hidden_size) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    const int blockDim = blockDim.x;
+    
+    if (b &gt;= batch_size) return;
+    
+    const float* row = in + b * hidden_size;
+    
+    float sum = 0.0f;
+    
+    int vec_size = 4;
+    int n_vec = hidden_size / vec_size;
+    
+    // We need to ensure hidden_size is divisible by 4 (32768 is).
+    for (int i = tid; i &lt; n_vec; i += blockDim) {
+        float4 val4 = reinterpret_cast&lt;const float4*&gt;(row)[i];
+        float4 b4 = reinterpret_cast&lt;const float4*&gt;(bias)[i];
+        
+        // compute sigmoid(val + bias)
+        float v0 = 1.0f / (1.0f + expf(-(val4.x + b4.x)));
+        float v1 = 1.0f / (1.0f + expf(-(val4.y + b4.y)));
+        float v2 = 1.0f / (1.0f + expf(-(val4.z + b4.z)));
+        float v3 = 1.0f / (1.0f + expf(-(val4.w + b4.w)));
+        
+        sum += v0 + v1 + v2 + v3;
+    }
+    
+    __shared__ float sdata[1024];
+    sdata[tid] = sum;
+    __syncthreads();
+    
+    for (int s = blockDim/2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        out[b] = sdata[0];
+    }
+}
+```
+
+Occupancy: blockDim 1024 uses 32 warps. Shared memory 1024*4 = 4KB, negligible. Registers: per thread uses a few. Should be fine.
+
+But we can also do warp-level reduction before writing to shared memory to reduce shared memory pressure. However with 1024 threads, 4KB is fine.
+
+We can also consider processing 2 or 4 float4s per thread to increase ILP, but memory bandwidth is the bottleneck, so it may not matter.
+
+One issue: `expf` might be slightly slower, but okay.
+
+Another thought: We could potentially fuse the bias add into the cuBLAS call. cuBLAS provides `cublasSgemm` with beta = 0 to compute into gemm_out. Then we do bias+sigmoid+sum. Good.
+
+Alternatively, we could use `cublasGemmEx` with TF32 or BF16 if allowed, but we need fp32 numerically equivalent, so no.
+
+We need to write the code for `load_inline`. Let&#x27;s write the C++ code:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x &quot; must be a CUDA tensor&quot;)
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x &quot; must be contiguous&quot;)
+#define CHECK_FLOAT(x) TORCH_CHECK(x.scalar_type() == at::kFloat, #x &quot; must be Float tensor&quot;)
+
+__global__ void fused_reduce_kernel(const float* __restrict__ in,
+                                    const float* __restrict__ bias,
+                                    float* __restrict__ out,
+                                    int batch_size,
+                                    int hidden_size) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (b &gt;= batch_size) return;
+    const float* row = in + b * hidden_size;
+    float sum = 0.0f;
+    int n_vec = hidden_size / 4;
+    for (int i = tid; i &lt; n_vec; i += blockSize) {
+        float4 val = reinterpret_cast&lt;const float4*&gt;(row)[i];
+        float4 bval = reinterpret_cast&lt;const float4*&gt;(bias)[i];
+        float v0 = 1.0f / (1.0f + expf(-(val.x + bval.x)));
+        float v1 = 1.0f / (1.0f + expf(-(val.y + bval.y)));
+        float v2 = 1.0f / (1.0f + expf(-(val.z + bval.z)));
+        float v3 = 1.0f / (1.0f + expf(-(val.w + bval.w)));
+        sum += v0 + v1 + v2 + v3;
+    }
+    // hidden_size is guaranteed multiple of 4 (32768), no tail.
+    extern __shared__ float sdata[];
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockSize/2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[b] = sdata[0];
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    CHECK_CUDA(x); CHECK_CONTIGUOUS(x); CHECK_FLOAT(x);
+    CHECK_CUDA(weight); CHECK_CONTIGUOUS(weight); CHECK_FLOAT(weight);
+    CHECK_CUDA(bias); CHECK_CONTIGUOUS(bias); CHECK_FLOAT(bias);
+    
+    int batch_size = x.size(0);
+    int input_size = x.size(1);
+    int hidden_size = weight.size(0);
+    // weight is (hidden_size, input_size)
+    
+    auto gemm_out = torch::empty({batch_size, hidden_size}, x.options());
+    auto output = torch::empty({batch_size, 1}, x.options());
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, at::cuda::getCurrentCUDAStream().stream());
+    
+    cublasSgemm(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                hidden_size, batch_size, input_size,
+                &amp;alpha,
+                weight.data_ptr&lt;float&gt;(), input_size,
+                x.data_ptr&lt;float&gt;(), input_size,
+                &amp;beta,
+                gemm_out.data_ptr&lt;float&gt;(), hidden_size);
+    
+    int threads = 1024;
+    int blocks = batch_size;
+    fused_reduce_kernel&lt;&lt;&lt;blocks, threads, threads * sizeof(float)&gt;&gt;&gt;(
+        gemm_out.data_ptr&lt;float&gt;(),
+        bias.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        batch_size,
+        hidden_size);
+    
+    return output;
+}
+```
+
+Wait, for `cublasSgemm`, we need to pass `lda`, `ldb`, `ldc`. In the small example, we had `lda = input_size`, `ldb = input_size`, `ldc = hidden_size`. Let&#x27;s double-check with the mapping:
+
+- A = weight_ptr. Non-transposed A is I x O col-major. lda = I = input_size.
+- B = x_ptr. Non-transposed B is I x B col-major. ldb = I = input_size.
+- C = gemm_out_ptr. C is O x B col-major. ldc = O = hidden_size.
+
+Yes.
+
+Let&#x27;s verify dimensions: weight is (hidden_size, input_size) = (O, I). In row-major, stride between rows is I. When interpreted as col-major I x O, the leading dimension (rows) is I. So lda = I. Good.
+
+x is (batch_size, input_size) = (B, I). In row-major, stride between rows is I. As col-major I x B, leading dimension is I. ldb = I. Good.
+
+gemm_out is (B, O) row-major. As col-major O x B, leading dimension is O. ldc = O. Good.
+
+Thus the call is correct.
+
+Potential issue: We need to make sure we include `#include &lt;cublas_v2.h&gt;` and link against cublas. `load_inline` should handle linking if we specify `extra_cuda_cflags` or rely on default includes. Usually `torch/utils/cpp_extension/load_inline` includes the necessary cuda libs. But we may need to add `extra_ldflags` or `extra_cuda_cflags`? Actually `cublas` is linked by default in PyTorch extensions because torch itself links to it. But to be safe, we can add `extra_cuda_cflags=[&quot;-O3&quot;]` and maybe `extra_ldflags`? The default should find cublas.
+
+Wait, the code uses `cublasHandle_t` and `cublasSgemm`. In ATen, there is a function `at::cuda::blas::gemm` that might be easier. Let&#x27;s see if we can use ATen&#x27;s BLAS wrapper.
+
+PyTorch C++ API provides `at::cuda::blas::gemm`. The signature (from memory) is something like:
+
+```
+namespace at::cuda::blas {
+void gemm(
+    cublasOperation_t transa, cublasOperation_t transb,
+    int64_t m, int64_t n, int64_t k,
+    at::opmath_type&lt;scalar_t&gt; alpha,
+    const scalar_t *a, int64_t lda,
+    const scalar_t *b, int64_t ldb,
+    at::opmath_type&lt;scalar_t&gt; beta,
+    scalar_t *c, int64_t ldc);
+}
+```
+
+But the exact namespace and overloads might vary by PyTorch version. Using raw cuBLAS is more portable.
+
+Using raw cuBLAS requires `cublas_v2.h`. In PyTorch extension, we can include `&lt;cublas_v2.h&gt;`. Also need to get the handle via `at::cuda::getCurrentCUDABlasHandle()`.
+
+One thing: we need to set `cublasSetStream(handle, at::cuda::getCurrentCUDAStream().stream());` to ensure the cuBLAS call runs on the current stream. `at::cuda::getCurrentCUDABlasHandle()` may already be bound to the current stream, but setting it again is safe.
+
+Another thing: we can avoid allocating `gemm_out` by reusing `output`? No, because we need to reduce across hidden_size to produce a scalar per batch. We could allocate `gemm_out` as a temporary. 16MB is fine.
+
+Alternatively, we could use `torch::mm_out` or `at::addmm_out` which might be fused? But we want a custom kernel.
+
+We should also consider using `cublasGemmStridedBatched`? No, batch_size is only 128, not batched in that sense.
+
+Another optimization: we could use a custom kernel that does the reduction without writing `gemm_out` to global memory, by computing the GEMM output on the fly using a simple dot product per output neuron. But for 32768x32768 weights, that&#x27;s too slow as discussed. So keep cuBLAS.
+
+Now, we need to write the `ModelNew` class in Python.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = &quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x &quot; must be a CUDA tensor&quot;)
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x &quot; must be contiguous&quot;)
+#define CHECK_FLOAT(x) TORCH_CHECK(x.scalar_type() == at::kFloat, #x &quot; must be Float tensor&quot;)
+
+__global__ void fused_reduce_kernel(const float* __restrict__ in,
+                                    const float* __restrict__ bias,
+                                    float* __restrict__ out,
+                                    int batch_size,
+                                    int hidden_size) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (b &gt;= batch_size) return;
+    const float* row = in + b * hidden_size;
+    float sum = 0.0f;
+    int n_vec = hidden_size &gt;&gt; 2; // divide by 4
+    for (int i = tid; i &lt; n_vec; i += blockSize) {
+        float4 val = reinterpret_cast&lt;const float4*&gt;(row)[i];
+        float4 bval = reinterpret_cast&lt;const float4*&gt;(bias)[i];
+        float v0 = 1.0f / (1.0f + expf(-(val.x + bval.x)));
+        float v1 = 1.0f / (1.0f + expf(-(val.y + bval.y)));
+        float v2 = 1.0f / (1.0f + expf(-(val.z + bval.z)));
+        float v3 = 1.0f / (1.0f + expf(-(val.w + bval.w)));
+        sum += v0 + v1 + v2 + v3;
+    }
+    extern __shared__ float sdata[];
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockSize/2; s &gt; 0; s &gt;&gt;= 1) {
+        if (tid &lt; s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[b] = sdata[0];
+    }
+}
+
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    CHECK_CUDA(x); CHECK_CONTIGUOUS(x); CHECK_FLOAT(x);
+    CHECK_CUDA(weight); CHECK_CONTIGUOUS(weight); CHECK_FLOAT(weight);
+    CHECK_CUDA(bias); CHECK_CONTIGUOUS(bias); CHECK_FLOAT(bias);
+    
+    int batch_size = x.size(0);
+    int input_size = x.size(1);
+    int hidden_size = weight.size(0);
+    
+    auto gemm_out = torch::empty({batch_size, hidden_size}, x.options());
+    auto output = torch::empty({batch_size, 1}, x.options());
+    
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cublasSetStream(handle, stream);
+    
+    cublasSgemm(handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                hidden_size, batch_size, input_size,
+                &amp;alpha,
+                weight.data_ptr&lt;float&gt;(), input_size,
+                x.data_ptr&lt;float&gt;(), input_size,
+                &amp;beta,
+                gemm_out.data_ptr&lt;float&gt;(), hidden_size);
+    
+    int threads = 1024;
+    int blocks = batch_size;
+    fused_reduce_kernel&lt;&lt;&lt;blocks, threads, threads * sizeof(float)&gt;&gt;&gt;(
+        gemm_out.data_ptr&lt;float&gt;(),
+        bias.data_ptr&lt;float&gt;(),
+        output.data_ptr&lt;float&gt;(),
+        batch_size,
+        hidden_size);
+    
+    return output;
+}
+&quot;&quot;&quot;
+
+module = load_inline(
+    name=&quot;fused_linear_sigmoid_sum&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.linear = nn.Linear(input_size, hidden_size)
+    
+    def forward(self, x):
+        return module.forward_cuda(x, self.linear.weight, self.linear.bias)
+```
+
+Wait, `nn.Linear` weight shape is `(hidden_size, input_size)`, which matches.
+
+One concern: load_inline might need `cpp_sources` to be empty, and `cuda_sources` to include the code. The `functions` should be `[&quot;forward_cuda&quot;]`. `load_inline` auto-generates pybind11 bindings for those functions.
+
+But does `load_inline` support `extra_cuda_cflags`? Yes.
+
+We should also note that `nn.Linear` weight might not be contiguous if the module was moved or something, but by default it is contiguous. The reference model uses `self.linear(x)`, which handles non-contiguous internally maybe with a copy. But we can just proceed. We could also add a check or make weight contiguous by calling `self.linear.weight.contiguous()`. Let&#x27;s do `.contiguous()` to be safe.
+
+Also, `bias.contiguous()`.
+
+Potential issue: The CUDA code uses `extern __shared__ float sdata[];`. This is dynamic shared memory. We pass `threads * sizeof(float)` as the third kernel config argument. Good.
+
+But we need to be careful that `threads` is 1024. If `hidden_size` is not a multiple of 4, the vectorized loop does `hidden_size &gt;&gt; 2`, which floors the division. Since hidden_size is 32768, divisible by 4, it&#x27;s fine. But to be safe for general sizes, we could add a scalar tail. However the problem sizes are fixed to 32768. But `ModelNew` should accept same constructor args. So hidden_size could be anything. Let&#x27;s add a tail loop for the remaining elements. It&#x27;s small overhead.
+
+We can also consider using `__launch_bounds__(1024)` on the kernel.
+
+Let&#x27;s adjust the kernel to handle arbitrary hidden_size:
+
+```
+int n_vec = hidden_size / 4;
+int remainder = hidden_size % 4;
+for (int i = tid; i &lt; n_vec; i += blockSize) {
+    // vectorized
+}
+// scalar tail
+for (int i = n_vec*4 + tid; i &lt; hidden_size; i += blockSize) {
+    float v = 1.0f / (1.0f + expf(-(row[i] + bias[i])));
+    sum += v;
+}
+```
+
+But vectorized loads require alignment. Since the row pointer is aligned to at least 256 bytes (tensor allocation), and hidden_size may be not multiple of 4, the tail elements are safe. For remainder, we just use scalar loads.
+
+Actually, `float4` loads need 16-byte alignment. Since tensors are allocated with alignment usually 256 or at least 16, the start of each row is aligned if hidden_size * sizeof(float) is multiple of 16, which it is for hidden_size multiple of 4. But if hidden_size is not multiple of 4, the start of the row is still aligned (since tensor start is aligned), but the vectorized loop will process `n_vec*4` elements, and the remaining elements are handled by scalar loads.
+
+But there is a subtlety: the pointer to the start of the row is aligned, and `n_vec*4` may leave 1-3 elements. We just do scalar loads for those. Fine.
+
+Also for bias, we can just load scalar for tail.
+
+Now, we should compile and test. Let&#x27;s write the complete code and compile.
+
+Actually `load_inline` with empty `cpp_sources` might be fine, or we can put the function declarations in `cpp_sources`. The typical usage:
+
+```
+module = load_inline(
+    name=&quot;...&quot;,
+    cpp_sources=&quot;torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);&quot;,
+    cuda_sources=cuda_source,
+    functions=[&quot;forward_cuda&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;, &quot;--use_fast_math&quot;],
+)
+```
+
+But I think `cpp_sources` can be the string with C++ declarations. It might need to include `&lt;torch/extension.h&gt;` if we have `torch::Tensor` in the declaration. Or simply provide just the CUDA source with the definitions. `load_inline` extracts the CUDA source, compiles it, and generates bindings for `functions`. Actually the docs say:
+
+```
+load_inline(name, cpp_sources, cuda_sources, functions, extra_cflags, extra_cuda_cflags, extra_ldflags, extra_include_paths, build_directory, verbose)
+```
+
+`cpp_sources` is a string containing C++ source code. `cuda_sources` is a string containing CUDA source code. `functions` is a list of function names to bind.
+
+If `cpp_sources` is empty, does it work? In some versions, `cpp_sources` must contain at least the declarations. But since `load_inline` generates the pybind11 module, it might need the declarations in `cpp_sources` or it can infer from `cuda_sources`? Actually the generated pybind11 wrapper includes the C++ headers. Usually you put the forward declarations in `cpp_sources`. Let&#x27;s include the forward declaration in `cpp_sources`. The CUDA source is compiled separately (as .cu file) and linked. So the C++ side just needs the declaration.
+
+```
+cpp_sources = &quot;&quot;&quot;
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+&quot;&quot;&quot;
+```
+
+And `cuda_sources` is the full CUDA code.
+
+Alternatively, combine everything into `cuda_sources` and leave `cpp_sources` empty. I think empty might still work because the compiler sees the definitions in the .cu file and the generated .cpp includes the .cu object. But to be safe, we can put the entire code in `cpp_sources` and set `cuda_sources=&quot;&quot;`? No, then the CUDA code is compiled as C++ and might not work because of `__global__`. We need `cuda_sources` to contain the CUDA code.
+
+Let&#x27;s check a typical snippet:
+
+```python
+module = load_inline(
+    name=&quot;my_module&quot;,
+    cpp_sources=&quot;&quot;&quot;
+    at::Tensor my_op(at::Tensor x);
+    &quot;&quot;&quot;,
+    cuda_sources=&quot;&quot;&quot;
+    #include &lt;torch/extension.h&gt;
+    __global__ void my_kernel(...) { ... }
+    at::Tensor my_op(at::Tensor x) { ... }
+    &quot;&quot;&quot;,
+    functions=[&quot;my_op&quot;],
+)
+```
+
+So `cpp_sources` contains declarations. It&#x27;s important. We&#x27;ll do that.
+
+One more thing: in our CUDA code, we use `cublas_v2.h`. Does `load_inline` include the CUDA toolkit paths? Yes, it uses `nvcc` so it has access.
+
+Now, let&#x27;s compile it. We can write the full Python source string and call `compile_kernel`.
+
+Wait, we have to be careful about `get_gpu_specs` etc. Let&#x27;s first call `get_gpu_specs` to know the hardware. Then compile. Then run correctness.
+
+Actually, I&#x27;ll write the kernel code, compile, and test.
+
+But before that, maybe we can fuse the bias and sigmoid and sum into a custom kernel that processes multiple rows per block to improve occupancy. With 128 blocks of 1024 threads, occupancy on A100 (108 SMs) is fine ~1 block per SM. But warps per SM: each block has 32 warps. On A100, maximum warps per SM is 64 (or 48?). Actually A100 has 64 warps per SM. So one block of 32 warps per SM gives 50% occupancy. We could process 2 rows per block? Or use 256 threads (8 warps) per block and process 4 rows per block? That might increase occupancy (more blocks). Let&#x27;s think.
+
+The reduction kernel reads 16MB total. Memory bandwidth bound. Occupancy might not be the bottleneck. But more blocks can help hide latency if memory bandwidth isn&#x27;t saturated. However, with 128 blocks and 108 SMs, we have enough. And each block is reading a large contiguous chunk (32768 floats = 128KB). At 2TB/s, each block reads 128KB in ~64 microseconds? Actually 128KB per block is small. But overall 16MB is read in ~8 microseconds at 2TB/s. The kernel is very short.
+
+So occupancy is not critical. 128 blocks is enough to saturate SMs.
+
+But we can also consider using 256 threads and each thread processing more elements to increase ILP. For example, each thread loads a float4 and does 4 sigmoids. With 256 threads, each block processes 256*4=1024 floats per iteration, and needs 32 iterations to cover 32768. That&#x27;s 32 loops. With 1024 threads, it needs 8 loops. More threads mean fewer loops and more parallel reduction, but also more shared memory. 1024 is fine.
+
+Alternatively, we can do warp-level reduction using `__shfl_down_sync` and avoid shared memory. That might be faster. Let&#x27;s do warp-shuffle reduction.
+
+```
+float sum = ...;
+// warp reduce
+for (int offset = 16; offset &gt; 0; offset /= 2) {
+    sum += __shfl_down_sync(0xffffffff, sum, offset);
+}
+if (tid % 32 == 0) {
+    sdata[tid / 32] = sum;
+}
+__syncthreads();
+// then reduce across warps in shared memory
+if (tid &lt; 32) {
+    float val = (tid &lt; blockDim.x / 32) ? sdata[tid] : 0;
+    for (int offset = 16; offset &gt; 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    if (tid == 0) out[b] = val;
+}
+```
+
+This uses only `blockDim.x/32` shared memory entries. For 1024 threads, that&#x27;s 32 floats = 128 bytes. Much less. And faster due to less syncthreads.
+
+Let&#x27;s implement warp shuffle.
+
+Also, we need to ensure `blockDim.x` is a multiple of 32. We&#x27;ll set it to 1024.
+
+Let&#x27;s rewrite the kernel:
+
+```
+__global__ void fused_reduce_kernel(...) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int lane = tid % 32;
+    int warpId = tid / 32;
+    int blockSize = blockDim.x;
+    if (b &gt;= batch_size) return;
+    const float* row = in + b * hidden_size;
+    float sum = 0.0f;
+    int n_vec = hidden_size / 4;
+    for (int i = tid; i &lt; n_vec; i += blockSize) {
+        float4 val = reinterpret_cast&lt;const float4*&gt;(row)[i];
+        float4 bval = reinterpret_cast&lt;const float4*&gt;(bias)[i];
+        sum += sigmoid(val.x + bval.x) + sigmoid(val.y + bval.y) + sigmoid(val.z + bval.z) + sigmoid(val.w + bval.w);
+    }
+    // tail
+    for (int i = n_vec*4 + tid; i &lt; hidden_size; i += blockSize) {
+        float v = row[i] + bias[i];
+        sum += 1.0f / (1.0f + expf(-v));
+    }
+    // warp shuffle
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+    __shared__ float warpSum[32]; // max 32 warps for 1024 threads
+    if (lane == 0) {
+        warpSum[warpId] = sum;
+    }
+    __syncthreads();
+    if (warpId == 0) {
+        float val = (lane &lt; blockSize/32) ? warpSum[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane == 0) {
+            out[b] = val;
+        }
+    }
+}
+```
+
+This is efficient.
+
+Note: for blockSize=1024, blockSize/32 = 32, which fits in 32 lanes. Good.
+
+For smaller blockSize, e.g., 256, blockSize/32 = 8, also fine.
+
+We can also make blockSize a template parameter or constexpr. But dynamic is fine.
+
+Now, compiling and testing.
+
+Let&#x27;s construct the final code.
+
+Wait, `load_inline` uses `nvcc` to compile `cuda_sources`. We need to make sure the code is valid. Also, we need to include `&lt;cuda_runtime.h&gt;` and `&lt;cublas_v2.h&gt;`.
+
+Potential compilation issue: `at::cuda::getCurrentCUDABlasHandle()` returns a `cublasHandle_t`. This is defined in `ATen/cuda/CUDAContext.h` or similar. We may need to include `&lt;ATen/cuda/CUDAContext.h&gt;`. Let&#x27;s check. In PyTorch C++ extensions, including `&lt;torch/extension.h&gt;` may already include ATen headers. But to be safe, we can include `&lt;ATen/cuda/CUDAContext.h&gt;`.
+
+Also, `at::cuda::getCurrentCUDAStream()` returns `at::cuda::CUDAStream`. To get `cudaStream_t`, we call `.stream()`.
+
+Actually, `cublasSetStream(handle, at::cuda::getCurrentCUDAStream().stream());` is correct.
+
+But maybe `at::cuda::getCurrentCUDABlasHandle()` already returns a handle bound to the current stream. Let&#x27;s check PyTorch source. In `aten/src/ATen/cuda/CUDABlas.cpp`, `getCurrentCUDABlasHandle()` gets the handle from a per-device handle pool, and sets the stream to `c10::cuda::getCurrentCUDAStream(device)` each time it&#x27;s retrieved? Actually the handle is cached and the stream is set when calling `at::cuda::blas::gemm` internally. But since we are using raw cuBLAS, setting the stream ourselves is safer.
+
+Now, let&#x27;s compile.
+
+One more thing: The CUDA code uses `float4` loads. Are they safe on all architectures? float4 is supported. For reading from global memory, using `const float4*` is fine if aligned. As mentioned, tensor allocation alignment is usually at least 256 bytes, but for the row start (in + b*hidden_size), if `in` is aligned and `hidden_size * sizeof(float)` is multiple of 16, then each row start is aligned. Since hidden_size=32768, hidden_size*4=131072, which is a multiple of 16. So alignment is guaranteed.
+
+For bias, similarly, the start is aligned. We read bias[i] in vectorized form with `i` running from 0 to n_vec-1. So `bias` pointer must be 16-byte aligned. Since it&#x27;s a contiguous 1D tensor of size 32768 floats, the start is aligned. Good.
+
+Now, let&#x27;s assemble the code and call compile_kernel.
+
+But before that, I want to make sure the `cpp_sources` part is correct.
+
+```python
+cpp_sources=&quot;&quot;&quot;
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+&quot;&quot;&quot;
+```
+
+Wait, `load_inline` might also need `#include &lt;torch/extension.h&gt;` in `cpp_sources` for the declaration. Actually the generated pybind code includes `torch/extension.h`. The C++ source string is compiled as a .cpp file. If we have a declaration without a header, it might error. We can include it.
+
+```python
+cpp_sources=&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+torch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+&quot;&quot;&quot;
+```
+
+The `cuda_sources` will include the definitions and also include `&lt;torch/extension.h&gt;`.
+
+Actually, if the function is defined in `cuda_sources`, the linker will find it. The declaration in `cpp_sources` is for the C++ side.
+
+Now, let&#x27;s write the full code string.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_sources = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);\n\&quot;\&quot;\&quot;\n\ncuda_sources = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n#include &lt;cublas_v2.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n#define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x \&quot; must be a CUDA tensor\&quot;)\n#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x \&quot; must be contiguous\&quot;)\n#define CHECK_FLOAT(x) TORCH_CHECK(x.scalar_type() == at::kFloat, #x \&quot; must be Float tensor\&quot;)\n\n__forceinline__ __device__ float sigmoid(float x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\n__global__ void fused_reduce_kernel(const float* __restrict__ in,\n                                    const float* __restrict__ bias,\n                                    float* __restrict__ out,\n                                    int batch_size,\n                                    int hidden_size) {\n    int b = blockIdx.x;\n    int tid = threadIdx.x;\n    int lane = tid &amp; 31;\n    int warpId = tid &gt;&gt; 5;\n    int blockSize = blockDim.x;\n    if (b &gt;= batch_size) return;\n\n    const float* row = in + b * hidden_size;\n    float sum = 0.0f;\n\n    int n_vec = hidden_size &gt;&gt; 2;\n    for (int i = tid; i &lt; n_vec; i += blockSize) {\n        float4 val = reinterpret_cast&lt;const float4*&gt;(row)[i];\n        float4 bval = reinterpret_cast&lt;const float4*&gt;(bias)[i];\n        sum += sigmoid(val.x + bval.x)\n             + sigmoid(val.y + bval.y)\n             + sigmoid(val.z + bval.z)\n             + sigmoid(val.w + bval.w);\n    }\n\n    // scalar tail\n    int tail_start = n_vec &lt;&lt; 2;\n    for (int i = tail_start + tid; i &lt; hidden_size; i += blockSize) {\n        sum += sigmoid(row[i] + bias[i]);\n    }\n\n    // warp-level reduction\n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        sum += __shfl_down_sync(0xffffffff, sum, offset);\n    }\n\n    __shared__ float warpSum[32];\n    if (lane == 0) {\n        warpSum[warpId] = sum;\n    }\n    __syncthreads();\n\n    if (warpId == 0) {\n        float val = (lane &lt; (blockSize &gt;&gt; 5)) ? warpSum[lane] : 0.0f;\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n            val += __shfl_down_sync(0xffffffff, val, offset);\n        }\n        if (lane == 0) {\n            out[b] = val;\n        }\n    }\n}\n\ntorch::Tensor forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {\n    CHECK_CUDA(x); CHECK_CONTIGUOUS(x); CHECK_FLOAT(x);\n    CHECK_CUDA(weight); CHECK_CONTIGUOUS(weight); CHECK_FLOAT(weight);\n    CHECK_CUDA(bias); CHECK_CONTIGUOUS(bias); CHECK_FLOAT(bias);\n\n    int batch_size = x.size(0);\n    int input_size = x.size(1);\n    int hidden_size = weight.size(0);\n\n    auto gemm_out = torch::empty({batch_size, hidden_size}, x.options());\n    auto output = torch::empty({batch_size, 1}, x.options());\n\n    const float alpha = 1.0f;\n    const float beta = 0.0f;\n\n    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();\n    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();\n    cublasSetStream(handle, stream);\n\n    cublasSgemm(handle,\n                CUBLAS_OP_T, CUBLAS_OP_N,\n                hidden_size, batch_size, input_size,\n                &amp;alpha,\n                weight.data_ptr&lt;float&gt;(), input_size,\n                x.data_ptr&lt;float&gt;(), input_size,\n                &amp;beta,\n                gemm_out.data_ptr&lt;float&gt;(), hidden_size);\n\n    int threads = 1024;\n    int blocks = batch_size;\n    fused_reduce_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n        gemm_out.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        output.data_ptr&lt;float&gt;(),\n        batch_size,\n        hidden_size);\n\n    return output;\n}\n\&quot;\&quot;\&quot;\n\nfused_module = load_inline(\n    name=\&quot;fused_linear_sigmoid_sum\&quot;,\n    cpp_sources=cpp_sources,\n    cuda_sources=cuda_sources,\n    functions=[\&quot;forward_cuda\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self, input_size, hidden_size):\n        super(ModelNew, self).__init__()\n        self.linear = nn.Linear(input_size, hidden_size)\n\n    def forward(self, x):\n        w = self.linear.weight.contiguous()\n        b = self.linear.bias.contiguous()\n        return fused_module.forward_cuda(x, w, b)\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: ImportError.
+ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `CXXABI_1.3.15&#x27; not found (required by /scratch/adalal542/KernelBench/runs/l12_all__gpu4_7/original/Kimi-K2.6/level_2_problem_56_cache/k_8816f290e353/fused_linear_sigmoid_sum/fused_linear_sigmoid_sum.so)</div></details></div></details></div>
 </body></html>
