@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 13</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:01:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 13</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:03:24 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">13_QuantVLA_SelectiveLayoutFusion.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -109,5 +109,860 @@ def get_inputs():
 
 def get_init_inputs():
     return [dim]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 135.2s · 60,796 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 135.2s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to produce a custom CUDA kernel that implements the forward pass faster than the PyTorch reference.
+
+The reference operations:
+- x shape (B,T,D)
+- layout_logits shape (B,T)
+- alpha = sigmoid(layout_logits).unsqueeze(-1) -&gt; (B,T,1)
+- with torch.no_grad(): amax = x.detach().abs().max().clamp(min=1e-8)
+  - Note: this is a scalar, computed global max absolute value across all elements.
+- scale = amax/127.0
+- x_q = clamp(round(x/scale), -127,127) * scale
+- mixed = alpha * x_q + (1-alpha) * x
+- out = linear(mixed) -&gt; self.out_proj (dim,dim) with bias.
+
+Goal: Fused CUDA kernel for the whole thing except maybe the linear layer? Could fuse quantization, sigmoid, blending, and maybe the linear projection as well. However, writing a fully fused Linear + activation is a bit complex but doable. Since D=128 (small), T=64, B=8. The main compute: scale (global max), quant each element, blend, then linear. Since D is small, we could fuse everything into one kernel using shared memory. But perhaps easier: write a fused kernel that computes alpha (sigmoid), quantization, blending, and then call the existing linear. But the linear with small D=128 might be okay. We could also fuse the linear in to reduce memory bandwidth.
+
+Reference uses lots of intermediate tensors: x_q, mixed, alpha.
+
+Let&#x27;s plan:
+
+1. Compute global maximum absolute value of x (amax). Since x is fp32. Could compute via standard PyTorch or with a custom reduction kernel. PyTorch x.abs().max() is very fast (likely a single reduction kernel). We can keep that in Python.
+
+2. Compute scale = amax / 127.0.
+
+3. Fused kernel &quot;quant_blend_fwd&quot; inputs: x (B,T,D), layout_logits (B,T), scale (scalar), weight (D,D), bias (D). Output: out (B,T,D). Wait, we also need to handle out_proj linear. But ModelNew has its own out_proj; we could just use nn.Linear and then call it. However faster would be to fuse linear into the same kernel, especially for D=128 which is small. But we can also implement a fused kernel that does:
+   - For each (b,t) token, load x[...], layout_logits.
+   - Compute alpha = sigmoid(logit).
+   - Quantize: qval = round(x / scale); clamp to [-127,127]; xq = qval * scale.
+   - mixed = alpha * xq + (1-alpha) * x.
+   - Then compute linear: out = mixed @ weight.T + bias.
+   This avoids multiple round trips through memory.
+
+Given D=128 small, each thread can compute the whole token (load D elements). Use 1 block per token or per batch of tokens.
+
+Option A: One block per token (B*T blocks). Each block has D threads (or maybe 128 threads). Each thread loads one x element, computes quant and blend, stores in shared memory (size D), then does a parallel reduction for the linear output per output feature. But linear is D inputs -&gt; D outputs. We need matrix-vector multiplication per token: out_j = sum_i mixed_i * W[j,i] + bias_j. If D=128, with 128 threads per block, each thread can compute one output j: load all mixed_i from shared memory and compute dot product. But reading all D from shared memory per thread yields 128*128 = 16384 reads per block, which is okay. Or we can use warp-level matrix multiply? But D=128 is small enough that a straightforward approach works.
+
+Block size: maybe 128 threads (1 warp of 32? Actually 128 threads = 4 warps). Since D=128, 128 threads per block is perfect. Each block processes one token. Number of blocks = B*T. For B=8,T=64 =&gt; 512 blocks. Each SM can handle many blocks.
+
+Compute linear: each thread tid handles output index j = tid % D; if blockDim.x == D, then j = tid. Then out_j = bias[j] + sum_{i=0}^{D-1} mixed[i] * W[j][i]. W is (D, D) stored row-major? In PyTorch, weight is (out_features, in_features) with out_features=D, in_features=D. So W_out_in: weight[j, i]. We can store weight in a const float pointer. Each thread iterates over i from 0 to D-1, loads mixed[i] from shared memory (broadcast to all threads, or each thread loads individually). If we have D=128, each thread trivially computes a private accumulator by reading mixed[i] (from shared memory) and weight[j*D + i] (from global memory). Since all threads read mixed[i] simultaneously, shared memory broadcast is efficient. Weight reads are coalesced? Threads have consecutive j. Weight access pattern: thread j reads weight[j*D + i]. For fixed i, threads read weight[j*D + i] with stride D (128 floats = 512 bytes). That is not coalesced. Coalesced would be if they read consecutive elements. To make weight accesses coalesced, we could transpose weight or store it as column-major, but we can also load weight in a transposed way: Wt[i,j] = W[j,i]. Then thread j reads Wt[i,j] consecutive. Alternatively, we can have each thread compute a partial sum over a chunk of i, using shared memory for weight tile. But given D=128, maybe the straightforward non-coalesced is okay because the kernel is memory-bound anyway. However, to be safe and fast, we can store a transposed copy of weight (or just access weight.T). Since weight is a nn.Parameter, we get weight.data.
+
+Actually we can just read weight[j*D + i]. Global memory accesses for consecutive j differ by D floats = 512 bytes. On A100, warp of 32 threads will issue 32 separate 128-byte transactions? Actually each thread reads 4 bytes, addresses are strided by 512 bytes, which means each address falls in different cache lines (assuming 128-byte line). So each warp read for a given i will fetch 32 cache lines, each 128 bytes, but only use 4 bytes from each. That&#x27;s huge waste: 32*128 = 4096 bytes fetched for 128 bytes used. That&#x27;s bad. We need to improve coalescing.
+
+Solution: Transpose the weight tensor before passing to kernel. Since we can pre-process weight in ModelNew (e.g., store `self.weight_t` as `self.out_proj.weight.t().contiguous()`). Then weight_t is (D,D) with weight_t[i,j] = W[j,i]. Then thread j reads weight_t[i*D + j] which is consecutive. That&#x27;s fully coalesced.
+
+Similarly for bias: each thread j reads bias[j] once. That&#x27;s fine.
+
+So plan:
+- In ModelNew.__init__(dim):
+   - Set up self.out_proj = nn.Linear(dim, dim, bias=True) to keep parameter compatibility? Actually we can just create the linear and then extract weight and bias. But for compatibility with constructor arguments and checkpoint loading, we need to keep nn.Linear so that state_dict matches? The evaluation likely instantiates ModelNew and calls forward; they might not load pretrained weights. But to be safe, we can store the linear layer, and in forward, we pass self.out_proj.weight and self.out_proj.bias to the kernel. We can also precompute a transposed weight buffer.
+
+   However, we need to be careful: The kernel is loaded at module load time via `torch.utils.cpp_extension.load_inline`. At module load time, the weight may not exist yet. But we can pass weight pointer at forward runtime.
+
+- The kernel code in CUDA C++:
+   - Input: const float* x, const float* layout_logits, float scale, const float* weight_t, const float* bias, float* out, int B, int T, int D.
+   - grid: (B*T) blocks, each block D threads (or maybe 128). Since D can be any? The problem says dim is a parameter, not necessarily 128. But get_init_inputs returns dim. The test might vary? Usually in these tasks, the dimensions are fixed as given, but to be safe we should handle arbitrary D. However D is likely small (&lt;1024). Let&#x27;s assume D &lt;= 1024 for simplicity.
+
+   If D is arbitrary, we can set block size to the next multiple of 32 up to D, but if D &gt; 1024 we can&#x27;t. We could set blockDim.x = 256 and each thread handles multiple elements. Better: write generic code where each block processes one token with `blockDim.x` threads, and each thread processes a subset of D outputs. But for simplicity and performance, we can set block size to something like 128 and have each thread handle `ceil(D / blockDim.x)` outputs. Or we can require D &lt;= 1024 and set blockDim.x = D.
+
+   Since the default dim=128, and likely tests use that, we can design for D &lt;= 1024 and set blockDim.x = D. But to be robust, we could handle D &gt; 1024 by loops.
+
+   Let&#x27;s see: if dim=128 exactly, D &lt;= 1024 is safe.
+
+   Actually maybe better to set block size to `min(D, 1024)` and have each thread handle `ceil(D / blockSize)` output features. Each thread then loops over mixed inputs from shared memory. Input mixed is size D in shared memory. Weight is (D_out, D_in) transposed, but D_out = D. We could partition output features among threads. This is robust for any D, though for D not a multiple of block size, load balancing is slightly off.
+
+   Let&#x27;s design block size = 256 (or maybe 128). blockSize = 128. Each thread handles `out_per_thread = (D + blockSize - 1) / blockSize` output features. For each output j assigned to thread, compute dot product over all D inputs.
+
+   For reading mixed[i], we have shared memory array of size D floats (maybe padded). We fill it by having thread t load x[t] for t &lt; D, compute mixed[t], store in smem[t]. Then __syncthreads(). Then each thread computes its assigned outputs.
+
+   For coalescing weight accesses: weight_t is transposed, shape (D_in, D_out) = (D, D). For output j, weight_t[i*D + j]. For a fixed i, threads with different j reading weight_t[i*D + j] will be coalesced if j are consecutive. Our partitioning should assign consecutive j to consecutive threads. So good.
+
+   For loading x and layout_logits:
+   - x is (B,T,D). For token (b,t), base = (b*T + t)*D. Thread tIdx loads x[base + tIdx] if tIdx &lt; D, then compute quant, write to smem[tIdx]. Since threads are consecutive, loads are coalesced.
+   - layout_logits is (B,T). Load layout_logits[b*T + t]. Broadcast to all threads (or just one thread loads and stores in smem). Actually we can have thread 0 load it, compute alpha, store in a shared float `alpha_s`. Or each thread can load it (uncoalesced same address, cached). It&#x27;s fine.
+
+   Compute alpha = sigmoid(logit). Use `1.0f / (1.0f + expf(-logit))`.
+
+   Quantization:
+     - scale is passed as float. If scale is 0? But scale = amax/127, and amax clamped &gt;=1e-8.
+     - For each x_i: q = round(x_i / scale). Use `nearbyintf` or `roundf`. Clamp to [-127.0f, 127.0f]. Then xq = q * scale.
+     - mixed_i = alpha * xq + (1-alpha) * x_i.
+
+   Then dot product:
+     - For each output j assigned to thread, sum = bias[j]; for i in 0..D-1: sum += mixed_i[i] * weight_t[i*D + j]; out[base + j] = sum.
+     - Since D &lt;= 1024 and blockSize=128, each thread does up to 8 outputs, each dot product is D=128 multiply-adds. So each thread does ~1024 FMAs. With 128 threads, total FMAs per block = 128*128 = 16384, which matches the linear compute.
+
+   Memory bandwidth:
+     - Reading x: B*T*D floats.
+     - Reading weight: D*D floats.
+     - Reading bias: D floats.
+     - Reading layout_logits: B*T floats.
+     - Writing out: B*T*D floats.
+     - Intermediate mixed is in smem, no extra HBM traffic.
+     - Total HBM traffic: (2*B*T*D + D*D + B*T + D) * 4 bytes.
+     - For B=8,T=64,D=128: 2*8*64*128 = 131072; D*D=16384; B*T=512; D=128. Total ~147k floats ~ 588 KB. That&#x27;s tiny. So compute is almost instant. Kernel must just avoid launch overhead and extraneous memory ops.
+
+   The reference does multiple kernels and many intermediate allocations. Even a simple fused kernel will beat it easily.
+
+   Implementation details:
+   - We need to compile the CUDA extension using `torch.utils.cpp_extension.load_inline`.
+   - The function signature for pybind: something like `void quant_blend_linear_forward(const torch::Tensor&amp; x, const torch::Tensor&amp; layout_logits, float scale, const torch::Tensor&amp; weight_t, const torch::Tensor&amp; bias, torch::Tensor&amp; out, int B, int T, int D)`
+   - Or we can compute B,T,D from tensor shapes inside function.
+
+   Let&#x27;s write the C++ wrapper:
+
+   ```cpp
+   #include &lt;torch/extension.h&gt;
+   #include &lt;cuda_runtime.h&gt;
+   #include &lt;math.h&gt;
+
+   __global__ void quant_blend_linear_kernel(const float* __restrict__ x,
+                                             const float* __restrict__ layout_logits,
+                                             float scale,
+                                             const float* __restrict__ weight_t,
+                                             const float* __restrict__ bias,
+                                             float* __restrict__ out,
+                                             int B, int T, int D) {
+       int token_idx = blockIdx.x;
+       int b = token_idx / T;
+       int t = token_idx % T;
+       if (b &gt;= B) return;
+       int tid = threadIdx.x;
+       int blockSize = blockDim.x;
+
+       extern __shared__ float smem[];
+       float* mixed = smem; // size D
+
+       int base = token_idx * D;
+
+       // load layout_logits and compute alpha
+       float alpha;
+       if (tid == 0) {
+           float logit = layout_logits[token_idx];
+           alpha = 1.0f / (1.0f + expf(-logit));
+           mixed[D] = alpha; // store alpha at end of mixed (need smem size D+1)
+       }
+       __syncthreads();
+       alpha = mixed[D];
+
+       // load x, quant, blend, store mixed
+       if (tid &lt; D) {
+           float val = x[base + tid];
+           float inv_scale = 1.0f / scale;
+           float q = roundf(val * inv_scale);
+           if (q &gt; 127.0f) q = 127.0f;
+           if (q &lt; -127.0f) q = -127.0f;
+           float xq = q * scale;
+           mixed[tid] = alpha * xq + (1.0f - alpha) * val;
+       }
+       // handle case D &gt; blockSize: other threads loop
+       // Actually we can have a loop for (int idx = tid; idx &lt; D; idx += blockSize)
+       // But if D &lt;= blockSize, the above is fine. Let&#x27;s do generic loop.
+       // But we must be careful not to read/write shared memory out of bounds.
+       // Use:
+       for (int idx = tid; idx &lt; D; idx += blockSize) {
+           float val = x[base + idx];
+           float inv_scale = 1.0f / scale;
+           float q = roundf(val * inv_scale);
+           if (q &gt; 127.0f) q = 127.0f;
+           if (q &lt; -127.0f) q = -127.0f;
+           float xq = q * scale;
+           mixed[idx] = alpha * xq + (1.0f - alpha) * val;
+       }
+       __syncthreads();
+
+       // compute linear outputs
+       // Each thread computes a block of output features.
+       // out_per_thread = (D + blockSize - 1) / blockSize
+       int out_per_thread = (D + blockSize - 1) / blockSize;
+       for (int k = 0; k &lt; out_per_thread; ++k) {
+           int j = tid + k * blockSize;
+           if (j &lt; D) {
+               float sum = bias[j];
+               // dot product over inputs
+               // unroll? D may not be known at compile time.
+               // We&#x27;ll just loop.
+               for (int i = 0; i &lt; D; ++i) {
+                   sum += mixed[i] * weight_t[i * D + j];
+               }
+               out[base + j] = sum;
+           }
+       }
+   }
+
+   torch::Tensor quant_blend_linear_forward(torch::Tensor x,
+                                            torch::Tensor layout_logits,
+                                            torch::Tensor weight,
+                                            torch::Tensor bias) {
+       auto B = x.size(0);
+       auto T = x.size(1);
+       auto D = x.size(2);
+       auto out = torch::empty_like(x);
+       // compute amax and scale on CPU
+       // Actually we can compute in the wrapper using PyTorch
+       // But we need to pass scale. Let&#x27;s compute inside forward() python.
+       // So the wrapper will accept scale.
+       // Wait, we can compute amax inside wrapper with x.abs().max() but that will launch a kernel.
+       // It&#x27;s okay.
+       // For simplicity, compute scale in python and pass as float arg.
+       return out;
+   }
+   ```
+
+   Actually, we can make the wrapper accept `scale` as float. The pybind function signature will reflect that.
+
+   But perhaps we can compute `amax` also in CUDA? Since it&#x27;s a simple reduction. PyTorch&#x27;s reduction is fine. We can compute it in Python and pass scale.
+
+   Let&#x27;s define the kernel function as:
+
+   `torch::Tensor quant_blend_linear_forward(torch::Tensor x, torch::Tensor layout_logits, float scale, torch::Tensor weight_t, torch::Tensor bias)`
+
+   Then in C++:
+   - Ensure all tensors are contiguous, float, cuda.
+   - D = x.size(2). B = x.size(0), T = x.size(1).
+   - out = torch::empty_like(x).
+   - grid = dim3(B*T), block = dim3(128) (or maybe min(D,128) etc). Let&#x27;s choose block = 128 for all D. But if D &lt; blockSize, we have threads that do nothing. That&#x27;s fine.
+   - shared memory size = (D + 1) * sizeof(float).
+   - Call kernel.
+
+   We need to handle D up to maybe large? Shared memory is limited to 48KB. (D+1)*4 &lt;= 49152 =&gt; D &lt;= 12287. That&#x27;s fine for typical D=128.
+   Actually, if D is small, we can set block size to `min(128, D)` if D is a multiple of 32. But block size less than 32 wastes? Not necessary.
+
+   Wait, if D &gt; 1024, we cannot have all threads load in one go with each thread handling one element if blockSize &lt; D. But our loop `for (int idx = tid; idx &lt; D; idx += blockSize)` handles that. Good.
+
+   However, if D &gt; 1024, `out_per_thread` becomes 1 or 2, and dot product loop is fine. But `mixed` shared memory size D*4 must be &lt; 48KB. For D=128, trivial.
+
+   Let&#x27;s fix blockSize at 128. It works for any D. But if D=1024, out_per_thread = 8, each thread does 8*1024 = 8192 FMAs. Total FMAs per block = 128*8192 = 1,048,576 = D^2. Same total compute. Occupancy: 128 threads per block = 4 warps. A100 can run many blocks.
+
+   Wait, but if D is e.g. 4096, shared memory = 16KB + 4 bytes. Fine. out_per_thread = 32. Each thread computes 32 outputs, each with dot of 4096. That&#x27;s 131k FMAs per thread. Might be slow with 128 threads, but D usually small.
+
+   We should ensure `weight_t` is contiguous float tensor. In Python, we can pass `weight_t = self.out_proj.weight.t().contiguous()`. But note that `weight` is (D,D) and we want column-major for coalescing. Actually, the original weight is row-major (out,in). If we transpose and make contiguous, weight_t[i,j] = weight[j,i]. Then in kernel, for output j, input i, weight is at weight_t[i*D + j]. This is coalesced across j. Good.
+
+   Let&#x27;s think about numerics. The reference uses `_fake_quant_symmetric_int8(x, scale)`:
+   - `q = torch.clamp(torch.round(x / scale), -127.0, 127.0)`
+   - `return q * scale`
+   In CUDA, we should mimic exactly. We can compute `inv_scale = 1.0f / scale`, then `q = roundf(val * inv_scale)`. For PyTorch `torch.round`, it uses round half to even? Actually `torch.round` maps to `std::nearbyint` which rounds half to even? Wait, `torch.round` uses round half away from zero? Let&#x27;s check: PyTorch&#x27;s `round` is `std::round` for float? Actually, `torch.round` implements &quot;round to nearest, ties to even&quot;? I need to recall. historically `torch.round` uses `round` from C which rounds half away from zero? Let&#x27;s check. In PyTorch, `aten/src/ATen/native/cpu/UnaryOpsKernel.cpp`: `round` uses `std::round`? Actually, I think `torch.round` uses `std::nearbyint` with `FE_TONEAREST`? No, `torch.round` in PyTorch is documented as rounding half to even? Let&#x27;s check docs: `torch.round(input, out=None) -&gt; Tensor`. It returns a new tensor with each of the elements of input rounded to the closest integer. In case of halfs, the result is rounded to the nearest even integer. Wait, that&#x27;s `torch.round` in NumPy? NumPy&#x27;s `rint` does round half to even. PyTorch&#x27;s `round` might also do round half to even. Let&#x27;s verify: In PyTorch source, `native/cpu/UnaryOpsKernel.cpp`, `REGISTER_DISPATCH( round_stub, ... )` uses `at::native::ROUND` maybe? Actually there is `round_impl` that calls `std::round`? But `std::round` rounds half away from zero. However, I recall that PyTorch&#x27;s `round` changed behavior to match NumPy&#x27;s `round` which is round half to even? Let&#x27;s quickly check mentally: In PyTorch 2.0, `torch.tensor(0.5).round()` gives 0.0? Or 1.0? I think `torch.round(0.5)` gives 0.0 (bankers rounding). Yes, I think `torch.round` uses round half to even. Wait, I&#x27;m not 100% sure. The safe approach: use `nearbyintf` with default rounding mode, which is round half to even. The CUDA `roundf` function rounds half away from zero. `rintf` and `nearbyintf` use the current rounding mode, which is round-to-nearest-even by default. In CUDA, `roundf` is away from zero, `rintf` is to nearest even? Actually `rintf` rounds according to the current rounding mode, which is round-to-nearest-even. `nearbyintf` is similar but may raise inexact exception? In CUDA, both are available. Let&#x27;s check CUDA docs: `roundf` rounds to nearest integer, half-way cases away from zero. `rintf` rounds to nearest integer using current rounding mode (round-to-nearest-even). `nearbyintf` like `rintf` but does not raise inexact.
+
+   Since PyTorch&#x27;s `round` is half to even (I think), we should use `nearbyintf` or `rintf`. To match numerically within tolerance, either is fine for random inputs because exact half cases are rare and tolerance is 1e-4. Using `roundf` vs `nearbyintf` only differs by 1 ulp on exact halves. Random inputs almost never hit exact halves. With scale being global max/127, the chance of hitting exact half is zero measure but possible with certain floats. For safety, we can use `nearbyintf` to mimic PyTorch&#x27;s round half to even.
+
+   Actually, the tolerance is 1e-4. The difference between round half away and even is 1.0 in quantized integer space, times scale (~amax/127). amax maybe ~3. So difference is ~0.024. That&#x27;s within 1e-4? No, 0.024 &gt; 1e-4. But exact half probability is low. Still, to be safe, use `nearbyintf`. Let&#x27;s do `q = nearbyintf(val * inv_scale);`.
+
+   Wait, but `nearbyintf` in CUDA may be slower? Not noticeable.
+
+   Also clamp: use `fminf(fmaxf(q, -127.0f), 127.0f)`.
+
+   Now, the linear layer `nn.Linear(dim, dim, bias=True)`. We need to ensure our custom kernel uses the same weight and bias. In ModelNew.__init__, we can create `self.out_proj = nn.Linear(dim, dim, bias=True)`. Or we could just create the parameters manually. But to accept the same constructor args and produce a module that can be loaded with the same state dict as Model, we should keep `self.out_proj = nn.Linear(dim, dim, bias=True)`. Then in forward, we can extract weight and bias.
+
+   One nuance: the reference Model does `with torch.no_grad(): amax = x.detach().abs().max().clamp(min=1e-8)`. It detaches x, meaning no gradient through amax. The scale is computed without grad. In our fused kernel, we will compute scale in python similarly, with `torch.no_grad()`. Good.
+
+   Since we are only replacing forward, and backward is not required? The task says replace the forward computation. It doesn&#x27;t mention backward. We can just do forward.
+
+   Let&#x27;s write the Python module.
+
+   Structure:
+
+   ```python
+   import torch
+   import torch.nn as nn
+   from torch.utils.cpp_extension import load_inline
+
+   cuda_source = r&quot;&quot;&quot;
+   #include &lt;torch/extension.h&gt;
+   #include &lt;cuda_runtime.h&gt;
+   #include &lt;math.h&gt;
+
+   __global__ void fused_kernel(const float* __restrict__ x,
+                                const float* __restrict__ layout_logits,
+                                float scale,
+                                const float* __restrict__ weight_t,
+                                const float* __restrict__ bias,
+                                float* __restrict__ out,
+                                int B, int T, int D) {
+       int token_idx = blockIdx.x;
+       if (token_idx &gt;= B * T) return;
+       int tid = threadIdx.x;
+       int blockSize = blockDim.x;
+
+       extern __shared__ float smem[];
+       float* mixed = smem;
+
+       int base = token_idx * D;
+
+       float alpha;
+       if (tid == 0) {
+           float logit = layout_logits[token_idx];
+           alpha = 1.0f / (1.0f + expf(-logit));
+           // store alpha in smem[D]
+           smem[D] = alpha;
+       }
+       __syncthreads();
+       alpha = smem[D];
+
+       float inv_scale = 1.0f / scale;
+
+       for (int idx = tid; idx &lt; D; idx += blockSize) {
+           float val = x[base + idx];
+           float q = nearbyintf(val * inv_scale);
+           q = fminf(fmaxf(q, -127.0f), 127.0f);
+           float xq = q * scale;
+           mixed[idx] = alpha * xq + (1.0f - alpha) * val;
+       }
+
+       __syncthreads();
+
+       int out_per_thread = (D + blockSize - 1) / blockSize;
+       for (int k = 0; k &lt; out_per_thread; ++k) {
+           int j = tid + k * blockSize;
+           if (j &lt; D) {
+               float sum = bias[j];
+               // loop over i
+               #pragma unroll 4
+               for (int i = 0; i &lt; D; ++i) {
+                   sum += mixed[i] * weight_t[i * D + j];
+               }
+               out[base + j] = sum;
+           }
+       }
+   }
+
+   torch::Tensor quant_blend_linear_forward(torch::Tensor x,
+                                            torch::Tensor layout_logits,
+                                            float scale,
+                                            torch::Tensor weight_t,
+                                            torch::Tensor bias) {
+       int B = x.size(0);
+       int T = x.size(1);
+       int D = x.size(2);
+       auto out = torch::empty_like(x);
+
+       int total_tokens = B * T;
+       int blockSize = 128;
+       // if D is small, maybe use smaller blockSize? But 128 is fine.
+       // We need shared memory for D floats + 1 float for alpha.
+       size_t smem_size = (D + 1) * sizeof(float);
+       dim3 grid(total_tokens);
+       dim3 block(blockSize);
+
+       fused_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(
+           x.data_ptr&lt;float&gt;(),
+           layout_logits.data_ptr&lt;float&gt;(),
+           scale,
+           weight_t.data_ptr&lt;float&gt;(),
+           bias.data_ptr&lt;float&gt;(),
+           out.data_ptr&lt;float&gt;(),
+           B, T, D);
+
+       return out;
+   }
+   &quot;&quot;&quot;
+
+   cpp_sources = r&quot;&quot;&quot;
+   torch::Tensor quant_blend_linear_forward(torch::Tensor x,
+                                            torch::Tensor layout_logits,
+                                            float scale,
+                                            torch::Tensor weight_t,
+                                            torch::Tensor bias);
+   &quot;&quot;&quot;
+
+   # Actually load_inline needs cuda_sources and cpp_sources? Let&#x27;s check API.
+   # torch.utils.cpp_extension.load_inline(name, cpp_sources, cuda_sources, functions, ...)
+   ```
+
+   Wait, `load_inline` signature:
+   `load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cuda_cflags=None, ...)`
+
+   The `cuda_sources` is for .cu code, `cpp_sources` is for .cpp code. Usually we put the C++ wrapper and kernel declaration in `cuda_sources`? Actually `load_inline` splits them: `cpp_sources` is C++ source that gets compiled with the host compiler, and `cuda_sources` is compiled with nvcc. The wrapper containing `&lt;&lt;&lt; &gt;&gt;&gt;` must be in `cuda_sources`. But the pybind wrapper also needs to be compiled. Actually we can put everything in `cpp_sources` if we include the kernel launch? No, `cpp_sources` is compiled with the C++ compiler which doesn&#x27;t understand `&lt;&lt;&lt; &gt;&gt;&gt;`. So kernel code and launch must be in `cuda_sources`. The wrapper `torch::Tensor quant_blend_linear_forward(...)` can be in `cuda_sources` as well, because nvcc compiles .cu files and can handle both host and device code. Then `cpp_sources` can be empty or just forward declarations? Actually `functions` list tells pybind which functions to bind; they need to be defined in some source that gets compiled. Since `cuda_sources` will be compiled into a .cu file, the function defined there is usable. `cpp_sources` can be empty string or omitted.
+
+   Let&#x27;s check docs: `torch.utils.cpp_extension.load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cflags=None, extra_cuda_cflags=None, extra_ldflags=None, extra_include_paths=None, build_directory=None, verbose=False, with_cuda=None, is_python_module=True, keep_intermediates=True)`
+   Example:
+   ```python
+   source = &#x27;&#x27;&#x27;
+   torch::Tensor my_op(torch::Tensor x) { ... }
+   &#x27;&#x27;&#x27;
+   module = load_inline(&#x27;my_op&#x27;, cpp_sources=&#x27;&#x27;, cuda_sources=source, functions=[&#x27;my_op&#x27;])
+   ```
+   So we can put everything in `cuda_sources`, and pass `cpp_sources=&#x27;&#x27;`.
+
+   Let&#x27;s double check: the function must be declared at module scope. `load_inline` auto-generates pybind code that calls the functions. We just list them in `functions=[&#x27;quant_blend_linear_forward&#x27;]`.
+
+   So:
+
+   ```python
+   _module = load_inline(
+       name=&#x27;quant_blend_linear_cuda&#x27;,
+       cpp_sources=&#x27;&#x27;,
+       cuda_sources=cuda_source,
+       functions=[&#x27;quant_blend_linear_forward&#x27;],
+       extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],
+       verbose=False,
+   )
+   ```
+
+   Wait, for numerical correctness, `--use_fast_math` might change `expf` and `nearbyintf` behavior. `expf` with fast math is usually okay but less accurate. `nearbyintf` might be okay. However, to be safe, we might avoid `--use_fast_math`? But it can speed up sigmoid. The tolerance is 1e-4. fast_math for exp is usually within a few ulps, well within 1e-4 for typical values. But let&#x27;s leave it out to be safe, or keep it. I think without fast math is fine since the kernel is not compute bound. But we want speedup. However, the main bottleneck is memory; fast math doesn&#x27;t matter much. Let&#x27;s omit `--use_fast_math` to ensure correctness.
+
+   Actually the kernel is tiny; launch overhead dominates. Using fast math or not won&#x27;t change launch overhead. Let&#x27;s omit.
+
+   Need to handle contiguous tensors: if x is not contiguous, we should use `.contiguous()`. The reference uses regular tensors which are contiguous. We can assert or just call `.contiguous()`. Similarly layout_logits is (B,T) but might not be contiguous. We can call `.contiguous().view(-1)`.
+
+   In forward:
+   - `x = x.contiguous()`
+   - `layout_logits = layout_logits.contiguous()`
+   - `with torch.no_grad(): amax = x.detach().abs().max().clamp(min=1e-8)`
+   - `scale = (amax / 127.0).item()` (scalar float)
+   - `weight_t = self.out_proj.weight.t().contiguous()` # transposed weight
+   - `bias = self.out_proj.bias.contiguous()` # though bias is 1D.
+   - `out = _module.quant_blend_linear_forward(x, layout_logits, scale, weight_t, bias)`
+   - return out
+
+   Wait, what about the case where weight is not contiguous? `self.out_proj.weight` is stored as (out,in) and is contiguous. `.t()` makes it non-contiguous (strided). `.contiguous()` copies it. We could avoid the copy on every forward by caching `self.weight_t`. Since weight changes on training, but the evaluation likely doesn&#x27;t train. We can just compute `self.weight_t = self.out_proj.weight.t().contiguous()` in `__init__` or lazily. Better: in `__init__`, create `self.out_proj = nn.Linear(dim, dim, bias=True)`, then after init transposes: `self.register_buffer(&#x27;weight_t&#x27;, self.out_proj.weight.t().contiguous(), persistent=False)`. Actually we can just do `self.weight_t = self.out_proj.weight.t().contiguous()` in `__init__`. But if the model is loaded from a state dict, weight_t won&#x27;t be in the state dict, but it will be updated after `load_state_dict`? Not needed for inference. For this benchmark, we just instantiate and run forward. So:
+
+   ```python
+   class ModelNew(nn.Module):
+       def __init__(self, dim):
+           super().__init__()
+           self.dim = dim
+           self.out_proj = nn.Linear(dim, dim, bias=True)
+           # Pre-transpose weight for coalesced access in kernel.
+           # Will be updated if weight changes.
+           self.register_buffer(&#x27;_weight_t&#x27;, torch.empty(dim, dim, dtype=torch.float32), persistent=False)
+           self._update_weight_t()
+
+       def _update_weight_t(self):
+           if self.out_proj.weight is not None:
+               self._weight_t.copy_(self.out_proj.weight.t())
+
+       def forward(self, x, layout_logits):
+           # maybe update weight_t if weight changed? skip
+           ...
+   ```
+
+   For simplicity, just compute in forward: `weight_t = self.out_proj.weight.t().contiguous()`. The cost of transposing a 128x128 matrix is negligible compared to the rest? Actually it&#x27;s a small copy, maybe 64KB. It&#x27;s fine. The kernel itself is fast but we want to beat reference. Reference does: alpha + quantization + mixed + linear. The linear will read weight anyway; transposing adds one small copy. It&#x27;s okay.
+
+   But can we avoid copy? We can read weight as is and accept non-coalesced access. For D=128, weight is 128*128*4 = 64KB. Non-coalesced access reads 1/32 efficiency? Actually each weight read per warp fetches 32 cache lines, using 4 bytes each. But L2 cache might help since total weight is small. Weight can stay in L2. So non-coalesced might still be okay. But let&#x27;s keep transpose for safety.
+
+   Let&#x27;s consider unrolling the inner loop for D=128. If D is a compile-time constant, the compiler can unroll. But D is passed at runtime. We can use template with D as a compile-time constant? But D is a runtime parameter. However, we know D=128 for the benchmark. We could generate code for specific D values or just use runtime D. The compiler might not unroll the inner loop because `D` is unknown at compile time. But it can unroll small constant loops if we pass it as template parameter or `#define`. Since D is likely fixed at 128, we could template the kernel and dispatch based on D. But that adds complexity. For small D, the compiler might inline and optimize the inner loop well enough. However, we can add `#pragma unroll 4` on the inner loop as we did for `i`. That hints unrolling by 4. Good.
+
+   Could we make blockSize = D if D &lt;= 1024? That would simplify and reduce loops. We could do:
+   ```cpp
+   int blockSize = (D &lt;= 1024) ? D : 128;
+   ```
+   But for D=128, blockSize=128, perfect. For D not multiple of 32, warp divergence. But D=128 is multiple of 32. Good.
+
+   Let&#x27;s just choose blockSize = min(D, 128) or maybe 128 if D &gt;= 128 else D. But for D=128, 128 is great.
+
+   Let&#x27;s just set blockSize = 128 for all cases. It&#x27;s robust.
+
+   Wait, one important thing: For `nearbyintf`, we need `&lt;cmath&gt;` or `&lt;math.h&gt;`. In CUDA, `&lt;math.h&gt;` provides `nearbyintf`. But `torch/extension.h` might pull in other headers. We can include `&lt;math.h&gt;`.
+
+   Another nuance: `fminf`/`fmaxf` are in `&lt;math.h&gt;` as well.
+
+   Thread divergence: `if (tid == 0) { ... }` is fine. The `for (int idx = tid; idx &lt; D; idx += blockSize)` loop ensures coalesced loads of x and stores to smem. Good.
+
+   Let&#x27;s refine the kernel:
+
+   ```cuda
+   __global__ void fused_kernel(const float* __restrict__ x,
+                                const float* __restrict__ layout_logits,
+                                float scale,
+                                const float* __restrict__ weight_t,
+                                const float* __restrict__ bias,
+                                float* __restrict__ out,
+                                int B, int T, int D) {
+       int token_idx = blockIdx.x;
+       if (token_idx &gt;= B * T) return;
+
+       int tid = threadIdx.x;
+       int blockSize = blockDim.x;
+
+       extern __shared__ float smem[];
+       float* mixed = smem;
+
+       int base = token_idx * D;
+
+       float alpha;
+       if (tid == 0) {
+           float logit = layout_logits[token_idx];
+           alpha = 1.0f / (1.0f + expf(-logit));
+           smem[D] = alpha;
+       }
+       __syncthreads();
+       alpha = smem[D];
+
+       float inv_scale = 1.0f / scale;
+
+       // Each thread loads some x elements, quantizes, blends, writes to smem
+       for (int idx = tid; idx &lt; D; idx += blockSize) {
+           float val = x[base + idx];
+           float q = nearbyintf(val * inv_scale);
+           q = fminf(fmaxf(q, -127.0f), 127.0f);
+           float xq = q * scale;
+           mixed[idx] = alpha * xq + (1.0f - alpha) * val;
+       }
+
+       __syncthreads();
+
+       int out_per_thread = (D + blockSize - 1) / blockSize;
+       for (int k = 0; k &lt; out_per_thread; ++k) {
+           int j = tid + k * blockSize;
+           if (j &lt; D) {
+               float sum = bias[j];
+               for (int i = 0; i &lt; D; ++i) {
+                   sum += mixed[i] * weight_t[i * D + j];
+               }
+               out[base + j] = sum;
+           }
+       }
+   }
+   ```
+
+   Wait, there&#x27;s a potential issue with floating point precision. The reference uses `amax = x.detach().abs().max().clamp(min=1e-8)`. If `amax` is computed via PyTorch&#x27;s `.max()` on a CUDA tensor, it&#x27;s a CUDA reduction. We compute it in python and pass as float. Fine.
+
+   Another thing: The layout_logits passed to kernel should be contiguous 1D. If it&#x27;s (B,T) contiguous, flattening is natural. We can just use `.contiguous().view(-1)` or assume it&#x27;s (B,T) contiguous. We call `layout_logits = layout_logits.contiguous().reshape(-1)`.
+
+   Similarly x must be contiguous.
+
+   Let&#x27;s also ensure we use `torch::Tensor` arguments by const reference? The pybind auto wrapper uses `torch::Tensor`. The function signature in CUDA should be `torch::Tensor quant_blend_linear_forward(torch::Tensor x, torch::Tensor layout_logits, float scale, torch::Tensor weight_t, torch::Tensor bias)`. That should be fine.
+
+   Need to handle CUDA streams. The kernel launch above doesn&#x27;t specify stream, so it goes to the default stream. PyTorch might use a different stream. To be safe, we should use the current CUDA stream. We can get it with `at::cuda::getCurrentCUDAStream()`. In the wrapper:
+
+   ```cpp
+   auto stream = at::cuda::getCurrentCUDAStream();
+   fused_kernel&lt;&lt;&lt;grid, block, smem_size, stream&gt;&gt;&gt;(...);
+   ```
+
+   Need to include `&lt;ATen/cuda/CUDAContext.h&gt;` for `at::cuda::getCurrentCUDAStream`. `torch/extension.h` might not include it. Let&#x27;s include it.
+
+   Actually, `torch/extension.h` includes many things. We can try `at::cuda::getCurrentCUDAStream()`. To be safe, include `&lt;ATen/cuda/CUDAContext.h&gt;`.
+
+   Also, after kernel launch, we should return `out`.
+
+   Let&#x27;s write the full cuda_source string carefully.
+
+   ```cpp
+   #include &lt;torch/extension.h&gt;
+   #include &lt;ATen/cuda/CUDAContext.h&gt;
+   #include &lt;cuda_runtime.h&gt;
+   #include &lt;math.h&gt;
+
+   __global__ void fused_kernel(const float* __restrict__ x,
+                                const float* __restrict__ layout_logits,
+                                float scale,
+                                const float* __restrict__ weight_t,
+                                const float* __restrict__ bias,
+                                float* __restrict__ out,
+                                int B, int T, int D) {
+       int token_idx = blockIdx.x;
+       if (token_idx &gt;= B * T) return;
+
+       int tid = threadIdx.x;
+       int blockSize = blockDim.x;
+
+       extern __shared__ float smem[];
+       float* mixed = smem;
+
+       int base = token_idx * D;
+
+       float alpha;
+       if (tid == 0) {
+           float logit = layout_logits[token_idx];
+           alpha = 1.0f / (1.0f + expf(-logit));
+           smem[D] = alpha;
+       }
+       __syncthreads();
+       alpha = smem[D];
+
+       float inv_scale = 1.0f / scale;
+
+       for (int idx = tid; idx &lt; D; idx += blockSize) {
+           float val = x[base + idx];
+           float q = nearbyintf(val * inv_scale);
+           q = fminf(fmaxf(q, -127.0f), 127.0f);
+           float xq = q * scale;
+           mixed[idx] = alpha * xq + (1.0f - alpha) * val;
+       }
+
+       __syncthreads();
+
+       int out_per_thread = (D + blockSize - 1) / blockSize;
+       for (int k = 0; k &lt; out_per_thread; ++k) {
+           int j = tid + k * blockSize;
+           if (j &lt; D) {
+               float sum = bias[j];
+               #pragma unroll 4
+               for (int i = 0; i &lt; D; ++i) {
+                   sum += mixed[i] * weight_t[i * D + j];
+               }
+               out[base + j] = sum;
+           }
+       }
+   }
+
+   torch::Tensor quant_blend_linear_forward(torch::Tensor x,
+                                            torch::Tensor layout_logits,
+                                            float scale,
+                                            torch::Tensor weight_t,
+                                            torch::Tensor bias) {
+       int B = x.size(0);
+       int T = x.size(1);
+       int D = x.size(2);
+       auto out = torch::empty_like(x);
+
+       int total_tokens = B * T;
+       const int blockSize = 128;
+       size_t smem_size = (D + 1) * sizeof(float);
+       dim3 grid(total_tokens);
+       dim3 block(blockSize);
+
+       auto stream = at::cuda::getCurrentCUDAStream();
+       fused_kernel&lt;&lt;&lt;grid, block, smem_size, stream&gt;&gt;&gt;(
+           x.data_ptr&lt;float&gt;(),
+           layout_logits.data_ptr&lt;float&gt;(),
+           scale,
+           weight_t.data_ptr&lt;float&gt;(),
+           bias.data_ptr&lt;float&gt;(),
+           out.data_ptr&lt;float&gt;(),
+           B, T, D);
+
+       return out;
+   }
+   ```
+
+   Wait, there&#x27;s a subtlety: `layout_logits` is (B,T). We can pass it directly if it&#x27;s contiguous. The kernel reads `layout_logits[token_idx]`. That&#x27;s fine.
+
+   In Python forward:
+   ```python
+   def forward(self, x, layout_logits):
+       x = x.contiguous()
+       layout_logits = layout_logits.contiguous()
+       with torch.no_grad():
+           amax = x.detach().abs().max().clamp(min=1e-8)
+       scale = (amax / 127.0).item()
+       weight_t = self.out_proj.weight.t().contiguous()
+       bias = self.out_proj.bias
+       return self._module.quant_blend_linear_forward(x, layout_logits, scale, weight_t, bias)
+   ```
+
+   But we need to store `_module`. Let&#x27;s define it at module load.
+
+   Actually, we should ensure that `x` and `layout_logits` are on CUDA and float32.
+
+   The benchmark probably places inputs on CUDA before calling forward? The `get_inputs` returns CPU tensors? Usually in these benchmarks, inputs are on CPU and the runner moves them to CUDA. Or the default Model delegates and works on whatever device. Our kernel requires CUDA. The check might run on `cuda` device. Let&#x27;s assume inputs are CUDA tensors when passed to forward. If they are CPU, our kernel will fail. But the reference uses PyTorch ops which can run on CPU or CUDA. The evaluation environment probably uses CUDA since it says &quot;backend=cuda&quot;. So it&#x27;s fine.
+
+   Let&#x27;s compile this and check correctness.
+
+   Wait, one more thing: the kernel uses `nearbyintf`. In some CUDA toolkits, `nearbyintf` is not available with `--use_fast_math`? Actually `nearbyintf` is available. Let&#x27;s check: `nearbyintf` is a standard CUDA math function. Yes.
+
+   Also, `#pragma unroll 4` on the inner loop. Since D is runtime variable, the compiler might unroll the loop partially.
+
+   Actually, to improve performance, we could compute the linear part using vectorized loads or warp-level primitives. But it&#x27;s probably overkill.
+
+   Let me think if we can fuse the linear with no shared memory by using registers: each thread loads all x elements (D=128) into registers? That&#x27;s 128 floats = 512 bytes per thread. With 128 threads, that&#x27;s 64KB registers per block. Register file is 256KB per SM on A100, so 64KB is okay. We could avoid shared memory entirely by having each thread load the whole token into registers or by having each thread compute a subset of outputs using a local copy of mixed. But mixed is the same for all threads in a block, so shared memory is the right way. Shared memory is faster than registers for broadcasting.
+
+   But we could also compute the linear without shared memory by having each thread compute one output and each thread loads x independently. That would mean each thread loads D values from global memory, coalesced? For output j, thread j loads x[base + 0], x[base + 1], ... separately. These loads are coalesced across threads within a warp? No, if all threads load x[base + 0] at the same time, it&#x27;s broadcast from L1 (same address). Actually, the loads for mixed[i] where i varies inside the inner loop: all threads load x[base + i] for a given i. That&#x27;s a broadcast across all threads in the block. If it&#x27;s in global memory, the warp will load it into registers and broadcast. L1 cache can handle it. But D=128, B*T=512, total reads of x = 512 * 128 * 128 = 8,388,608 (for linear alone) + reads for quant = 65,536. Total x reads ~8.4M floats = 33.5MB. That&#x27;s not huge. But using shared memory reduces x reads: we load x once, write to smem, then read from smem D times per output. So total HBM reads of x = B*T*D = 65k floats. That&#x27;s much better. So shared memory is worth it.
+
+   Another idea: since D is small and fixed (128), we could pack the weight into shared memory too? Weight is 128*128 = 16k floats = 64KB. Shared memory limit is 48KB or 164KB (with config). 64KB fits in 96KB (A100 shared memory per SM with config). But if we load weight into shared memory, that saves repeated reads of weight from HBM. However, with transposed weight and coalesced access, each warp reads a contiguous chunk of weight per i: weight_t[i*D + j] for j in warp. With 128 threads, that&#x27;s fully coalesced: one 512-byte transaction per i per block. Total weight reads = D * (D * 4 bytes) = 64KB per block. For 512 blocks, that&#x27;s 32MB of weight reads. But weight might stay in L2 cache (size 40MB on A100). Actually L2 is 40MB, weight is 64KB, so it will be fully cached. So weight reads from HBM happen only once per block or less due to L2. So it&#x27;s fine.
+
+   Actually, for 512 blocks, weight is read many times but from L2 after the first few blocks. So performance is not dominated by weight bandwidth but by latency of the inner loop. The inner loop does D iterations reading mixed[i] and weight_t[i*D+j]. mixed is in shared memory (fast). weight_t is in global memory but cached in L2 (fast). So performance is good.
+
+   Could we further optimize by having each warp compute a sub-range of outputs and preload a slice of weight into registers? But weight is D*D. If we tile by warp, we could reduce loop length. For example, each warp computes 32 outputs, then inner loop is still over D. Not much gain.
+
+   The kernel is latency-bound on the inner loop. We can reduce latency by unrolling the loop. `#pragma unroll` might help. Since D is not compile-time constant, the compiler may not fully unroll. But for D=128, if we pass it as a template parameter, the compiler can unroll completely. Let&#x27;s consider templating by D to allow full unrolling.
+
+   Since D is known at runtime, we can write a switch statement for common D values, or just a generic version. For D=128 specifically, we can write a specialized path. But the benchmark uses dim=128, and it&#x27;s fixed. We can do:
+
+   ```cpp
+   template &lt;int D&gt;
+   __global__ void fused_kernel_t(...) {
+       // same code, but D is compile-time constant.
+   }
+
+   torch::Tensor quant_blend_linear_forward(...) {
+       int D = x.size(2);
+       if (D == 128) {
+           // launch fused_kernel_t&lt;128&gt;
+       } else {
+           // launch generic fused_kernel
+       }
+   }
+   ```
+
+   This is a good idea because full unrolling of the inner loop (128 iterations) will reduce loop overhead and allow better instruction scheduling. For D=128, it&#x27;s perfect. Let&#x27;s do it. We&#x27;ll have a generic version and a templated version for D=128.
+
+   Actually, we can just template and dispatch for any D without a generic fallback. But we need an instantiation for each possible D. Since only 128 is used, we can just instantiate for 128. But maybe the tests could use a different dim? Unlikely but possible. Let&#x27;s keep both: template for arbitrary D, and a host function that uses a switch to dispatch for compile-time D up to some limit? Or use C++ `if constexpr`? Not easily for runtime D.
+
+   Simpler: just use the generic kernel with runtime D. The compiler with `-O3` might still unroll the inner loop if it sees the loop bound is invariant and small (128). But since D is passed as a kernel argument, it&#x27;s not a compile-time constant. However, the compiler might not know. We can add `#pragma unroll` and hope it unrolls. Actually, `#pragma unroll` requires a constant or no argument. If no argument, the compiler decides. It might not fully unroll 128 iterations because it&#x27;s large. But `#pragma unroll 128` would be ignored if D is not constant. So it&#x27;s limited.
+
+   For D=128, we could manually write a loop that iterates 128 times by copying the code... not practical.
+
+   Another approach: pass D via template using a switch with many cases? Not needed.
+
+   Let&#x27;s just stick with generic kernel. It will still be much faster than reference.
+
+   Let&#x27;s also consider using `float4` vectorized loads for x and writes for out. Since D=128 and blockSize=128, each thread loads exactly one float. Vectorization doesn&#x27;t help because each thread handles one element. But we could use `float4` to load 4 floats per thread, reducing thread count to 32. However, for D=128, blockSize=32 would mean each thread handles 4 outputs. That reduces parallelism inside the block but same total work. Maybe not needed.
+
+   Actually, we can set blockSize = 128 because D=128. Each thread loads exactly one x element, writes one out element. That&#x27;s perfect. The inner loop does 128 iterations. With 4 warps, there is some instruction-level parallelism.
+
+   One more optimization: compute `inv_scale = 1.0f / scale` once per block (or per thread, compiler will hoist it).
+
+   Let&#x27;s think about correctness of PyTorch `round` again. To be absolutely safe, we can implement the rounding exactly as PyTorch does. PyTorch&#x27;s `round` for CPU uses `std::nearbyint`? Let&#x27;s check: In PyTorch source (I recall), `round` uses `std::round` for scalar? Wait, maybe there&#x27;s confusion. Let&#x27;s check the behavior: In Python:
+   ```python
+   import torch
+   torch.tensor([0.5, 1.5, 2.5]).round()
+   ```
+   On my memory, PyTorch 1.9+ changed `round` to match NumPy&#x27;s `round` which rounds to nearest, ties to even. Actually, NumPy&#x27;s `round` also rounds half to even. So PyTorch likely does the same. `nearbyintf` does round half to even with the current rounding mode. So we should be fine.
+
+   But what about `torch.round` vs `torch.rint`? `torch.rint` also rounds to nearest integer, ties to even. `torch.round` historically maybe did round half away? Let&#x27;s not overthink; `nearbyintf` will give ties to even, which is the standard default. The tolerance is 1e-4. A difference of 1 * scale (~0.02) on exact tie would be rare. We&#x27;ll use `nearbyintf`.
+
+   Let&#x27;s also consider `expf` for sigmoid. PyTorch uses `exp` in `sigmoid`. For float32, `expf` is accurate enough.
+
+   Time to compile and test.
+
+   Let&#x27;s write the Python code.
+
+   One more thing: `torch.utils.cpp_extension.load_inline` requires that we don&#x27;t define `PYBIND11_MODULE`. We won&#x27;t. We&#x27;ll just provide the function and list it.
+
+   Code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_CUDA_SOURCE = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;math.h&gt;
+
+__global__ void fused_quant_blend_linear_kernel(const float* __restrict__ x,
+                                                const float* __restrict__ layout_logits,
+                                                float scale,
+                                                const float* __restrict__ weight_t,
+                                                const float* __restrict__ bias,
+                                                float* __restrict__ out,
+                                                int B, int T, int D) {
+    int token_idx = blockIdx.x;
+    if (token_idx &gt;= B * T) return;
+
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+
+    extern __shared__ float smem[];
+    float* mixed = smem;
+
+    int base = token_idx * D;
+
+    float alpha;
+    if (tid == 0) {
+        float logit = layout_logits[token_idx];
+        alpha = 1.0f / (1.0f + expf(-logit));
+        smem[D] = alpha;
+    }
+    __syncthreads();
+    alpha = smem[D];
+
+    float inv_scale = 1.0f / scale;
+
+    for (int idx = tid; idx &lt; D; idx += blockSize) {
+        float val = x[base + idx];
+        float q = nearbyintf(val * inv_scale);
+        q = fminf(fmaxf(q, -127.0f), 127.0f);
+        float xq = q * scale;
+        mixed[idx] = alpha * xq + (1.0f - alpha) * val;
+    }
+
+    __syncthreads();
+
+    int out_per_thread = (D + blockSize - 1) / blockSize;
+    for (int k = 0; k &lt; out_per_thread; ++k) {
+        int j = tid + k * blockSize;
+        if (j &lt; D) {
+            float sum = bias[j];
+            #pragma unroll 4
+            for (int i = 0; i &lt; D; ++i) {
+                sum += mixed[i] * weight_t[i * D + j];
+            }
+            out[base + j] = sum;
+        }
+    }
+}
+
+torch::Tensor quant_blend_linear_forward(torch::Tensor x,
+                                         torch::Tensor layout_logits,
+                                         float scale,
+                                         torch::Tensor weight_t,
+                                         torch::Tensor bias) {
+    int B = x.size(0);
+    int T = x.size(1);
+    int D = x.size(2);
+    auto out = torch::empty_like(x);
+
+    int total_tokens = B * T;
+    const int blockSize = 128;
+    size_t smem_size = (D + 1) * sizeof(float);
+    dim3 grid(total_tokens);
+    dim3 block(blockSize);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    fused_quant_blend_linear_kernel&lt;&lt;&lt;grid, block, smem_size, stream&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        layout_logits.data_ptr&lt;float&gt;(),
+        scale,
+        weight_t.data_ptr&lt;float&gt;(),
+        bias.data_ptr&lt;float&gt;(),
+        out.data_ptr&lt;float&gt;(),
+        B, T, D);
+
+    return out;
+}
+&quot;&quot;&quot;
+
+_cpp_ext = load_inline(
+    name=&quot;quant_blend_linear_cuda&quot;,
+    cpp_sources=&quot;&quot;,
+    cuda_sources=_CUDA_SOURCE,
+    functions=[&quot;quant_blend_linear_forward&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+```
+
+One issue: `load_inline` with `verbose=False` may throw errors silently? Actually verbose only prints. The compilation errors will raise RuntimeError.
+
+Next, define ModelNew.
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:
+        x = x.contiguous()
+        layout_logits = layout_logits.contiguous()
+        with torch.no_grad():
+            amax = x.detach().abs().max().clamp(min=1e-8)
+        scale = (amax / 127.0).item()
+        weight_t = self.out_proj.weight.t().contiguous()
+        bias = self.out_proj.bias
+        return _cpp_ext.quant_blend_linear_forward(x, layout_logits, scale, weight_t, bias)
+```
+
+Wait, we should ensure that self.out_proj exists and its parameters are initialised when used. `nn.Linear` initializes weight and bias lazily? No, immediately.
+
+One more nuance: `self.out_proj.weight` requires `requires_grad=True`, but we only read it. That&#x27;s fine.
+
+Is there any risk that `layout_logits` is not contiguous 1D? It&#x27;s (B,T) contiguous. The kernel reads `layout_logits[token_idx]`. That&#x27;s fine.
+
+Let&#x27;s compile and test.
+
+I need to produce the complete Python code. Then call compile_kernel.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n_CUDA_SOURCE = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;ATen/cuda/CUDAContext.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n__global__ void fused_quant_blend_linear_kernel(const float* __restrict__ x,\n                                                const float* __restrict__ layout_logits,\n                                                float scale,\n                                                const float* __restrict__ weight_t,\n                                                const float* __restrict__ bias,\n                                                float* __restrict__ out,\n                                                int B, int T, int D) {\n    int token_idx = blockIdx.x;\n    if (token_idx &gt;= B * T) return;\n\n    int tid = threadIdx.x;\n    int blockSize = blockDim.x;\n\n    extern __shared__ float smem[];\n    float* mixed = smem;\n\n    int base = token_idx * D;\n\n    float alpha;\n    if (tid == 0) {\n        float logit = layout_logits[token_idx];\n        alpha = 1.0f / (1.0f + expf(-logit));\n        smem[D] = alpha;\n    }\n    __syncthreads();\n    alpha = smem[D];\n\n    float inv_scale = 1.0f / scale;\n\n    for (int idx = tid; idx &lt; D; idx += blockSize) {\n        float val = x[base + idx];\n        float q = nearbyintf(val * inv_scale);\n        q = fminf(fmaxf(q, -127.0f), 127.0f);\n        float xq = q * scale;\n        mixed[idx] = alpha * xq + (1.0f - alpha) * val;\n    }\n\n    __syncthreads();\n\n    int out_per_thread = (D + blockSize - 1) / blockSize;\n    for (int k = 0; k &lt; out_per_thread; ++k) {\n        int j = tid + k * blockSize;\n        if (j &lt; D) {\n            float sum = bias[j];\n            #pragma unroll 4\n            for (int i = 0; i &lt; D; ++i) {\n                sum += mixed[i] * weight_t[i * D + j];\n            }\n            out[base + j] = sum;\n        }\n    }\n}\n\ntorch::Tensor quant_blend_linear_forward(torch::Tensor x,\n                                         torch::Tensor layout_logits,\n                                         float scale,\n                                         torch::Tensor weight_t,\n                                         torch::Tensor bias) {\n    int B = x.size(0);\n    int T = x.size(1);\n    int D = x.size(2);\n    auto out = torch::empty_like(x);\n\n    int total_tokens = B * T;\n    const int blockSize = 128;\n    size_t smem_size = (D + 1) * sizeof(float);\n    dim3 grid(total_tokens);\n    dim3 block(blockSize);\n\n    auto stream = at::cuda::getCurrentCUDAStream();\n    fused_quant_blend_linear_kernel&lt;&lt;&lt;grid, block, smem_size, stream&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        layout_logits.data_ptr&lt;float&gt;(),\n        scale,\n        weight_t.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        B, T, D);\n\n    return out;\n}\n\&quot;\&quot;\&quot;\n\n_quant_blend_linear_cuda = load_inline(\n    name=\&quot;quant_blend_linear_cuda\&quot;,\n    cpp_sources=\&quot;\&quot;,\n    cuda_sources=_CUDA_SOURCE,\n    functions=[\&quot;quant_blend_linear_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n    verbose=True,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int):\n        super().__init__()\n        self.dim = dim\n        self.out_proj = nn.Linear(dim, dim, bias=True)\n\n    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:\n        x = x.contiguous()\n        layout_logits = layout_logits.contiguous()\n        with torch.no_grad():\n            amax = x.detach().abs().max().clamp(min=1e-8)\n        scale = (amax / 127.0).item()\n        weight_t = self.out_proj.weight.t().contiguous()\n        bias = self.out_proj.bias\n        return _quant_blend_linear_cuda.quant_blend_linear_forward(\n            x, layout_logits, scale, weight_t, bias\n        )\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;quant_blend_linear_cuda&#x27;</div></details></div></details></div>
 </body></html>
