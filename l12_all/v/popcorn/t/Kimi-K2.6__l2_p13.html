@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 13</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:47:56 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 13</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:50:04 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">13_QuantVLA_SelectiveLayoutFusion.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">10 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">10</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">11 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">11</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -1913,5 +1913,365 @@ profile_kernel PASSED: profiling complete.
   DRAM BW%: 4.63→4.50% (↓0.12) REGRESSED
   Compute%: 13.07→12.73% (↓0.34) REGRESSED
   Occupancy: 70.74→70.66% (↓0.08) REGRESSED
-  L2 hit%: 539.38→540.44% (↑1.06) ok</div></details></div></details></div>
+  L2 hit%: 539.38→540.44% (↑1.06) ok</div></details></div></details><details class="turn-collapse"><summary><b>turn 10</b> · 1 tool call(s) · 42.3s · 27,380 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 10</span><span>llm latency: 42.3s</span></div><details open><summary>reasoning</summary><div class="block reasoning">I see the issue now. The profiling shows `aten::clamp`, `aten::max`, `aten::contiguous`, etc. These are from the PyTorch reference implementation! The profile is comparing against the reference, not just measuring my kernel time.
+
+Wait, looking again at the output: &quot;GPU time: 45.98 μs&quot; - this is my kernel&#x27;s time. And there are additional kernels like aten::max (10934μs), etc. It seems the profile is capturing the entire forward pass of the model, but the timing summary shows just the GPU time of the main kernels.
+
+Actually, the high `aten::max` (10934μs) is shocking - that&#x27;s the `x.detach().abs().max()` calculation. The actual kernel runs in 45.98μs.
+
+But the key issues are:
+1. The kernel has terrible memory coalescing (70 sectors per request)
+2. Only 0.43 eligible warps/cycle
+3. Long scoreboard stalls at nearly 10000%
+
+Looking at the kernel, the problem is in how we access `weight_t`. In the linear projection step:
+```cuda
+for (int j = tid; j &lt; D; j += blockSize) {
+    float sum = bias[j];
+    for (int i = 0; i &lt; D; ++i) {
+        sum += mixed[i] * weight_t[i * D + j];
+    }
+    out[base + j] = sum;
+}
+```
+
+Each thread iterates over `j`, and for each `j`, it reads `weight_t[i*D + j]` for `i = 0..D`. So thread 0 reads weight_t[0], weight_t[D], weight_t[2D], ... thread 1 reads weight_t[1], weight_t[D+1], ... This is a stride-1 access pattern per thread, but across threads, when two adjacent threads read the same `i` value, they access `weight_t[i*D + tid]` and `weight_t[i*D + (tid+1)]`. That IS contiguous. But wait, that means the coalescing should be fine for weight_t.
+
+The issue is `mixed[i]` - all threads read the SAME `mixed[i]`. Since mixed is in shared memory, that&#x27;s a broadcast, which should be fast.
+
+The real coalescing issue might be in step 1:
+```cuda
+for (int i = tid; i &lt; D; i += blockSize) {
+    float val = x[base + i];
+```
+
+Here we have blockSize=128 and D=128, so each thread reads exactly one element. Thread 0 reads x[base+0], thread 1 reads x[base+1], etc. That&#x27;s contiguous and perfectly coalesced.
+
+Wait, let me re-read the profile: &quot;Global ld coalescing: 69.99 sectors/req (70.0x wasted BW)&quot;. 
+
+This means on average, each memory request pulls in 70 sectors. A sector is 32 bytes. So 70 sectors = 2240 bytes per request. But each thread only wants 4 bytes. That means only 4 bytes out of 2240 are used.
+
+Hmm, that could be because each thread is iterating over `j` with stride `blockSize` (128). But wait, that&#x27;s for the output. For the weight reads, each thread reads:
+- weight_t[i*D + j], weight_t[i*D + j + blockSize], weight_t[i*D + j + 2*blockSize], ...
+
+With blockSize=128 and D=128, each thread only processes one j value. So each thread reads:
+- weight_t[i*D + tid], for i=0..D-1
+
+For i=0: thread 0 reads weight_t[0], thread 1 reads weight_t[1], ... thread 127 reads weight_t[127]. This is contiguous. 
+For i=1: thread 0 reads weight_t[128], thread 1 reads weight_t[129], ... thread 127 reads weight_t[255]. Again contiguous.
+
+But the issue is that each warp (32 threads) is making a request. Each request loads 32 sectors (32*32 = 1024 bytes) for 32 threads, each wanting 4 bytes = 128 bytes. That&#x27;s only 8x waste, not 70x.
+
+Unless... the memory is being accessed in a pattern that triggers many more cache lines to be pulled in. Let me think...
+
+Actually, the issue could be the register pressure causing spills to memory. With 171 registers per thread, there might be local memory accesses that are highly uncoalesced. But wait, the profile says &quot;Global ld coalescing: 69.99 sectors/req&quot;, which is specifically global loads. Register spills go to local memory, not global memory.
+
+Actually, I just realized: the block size is 128, but we have 512 threads per SM. So each SM can run 1 block (128 threads) and has 4 blocks worth of warps (4 warps). With grid=643 and block=1152, that means block=1152 threads? Wait, block=1152... let me recalculate.
+
+No, `block=1152` can&#x27;t be right if D=128. The profile says &quot;Launch: regs/thread=171, smem/blk=8960B, block=1152, grid=643&quot;. `block=1152` means the block size is 1152 threads. But I set blockSize=128. What&#x27;s going on?
+
+Oh! I see it now: the block=1152 is the total threads in the block, and grid=643 is the number of blocks. 643 * 1152 = 740,736 threads. B=8, T=64, D=128, so total elements = 8*64*128 = 65,536. But wait, my blockSize is 128 and total_tokens = 512. So I should have 512 blocks * 128 threads = 65,536 threads. But the profile says 643 blocks * 1152 threads. That&#x27;s weird.
+
+Oh wait, maybe `block=1152` is the max block size or something else, or maybe the profiler is reporting block as threads per block but I actually set it to something else? Let me check... 
+
+Actually, wait. In my kernel I set:
+```python
+int blockSize = 128;
+size_t smem_size = (D + 1) * sizeof(float);
+dim3 grid(total_tokens);
+dim3 block(blockSize);
+```
+
+But in the profile: &quot;block=1152, grid=643&quot;. 1152 = 128 + 1024... No, 1152 = 9 * 128. That&#x27;s odd.
+
+Maybe the profiler is summing over the kernel launches? Or maybe I had a different configuration? 
+
+Actually, I think the confusion is because my `compile_kernel` and `profile_kernel` calls used slightly different code. In the first call I had `blockSize = D` (which is 128), and in the second call I had `blockSize = 128`. Both are 128. So it should be 512 blocks * 128 threads = 65,536 threads.
+
+&quot;block=1152&quot; in the profiler output must mean something else. Maybe it&#x27;s reporting the total number of threads or the maximum block size? Or maybe the code was actually compiled with blockSize=D which is 128, and 1152 is 9*128? No...
+
+Actually, looking more carefully: &quot;Launch: regs/thread=171, smem/blk=8960B, block=1152, grid=643&quot;. Wait, total_tokens = B * T = 8 * 64 = 512. But grid=643. That&#x27;s too many. And block=1152 threads... 
+
+Maybe the profile is picking up another kernel? Or maybe the code I submitted for profiling was different? Let me check... The `profile_kernel` call I made used code from my second compile attempt. In that code, blockSize=128. But why does the profiler show grid=643 and block=1152?
+
+I think I might be misinterpreting the profiler output. Maybe &quot;block=1152&quot; is the total threads launched, and &quot;grid=643&quot; is the number of SMs? Or maybe it&#x27;s showing that the kernel was launched with dynamic block sizes?
+
+Actually wait, I see it: `aten::max 10934.0μs (17%) calls=1`. This is PyTorch&#x27;s aten max kernel. And there are 20 more kernels. The profile is measuring the full model forward pass, which includes the reference ops happening during training. But the main kernel time is 45.98μs.
+
+Let me check if my kernel is indeed what the profiler calls. Looking at the kernel breakdown, there isn&#x27;t a named kernel from my extension (which would have a name like `fused_quant_blend_linear_kernel`). That&#x27;s suspicious. Maybe my kernel isn&#x27;t showing up in the top 5, or maybe it is but named differently.
+
+Actually, the top 5 kernels are all aten operations with very high times (10ms, 7ms). But the total time reported is only 45.98μs. This doesn&#x27;t add up. Unless those aten operations are happening on CPU or there&#x27;s something else going on...
+
+Ah, I think the 10ms times are because the first run includes compilation overhead or initialization. The &quot;GPU time: 45.98 μs&quot; is probably the actual kernel time excluding those setup operations. 
+
+OK, regardless of profiling details, I need to optimize the kernel. The main issues are:
+1. Memory coalescing is terrible
+2. Latency bound - not enough parallelism
+3. Low occupancy (70.7%)
+
+For the memory coalescing issue, I think the problem is how I access weights. Let me reconsider.
+
+Currently:
+```cuda
+for (int j = tid; j &lt; D; j += blockSize) {
+    float sum = bias[j];
+    for (int i = 0; i &lt; D; ++i) {
+        sum += mixed[i] * weight_t[i * D + j];
+    }
+    out[base + j] = sum;
+}
+```
+
+With blockSize=128 and D=128, each thread handles exactly one j. So thread tid computes output[tid] by reading weight_t[i*D + tid] for all i from 0 to 127. For a given i, all threads read contiguous elements: weight_t[i*D + 0], weight_t[i*D + 1], ..., weight_t[i*D + 127]. This is perfectly coalesced!
+
+So why is the profile showing 70x wasted BW? Maybe it&#x27;s the reading of `mixed[i]`. But that&#x27;s in shared memory!
+
+Wait, maybe the issue is `out[base + j]`. Each thread writes to a different j, so `out[base + tid]` is coalesced.
+
+Hmm, let me think about what else could cause bad coalescing. The only other global memory reads are `x[base + i]`, `layout_logits[token_idx]`, `bias[j]`, and `weight_t[i*D + j]`.
+
+`x[base + i]` with i = tid to D with step blockSize. With blockSize=128 and D=128, each thread reads exactly one element: x[base + tid]. Coalesced.
+`layout_logits[token_idx]`: only tid==0 reads this. Not coalesced but only one access per block.
+`bias[j]` with j = tid, and blockSize=128, D=128. Each thread reads bias[tid]. Coalesced.
+`weight_t[i*D + j]` as discussed - coalesced.
+
+Unless... the compiler is doing something weird? Or maybe the issue is with how the shared memory accesses are being reported? The `Global ld coalescing` metric should only count global memory loads, not shared memory.
+
+Let me re-examine if the kernel is register spilling. With 171 registers per thread on a GPU that has 65536 registers per SM, and each SM can run 2048 threads max. 171 * 128 = 21,888 registers per block. An SM could run 65536 / 21888 = 2.99 blocks, but limited to available blocks per SM. On Ampere/Hopper, the limit is 32 blocks per SM. With 128 threads per block and 171 registers, we can run 2 blocks per SM (256 threads total), giving us 50% theoretical occupancy. The achieved 70.7% occupancy makes sense if some SMs can run more.
+
+Actually, 171 registers per thread. Each SM has 65536 registers. 65536 / 171 = 383 threads max per SM (before register allocation limits). With 128 threads per block, that&#x27;s 2 blocks per SM (need 2 * 128 * 171 = 43776 registers), and 3 blocks would need 65664 registers - just barely over. So we can only run 2 blocks per SM. That gives us 2 blocks * 128 threads / 1536 max threads = 256/1536 = 16.7% theoretical occupancy! But the profile says 70.7%. Hmm.
+
+Wait, my math is wrong. On Hopper (H100), each SM can have up to 2048 threads max (64 warps * 32 threads). The register file is 65536 32-bit registers per SM. With 171 registers per thread, the max threads per SM is 65536 / 171 ≈ 383. So that&#x27;s about 12 warps per SM, which is 12/64 = 18.75% theoretical max occupancy based on registers. But the profile shows 70.7% achieved occupancy. That&#x27;s weird. Maybe my register count reading is wrong? &quot;regs/thread=171&quot; means 171 32-bit registers, so 171/256 ≈ 66.8% of the register file per block with 128 threads. With 65536 registers per SM and 171*128=21888 registers per block, we can fit 2.99 blocks per SM. But actual hardware might round up allocations, so maybe 3 blocks can fit (with some leftover). No, NVIDIA allocates registers in chunks.
+
+Actually, on newer GPUs (Hopper), register allocation is at warp granularity. Each warp gets ceil(171 * 32 / 256) * 256 = ceil(5472 / 256) * 256 = ceil(21.375) * 256 = 22 * 256 = 5632 registers. An SM has 65536 registers, so it can fit 65536 / 5632 = 11.63 warps ≈ 11 warps. 11 warps = 352 threads. 352 / 2048 = 17.2% occupancy. 
+
+But the profile says 70.7% occupancy. Something doesn&#x27;t add up. Maybe the profiler is showing combined occupancy across all kernels in the pass, and my kernel only runs for a small fraction? Or maybe I am miscalculating the GPU architecture.
+
+Actually, the occupancy might be for a different kernel, or the block size I&#x27;m using might be different than what I think. Let me check if there&#x27;s a hidden issue.
+
+Anyway, regardless of the profiling confusion, the key optimization is to improve the kernel. Let me try a different approach: use vectorized loads and stores.
+
+Actually, wait. Let me re-read the profile more carefully. It says:
+&quot;Launch: regs/thread=171, smem/blk=8960B, block=1152, grid=643&quot;
+
+8960B smem/blk = (128 + 1) * 4 bytes = 516 bytes. But 8960 is much larger. Hmm. 8960 = 1120 * 8? No, that&#x27;s weird. Or maybe it includes something else.
+
+Wait, actually: &quot;block=1152&quot; and &quot;grid=643&quot;. Could this be for a matmul kernel (like CuBLAS)? Since my nn.Linear call inside the Python code would call into cuBLAS, which uses its own kernels. That would explain it!
+
+Oh! Looking at my code again:
+```python
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x, layout_logits):
+        ...
+        mixed = _fused.fused_quant_blend_linear_forward(...)
+        return self.out_proj(mixed)
+```
+
+Wait! I completely fused the operations but then my kernel ALREADY includes the linear projection. So if I call `_fused.fused_quant_blend_linear_forward` and then `self.out_proj(mixed)`, I&#x27;m doing the linear projection TWICE!
+
+No wait, let me re-read my kernel. The kernel IS computing the full linear projection inside it. It writes to `out`. So I should be returning `out` directly, not calling `self.out_proj(mixed)`.
+
+Let me check my code again... 
+
+Yes, in the `ModelNew.forward`:
+```python
+    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:
+        ...
+        return _fused_quant_blend_linear_cuda.fused_quant_blend_linear_forward(
+            x, layout_logits, scale, weight_t, bias
+        )
+```
+
+So I am returning the output of my fused kernel. Then in the profile, the `self.out_proj` is NOT being called. But the profile shows `block=1152, grid=643` which could be for the PyTorch reference run.
+
+Ah, actually profiling compares the reference and the new kernel. The profile shows both. So the reference PyTorch linear layer might be using a cuBLAS kernel with those parameters.
+
+Anyway, let me focus on the key insight: my kernel computes everything correctly but could be faster. The main optimization opportunities are:
+
+1. **Reduce register pressure**: Currently using 171 registers. This limits occupancy.
+2. **Better instruction-level parallelism**: Do multiple accumulations per thread.
+3. **Vectorized memory access**: Use float4 for x, weight, and out.
+4. **Loop unrolling**: Help the scheduler find independent instructions.
+
+Let me create a new version with these optimizations:
+
+```cuda
+// Each thread handles UNROLL elements of the output
+// For D=128, with blockSize=128, each thread handles 1 element, UNROLL=1
+// But we can use float4 to process 4 at a time
+```
+
+Actually, for D=128, I can have each warp handle 4 output elements using float4, where each thread in a warp reads a float4 from contiguous memory. But with threads in a warp, float4 reads would require each thread to read 16 bytes, and adjacent threads would read adjacent float4s, giving 64 bytes per thread which might split across cache lines.
+
+Let me try a simpler vectorization: use float4 for loading x and weight.
+
+For x: `x[base + i]` can be loaded as `float4` when `blockSize &gt;= 4` and `D % 4 == 0`.
+For weight_t: `weight_t[i*D + j]` where we iterate i... loading a float4 from `weight_t[i*D + j]`.
+For out: `out[base + j]` can be stored as float4.
+
+But the mixed computation needs element-wise operations, so we&#x27;d have to unpack the float4.
+
+Let me try this approach:
+
+```cpp
+__device__ float4 operator*(float s, float4 v) {
+    return make_float4(s*v.x, s*v.y, s*v.z, s*v.w);
+}
+
+__device__ float4 operator+(float4 a, float4 b) {
+    return make_float4(a.x+b.x, a.y+b.y, a.z+b.z, a.w+b.w);
+}
+
+// In kernel:
+for (int i = tid*4; i &lt; D; i += blockSize*4) {
+    float4 xv = *reinterpret_cast&lt;const float4*&gt;(&amp;x[base + i]);
+    // ... process all 4 elements ...
+    *reinterpret_cast&lt;float4*&gt;(&amp;mixed[i]) = result;
+}
+```
+
+For the linear projection part:
+```cpp
+for (int j = tid*4; j &lt; D; j += blockSize*4) {
+    float4 sum = *reinterpret_cast&lt;const float4*&gt;(&amp;bias[j]);
+    for (int i = 0; i &lt; D; i += 4) {
+        // This gets complicated because we need mixed[i], mixed[i+1], mixed[i+2], mixed[i+3]
+        // and each has different weights
+        float4 w0 = *reinterpret_cast&lt;const float4*&gt;(&amp;weight_t[i*D + j]);
+        // ...
+    }
+}
+```
+
+This is getting complicated. Let me think of a different approach.
+
+What if each thread computes one output element but uses unroll and ILP? For example:
+
+```cpp
+__device__ inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_quant_blend_linear_kernel(...) {
+    int token_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    // Use int instead of size_t to reduce register usage
+    int base = token_idx * D;
+    int inv_scale = 1.0f / scale;
+    
+    // Shared memory for mixed and alpha
+    extern __shared__ float smem[];
+    float* mixed = smem;
+    
+    if (tid == 0) {
+        smem[D] = sigmoid(layout_logits[token_idx]);
+    }
+    __syncthreads();
+    float alpha = smem[D];
+    
+    // Quantize + blend
+    #pragma unroll
+    for (int i = tid; i &lt; D; i += blockSize) {
+        float xval = x[base + i];
+        float q = nearbyintf(xval * inv_scale);
+        q = fminf(fmaxf(q, -127.0f), 127.0f);
+        mixed[i] = alpha * (q * scale - xval) + xval;
+    }
+    __syncthreads();
+    
+    // Linear
+    for (int j = tid; j &lt; D; j += blockSize) {
+        float sum0 = bias[j];
+        #pragma unroll 8
+        for (int i = 0; i &lt; D; ++i) {
+            sum0 += mixed[i] * weight_t[i * D + j];
+        }
+        out[base + j] = sum0;
+    }
+}
+```
+
+I&#x27;m still not sure why the coalescing is bad. Let me try a completely different approach where I tile the computation more aggressively.
+
+Actually, I just realized something. In my kernel:
+```cuda
+for (int j = tid; j &lt; D; j += blockSize) {
+    float sum = bias[j];
+    for (int i = 0; i &lt; D; ++i) {
+        sum += mixed[i] * weight_t[i * D + j];
+    }
+    out[base + j] = sum;
+}
+```
+
+If blockSize=128 and D=128, then `j += blockSize` means each thread only does one iteration (j=tid). So the loop over j has just one iteration. The inner loop over i from 0 to 127 does all the work. Each thread reads weight_t[i*D + tid] for i from 0..127. This is coalesced for each i because adjacent threads read adjacent j values.
+
+BUT - the issue might be that the weight matrix is accessed 128 times (for each i), and each time a warp reads 128 floats = 512 bytes. Cache lines are 128 bytes. So each memory instruction needs 4 cache lines. The scheduler might not be able to hide all this latency.
+
+Actually, I just realized: the profile says `block=1152, grid=643`, but that doesn&#x27;t match my kernel. 643 is approximately 512 * something. Let me check: B=8, T=64, total_tokens=512. But grid=643. Hmm, that&#x27;s wrong.
+
+I wonder if the profile is showing a different kernel entirely. Let me try adding my kernel name to see if it shows up.
+
+Actually, I think there might be an issue with how I&#x27;m reading the profile. Let me submit a simpler version and see what happens.
+
+Actually, let me think about what the real problem might be. Perhaps the PyTorch reference actually includes cuBLAS matmul, which on H100 might be very fast due to tensor cores. My manually written matmul is not using tensor cores and might be much slower.
+
+For a D=128 matrix multiplication, cuBLAS on H100 would use tensor cores. A 128x128x128 matmul using tensor cores would be very fast. My manual implementation does 128*128*2 = 32K FLOPs per token, which is tiny. The overhead of my hand-written matmul might be the bottleneck.
+
+Wait, let me estimate: for 512 tokens, each doing a 128x128x128 matmul, that&#x27;s 512 * 32K = 16.4M FLOPs. At 67 TFLOPS (FP32), that should take 0.24 ms or 240μs. But the profile says my kernel takes 45.98μs. That seems very fast - maybe the profile is only capturing part of the kernel?
+
+Actually, `45.98 μs` for the entire fused kernel including quantize, blend, and matmul for 512 tokens of 128-dim... that&#x27;s 45.98μs for ~16.4M FLOPs. That&#x27;s 357 GFLOPS, which is only 0.5% of peak FP32. The low compute utilization (12.7%) makes sense.
+
+The reference PyTorch model uses `torch.matmul` which on Hopper would use tensor cores. Let me check what the reference runtime should be. Actually, PyTorch nn.Linear for fp32 usually doesn&#x27;t use tensor cores (they&#x27;re for FP16/BF16). But cuBLAS for FP32 on H100 still achieves high throughput through optimized kernels.
+
+For 512 tokens * 128 features * 128 features matmul, the reference might use a batched matmul approach. CuBLAS might take around 50-100μs. So my 45.98μs with the quantization and blend included could be competitive!
+
+But the profile says &quot;aten::max 10934.0μs (17%)&quot; - that&#x27;s 10ms just for the max operation, which is absurd. That must be a CPU synchronization or something.
+
+Let me check what the actual total reference time would be. The reference model does:
+1. `layout_logits.sigmoid()` - tiny
+2. `x.max()` - tiny on GPU
+3. Fake quant - elementwise
+4. Blend - elementwise
+5. `nn.Linear` - matmul
+
+If the reference is actually taking ~60μs total (which is reasonable), and my kernel is taking 45.98μs, then I have a ~23% speedup. But I need to be sure.
+
+The profile says my kernel is &quot;Compute-bound&quot; but with &quot;Low eligible warps&quot; - this suggests that despite being compute-bound, the kernel has poor instruction scheduling. This can happen with tight loops that have dependency chains.
+
+Let me try to improve the kernel by:
+1. Using more ILP - each thread computes multiple output features
+2. Better loop unrolling
+3. Maybe using half the threads to compute two outputs each
+
+For ILP: instead of each thread computing one output, let&#x27;s have each thread compute two outputs. This way, while waiting for one computation, the other can proceed.
+
+```cuda
+for (int j = tid; j &lt; D; j += blockSize * 2) {
+    float sum0 = 0, sum1 = 0;
+    #pragma unroll 8
+    for (int i = 0; i &lt; D; ++i) {
+        float mi = mixed[i];
+        sum0 += mi * weight_t[i * D + j];
+        sum1 += mi * weight_t[i * D + (j + blockSize)];
+    }
+    out[base + j] = sum0 + bias[j];
+    out[base + j + blockSize] = sum1 + bias[j + blockSize];
+}
+```
+
+With blockSize=64, each thread computes 2 outputs, and we have total 64*2 = 128 outputs. This halves the number of blocks but doubles ILP.
+
+Let me try this approach.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCPP_SOURCE = \&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\ntorch::Tensor fused_quant_blend_linear_forward(\n    torch::Tensor x, torch::Tensor layout_logits, float scale,\n    torch::Tensor weight_t, torch::Tensor bias);\n\&quot;\&quot;\&quot;\n\nCUDA_SOURCE = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n\n__global__ void fused_quant_blend_linear_kernel(\n    const float* __restrict__ x,\n    const float* __restrict__ layout_logits,\n    float scale,\n    const float* __restrict__ weight_t,\n    const float* __restrict__ bias,\n    float* __restrict__ out,\n    int B, int T, int D) {\n\n    int token_idx = blockIdx.x;\n    if (token_idx &gt;= B * T) return;\n\n    int tid = threadIdx.x;\n    int blockSize = blockDim.x;\n\n    extern __shared__ float smem[];\n    float* mixed = smem;\n\n    int base = token_idx * D;\n    float inv_scale = 1.0f / scale;\n\n    if (tid == 0) {\n        float logit = layout_logits[token_idx];\n        smem[D] = 1.0f / (1.0f + expf(-logit));\n    }\n    __syncthreads();\n    float alpha = smem[D];\n\n    // Quantize + blend - each thread handles multiple elements\n    for (int i = tid; i &lt; D; i += blockSize) {\n        float val = x[base + i];\n        float q = nearbyintf(val * inv_scale);\n        q = fminf(fmaxf(q, -127.0f), 127.0f);\n        mixed[i] = alpha * (q * scale) + (1.0f - alpha) * val;\n    }\n    __syncthreads();\n\n    // Linear projection - each thread computes 4 outputs with ILP\n    const int UNROLL = 4;\n    for (int j = tid * UNROLL; j &lt; D; j += blockSize * UNROLL) {\n        float sum[UNROLL];\n        #pragma unroll\n        for (int u = 0; u &lt; UNROLL; ++u) {\n            sum[u] = bias[j + u];\n        }\n\n        #pragma unroll 8\n        for (int i = 0; i &lt; D; ++i) {\n            float mi = mixed[i];\n            #pragma unroll\n            for (int u = 0; u &lt; UNROLL; ++u) {\n                sum[u] += mi * weight_t[i * D + j + u];\n            }\n        }\n\n        #pragma unroll\n        for (int u = 0; u &lt; UNROLL; ++u) {\n            out[base + j + u] = sum[u];\n        }\n    }\n}\n\ntorch::Tensor fused_quant_blend_linear_forward(\n    torch::Tensor x, torch::Tensor layout_logits, float scale,\n    torch::Tensor weight_t, torch::Tensor bias) {\n\n    int B = x.size(0);\n    int T = x.size(1);\n    int D = x.size(2);\n    auto out = torch::empty_like(x);\n\n    int total_tokens = B * T;\n    int blockSize = 32;  // 32 threads, each computes 4 outputs = 128 outputs total\n    size_t smem_size = (D + 1) * sizeof(float);\n\n    dim3 grid(total_tokens);\n    dim3 block(blockSize);\n\n    fused_quant_blend_linear_kernel&lt;&lt;&lt;grid, block, smem_size&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        layout_logits.data_ptr&lt;float&gt;(),\n        scale,\n        weight_t.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        B, T, D);\n\n    return out;\n}\n\&quot;\&quot;\&quot;\n\n_fused = load_inline(\n    name=\&quot;fused_quant_blend_linear_cuda_v3\&quot;,\n    cpp_sources=CPP_SOURCE,\n    cuda_sources=CUDA_SOURCE,\n    functions=[\&quot;fused_quant_blend_linear_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;, \&quot;--use_fast_math\&quot;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim: int):\n        super().__init__()\n        self.dim = dim\n        self.out_proj = nn.Linear(dim, dim, bias=True)\n\n    def forward(self, x: torch.Tensor, layout_logits: torch.Tensor) -&gt; torch.Tensor:\n        x = x.contiguous()\n        layout_logits = layout_logits.contiguous().view(-1)\n        with torch.no_grad():\n            amax = x.detach().abs().max().clamp(min=1e-8)\n        scale = (amax / 127.0).item()\n        weight_t = self.out_proj.weight.t().contiguous()\n        bias = self.out_proj.bias\n        return _fused.fused_quant_blend_linear_forward(\n            x, layout_logits, scale, weight_t, bias\n        )\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
