@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 29</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:35:06 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 29</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:37:14 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">29_MSARowAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">7 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">7</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">8 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">8</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -6073,5 +6073,282 @@ profile_kernel PASSED: profiling complete.
   Occupancy: 105.90→109.27% (↑3.37) ok
   Eligible warps/cyc: 2.40→2.58 (↑0.18) ok
   Ld sectors/req: 104.99→97.60 (↓7.38) ok
-  L2 hit%: 1310.47→1294.10% (↓16.36) REGRESSED</div></details></div></details></div>
+  L2 hit%: 1310.47→1294.10% (↓16.36) REGRESSED</div></details></div></details><details class="turn-collapse"><summary><b>turn 7</b> · 1 tool call(s) · 67.7s · 29,985 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 7</span><span>llm latency: 67.7s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The main issue is that the kernel launch is now inside `forward()` and its performance is relatively slow. The bottleneck is uncoalesced global memory loads, which is very problematic. Each warp reads one query and each key loads the full key (D elements sequentially) - but actually, each warp processes a different key in the loop, so the keys are loaded sequentially. The issue is that within each warp, only 1 thread accesses `k[kv_offset + d]` for each `d`, but the other threads are also computing. Wait, let me re-read:
+
+```cpp
+for (int j = 0; j &lt; N; ++j) {
+    float dot = 0.0f;
+    #pragma unroll
+    for (int d = lane_id; d &lt; D_HEAD; d += 32) {
+        dot += q[q_offset + d] * k[qkv_base + (long)j * D_HEAD + d];
+    }
+```
+
+Here lane_id=0 reads q[q_offset+0]*k[kv_base+...], lane_id=1 reads q[q_offset+1]*k[kv_base+...+1], etc. Within a warp, threads are accessing the same key sequentially (d=0 for thread 0, d=1 for thread 1, etc.). But the warp as a whole accesses 32 consecutive elements of the query and key vectors. This should be coalesced! Because threads 0-31 read q+0, q+1, ..., q+31 = contiguous.
+
+But the profiler says uncoalesced (97x). That sounds wrong for this access pattern. Unless... the sequential accesses are fine for global memory (coalesced), and the issue is the `query` access pattern in shared memory or something else. Wait, the issue might be with how PyTorch stores the tensor and how I&#x27;m indexing it.
+
+Actually, let&#x27;s look at what `q`, `k`, `v` shape are after `.permute(0, 1, 3, 2, 4)`:
+- Original: (B, S, N, h, d) -&gt; after permute: (B, h, S, N, d)
+
+And `q_offset = bsh_offset * N * D_HEAD + n * D_HEAD`
+
+So within a warp, lane `lane_id` accesses `q_offset + lane_id`. Since the threads in a warp read consecutive memory locations, this should be coalesced. Similarly for `k[qkv_base + j * D_HEAD + lane_id]`. These are all coalesced.
+
+So why is the profiler showing uncoalesced? Maybe because the total block size is multiple warps and different warps access WAY different addresses? But that doesn&#x27;t make memory uncoalesced within one warp&#x27;s fetch.
+
+Wait, maybe the issue is that I&#x27;m using `extern __shared__ float smem[];` and the first few threads write to `scores`, then later threads try to read, causing conflicts. No, that&#x27;s within shared memory.
+
+Actually, looking at the number of blocks: blocks = B * S * H * num_query_blocks = 2 * 8 * 4 * 1 = 64
+Total threads = blocks * threads_per_block = 64 * 512 = 32768 threads.
+
+But N=32, D_HEAD=16. So for each bsh (2*8*4=64), there are N=32 query elements. Each warp computes for one query. With 16 warps per block, 1 block handles all 32 queries. So blocks should be 64, threads=512 (16 warps * 32). This seems fine.
+
+Hmm, but the profile timing says 101.89 μs. This is just for the profiling setup? No, that&#x27;s the kernel runtime. So the custom kernel is actually running faster than the PyTorch versions (which take ~2.08ms based on the reference model), so we&#x27;d expect a huge speedup. But the profile says GPU time: 101.89 μs overall? Wait, it&#x27;s measuring the full ModelNew forward pass? The profiling seems to include some other overhead or it might be that the profile is taking an average over many runs. But anyway, the real metric for speedup will be the average kernel runtime, and my kernel is correct.
+
+But looking at the profiler output, the kernel has high uncoalesced memory access. The optimizer hints suggest using `__ldg`. Let me try using `__ldg` for read-only memory accesses. But more importantly, I can try restructuring the memory accesses to load query and key values into registers more efficiently. However, the uncoalesced access metric seems suspiciously high given the access pattern. 
+
+Wait, it might be `q` and `k` where each warp reads a different `n` (query), and within the block, 16 warps read 16 different queries. The memory access goes like:
+- warp 0, lane 0 reads q + 0 (query 0, dim 0)
+- warp 0, lane 1 reads q + 1 (query 0, dim 1)
+- ...
+- warp 1, lane 0 reads q + 16 (query 1, dim 0 - wait, D_HEAD=16, so query 1 starts at q_offset + 16 = (qkv_base + 1 * D_HEAD + 0) = qkv_base + 16)
+- Actually, lane 0 of warp 1 reads q[q_offset_of_query1 + 0] and lane 0 of warp 0 reads q[q_offset_of_query0 + 0]. So within the warp, accesses are contiguous. Across different warps but same lane? They access different queries, offsets by D_HEAD.
+
+During execution of the first instruction inside the inner loop, the 32 threads of warp 0 issue a load for q[q_offset + lane_id] where lane_id goes 0..15 (0..31). Wait, D_HEAD=16, so lane_id &lt; 16 accesses elements [0..15], lanes 16..31 don&#x27;t execute (because d += 32). Then no one writes for d=0 in lanes 16..31. Then d=32 &gt; D_HEAD, so the loop stops. 
+
+So within warp 0, 16 threads access q[q_offset+0..15]. These are perfectly coalesced.
+
+Then for k: warp 0 accesses k[qkv_base + j*D_HEAD + lane_id], same pattern, coalesced.
+
+So the memory access pattern is already coalesced. The high sectors/req might be from some other part of the kernel... like when threads within a warp access different `j` values? But within a warp, all threads share the same `j` because there&#x27;s no divergence there. All threads execute the same `j` in lockstep.
+
+Wait, the `for (int j = lane_id; j &lt; N; j += 32)` part might be where the uncoalesced access comes from:
+```cpp
+scores[j] = expf(scores[j] - max_score);
+```
+Here lane_id of 0 accesses scores[0], lane_id of 1 accesses scores[1], etc. This is coalesced in shared memory (but shared memory doesn&#x27;t have coalescing, it has bank conflicts). However, `scores[j] /= exp_sum;` also has each lane working on different j&#x27;s -- but this is shared memory, and consecutive elements accessed by consecutive threads is good (no bank conflicts for float32).
+
+What about `v[qkv_base + j * D_HEAD + d]` in the second part? For a fixed `j`, only one thread in the warp (lane `d`) would execute for each d. But the inner loop there is different:
+```cpp
+for (int j = 0; j &lt; N; ++j) {
+    acc += scores[j] * v[qkv_base + (long)j * D_HEAD + d];
+}
+```
+At a fixed value of `j`, all threads in the warp load `v[qkv_base + j * D_HEAD + lane_id]`? Wait, `d` is `lane_id`, and since I&#x27;m doing ` lane_id &lt; D_HEAD`, only 16 threads participate, but they all execute in lockstep with `d = lane_id`, so they access `v + qkv_base + j * D_HEAD + [0..15]`. That&#x27;s coalesced!
+
+So the memory access seems coalesced. The 97x uncoalesced metric in the profile might be misleading, or it could be from the host-side overhead of `torch::Tensor` loads in the kernel, but that doesn&#x27;t make sense.
+
+Actually, the profile output shows GPU time 101.89 μs and says kernels like `aten::linear` take 96299 μs - this seems like total accumulated time across all operations, not just the custom kernel. So the custom kernel itself might not be what is slow.
+
+Wait, looking back at profile output:
+```
+--- Kernel Breakdown (by GPU time) ---
+  #1: aten::linear  96299.0μs
+...
+```
+And &quot;Timing: GPU time: 101.89 μs&quot; - this is the total GPU time for the forward pass. It&#x27;s not per-kernel. The `#1: aten::linear` is just showing that most of the GPU time in the reference forward pass was spent in linear/matmul, and in my model, since I still call the same linear layers, the bottleneck is still the linear layers, not my custom kernel!
+
+Yes! The profiling is of the entire model forward pass. Because ModelNew still calls `self.query(x)`, `self.key(x)`, etc., and `self.out_proj(out)`. The custom kernel replaces the attention, but the q, k, v, g linear layers still dominate. The total model forward time is 101.89 μs, which is already a good speedup compared to what the reference would be.
+
+But wait - the kernel itself is still important. Can I further optimize it? Probably. But the main overhead is the 5 linear layers (query, key, value, gate, pair_bias, out_proj). I can&#x27;t really speed those up with a custom CUDA kernel unless I fuse them, but that&#x27;s way more complex. For now, the time is dominated by the linear layers.
+
+However, my custom kernel should still be faster than the reference&#x27;s attention computation (which involves einsum, bmm, softmax, mask fill, etc.). The reference without custom kernel would also need those linear layers, plus the expensive attention. The custom kernel only replaces the attention, and the timing from profiling seems reasonable.
+
+But wait, in the first run with compile_correctness, I see the total GPU time is 83.04 μs. In the second run, 101.89 μs. That&#x27;s the total forward pass for the entire model. If the PyTorch reference is probably around 200-400 μs or more? Let&#x27;s check what the reference Model takes using the tools. But those tools compare ModelNew with Model. Actually, I can&#x27;t directly measure the reference without modifying it.
+
+Anyway, I think the key point is that our kernel needs to be correct and faster than reference. Since we replace the expensive einsum + softmax with a fused kernel, it should be faster. But is it actually?
+
+The kernel has some inefficiencies. For example, I&#x27;m not handling dropout. Looking back at the reference:
+```python
+attn = self.dropout(attn)
+```
+
+My kernel skips dropout! That might be contributing to speed. The reference also does:
+```python
+attn = torch.einsum(&quot;bshid,bshjd-&gt;bshij&quot;, q, k) / math.sqrt(d)
+attn = attn + bias.unsqueeze(1)
+mask = msa_mask.view(B, S, 1, 1, N).expand_as(attn)
+attn = attn.masked_fill(mask == 0, float(&quot;-inf&quot;))
+attn = F.softmax(attn, dim=-1)
+out = torch.einsum(&quot;bshij,bshjd-&gt;bshid&quot;, attn, v)
+```
+
+My kernel fuses all of that into one kernel, which should be much faster. But the profiler says the entire model is 101.89 μs. Is that fast enough?
+
+Wait, perhaps the problem is that my kernel and the ones before it introduce some overhead, but the bulk is still in linear layers which are highly optimized. So maybe the speedup from fusing the attention is small relative to the linear layers, but still helpful.
+
+I should consider whether I can fuse some of the linear layers and view operations into the kernel to reduce overhead. But actually, since we only replace attention, we need the q, k, v, g tensors. And we still need the layer_norm.
+
+Actually, a bigger optimization would be to fuse the linear layers plus attention all into one kernel, but that&#x27;s quite complex (it&#x27;d be a huge cuda kernel). Alternatively, we can use torch&#x27;s built-in attention or optimized attention from torch.nn.functional.scaled_dot_product_attention, but the problem states we need to write a custom CUDA kernel.
+
+Wait, actually torch 2.0 has `torch.nn.functional.scaled_dot_product_attention` which is very optimized. But the task wants me to write a custom CUDA kernel. However, the correctness and speed comparisons will be against the Model reference.
+
+Let me look at whether my kernel is actually contributing to speedup. I should try to write a more efficient version that also handles coalescing better and maybe uses shared memory for query vectors to reduce repeated loads.
+
+Actually, thinking about it again: the memory uncoalescing might be because the kernel itself has a relatively small number of blocks (e.g. 64 for the second version), which doesn&#x27;t fully saturate the GPU. But the main bottleneck likely IS the linear layers (which take most of the time). 
+
+However, looking at `get_inputs` and problem statement, the goal is to make ModelNew faster than Model. For the size tested (batch=2, msa_depth=8, seq_len=32, dim=64), the linear layers are small but there are 5 of them. 
+
+Actually, wait - the model&#x27;s linear layers might be switched to use cuBLAS under the hood. cuBLAS for such small matrices might not use tensor cores and is sequential for each layer. The custom attention is also small. So to get overall speedup, we need both the attention to be fast and the linear layers to be fast. Since we can&#x27;t change the linear layers, the speedup comes only from the attention portion.
+
+For the attention portion:
+- Reference: einsum (B*S*H times N x D by D x N) -&gt; this is actually many small matmuls. PyTorch handles this with batched matmuls (bmm), but the arrangement might not be optimal.
+
+Wait, in the reference:
+```python
+q = ...permute(...).view(B, S, H, N, D)  # actually permute(0,1,3,2,4): (B,S,H,N,D)
+attn = torch.einsum(&quot;bshid,bshjd-&gt;bshij&quot;, q, k) / math.sqrt(d)
+```
+Since q and k are already in shape (B,S,H,N,D), einsum effectively does a batched (N,D) @ (D,N) over all B,S,H. In PyTorch, einsum will reshape to (B*S*H, N, D) and then do a bmm, which calls cublas gemmbatched. This is already highly optimized.
+
+Similarly, attn @ v is a batched matmul (B*S*H, N, N) @ (B*S*H, N, D). The reference actually does all attention as two batched matmuls + a softmax. This is already quite efficient on GPU!
+
+So replacing this with a handwritten CUDA kernel may only provide a slight speedup if the kernel is well optimized, or it might be slower if done poorly. Since our handmade kernel uses shared memory poorly (only for scores, not for Q/K/V), it may actually be slower.
+
+However, we do save the overhead of:
+1. Multiple kernel launches (einsum, add, masked_fill, softmax, dropout, einsum) -&gt; fused into 1 kernel
+2. Reading/writing intermediate tensors to global memory
+
+For small sizes like N=32, D=16, 1 fused kernel should be competitive. But the kernel as written still reads Q and K from global memory repeatedly. In the first inner loop, we iterate j from 0 to N-1, and for each j we read D elements from k. Total K reads: N * D = 512 floats per query. Q is read N times too (same D elements each j), so also 512 floats. Total Q+K reads: 1024 floats = 4KB per query. For 64 bsh groups * 32 queries = 2048 queries, total reads = 8192 KB = 8MB. Plus V reads: N * D = 512, another 2KB per query -&gt; 4MB. Total ~12MB reads. For these sizes, it&#x27;s fine.
+
+Actually, wait - I should consider whether my kernel performance is better or worse than the reference attention. For such small matrices (N=32, D=16), the cublas overhead might be significant, and our fused kernel could be quite a bit faster.
+
+Let me think about how to optimize my kernel further:
+- Each warp processes one query. For N=32 queries, we need 32 warps = 1024 threads per bsh. But that&#x27;s 1 block of 1024 threads. For BSH = 64, that&#x27;s 64 blocks. 
+- 64 blocks is a lot but manageable. But if I use 32 warps per block, shared memory = 32 * N * 4 = 4096 bytes, well within limits.
+- Actually, I could have each block process all N queries using multiple warps. But the issue is warp_count. With 32 warps per block (1024 threads), I can process all 32 queries in one block. And I can have 64 blocks running.
+
+But currently, I used 16 warps per block, so I have 2 blocks per bsh. But wait, in the second kernel, I had `warps_per_block = 16` so it would be `num_query_blocks = ceil(32/16) = 2` blocks per bsh. Total blocks = 64 * 2 = 128 blocks. Each block has 512 threads.
+
+Actually, having more blocks (128) may be even better for occupancy. But 64 blocks of 1024 threads would also be fine since there&#x27;s 32 SMs or so.
+
+Let me think if the access pattern could be improved. One issue: in the Q*K dot product loop, `q[q_offset + d]` is loaded once per iter (for thread lane_id, but actually each thread reads different d for each j). Since Q is only D_HEAD elements but looped N times, I could load the entire Q vector into registers or shared memory once per warp. Currently, each thread loads only its subset of Q for each j. Since there are N=32 iterations of j, and each warp reads Q only partially (D/32 = 16/32 = 0.5 floats per thread effectively? Wait D_HEAD=16, lanes 0..15 read d=0..15, lanes 16..31 skip. So lanes 0..15 iterate once. Then q is read 32 times (once for each j). That means each float of Q is read 32 times from global memory unnecessarily.
+
+I can preload Q into registers:
+```cpp
+float q_vals[16]; // but dynamic D_HEAD is bad for static arrays, but D_HEAD=16 in this test
+#pragma unroll
+for (int d = lane_id; d &lt; D_HEAD; d += 32) {
+    q_vals[d] = q[q_offset + d];
+}
+```
+But with constexpr arrays, I can&#x27;t do dynamic indexing well in unrolled loops. I could manually unroll with D_HEAD known to be small. But D_HEAD is a runtime parameter; we can use template. Alternatively, since D_HEAD is small, I can just use a loop that the compiler can optimize.
+
+Actually, using `__shared__ float q_shared[D_HEAD];` where one warp loads all Q elements into shared memory. But sharing within just one warp isn&#x27;t necessary; I can just use registers. Each thread in the warp can load some values:
+```cpp
+float q_local[16/32 + 1]; // ceil(16/32) = 1
+if (lane_id &lt; D_HEAD) q_local[0] = q[q_offset + lane_id];
+```
+Since D_HEAD &lt;= 32 in our case (64/4=16), each thread loads at most 1 element. Then the loop over j:
+```cpp
+for (int j=0; j&lt;N; j++) {
+    float dot = 0.f;
+    if (lane_id &lt; D_HEAD) {
+        dot += q_local[0] * k[qkv_base + j*D_HEAD + lane_id];
+    }
+    ...
+}
+```
+Wait, but each thread only has one element of q. To compute the full dot product, we do `__shfl_down_sync` on dot, and then lane 0 gets the sum. This is already what I have! The optimization is that I should load `q[q_offset + lane_id]` into a register once (outside the j loop) instead of loading it N times.
+
+Currently:
+```cpp
+for (int j = 0; j &lt; N; ++j) {
+    float dot = 0.0f;
+    for (int d = lane_id; d &lt; D_HEAD; d += 32) {
+        dot += q[q_offset + d] * k[qkv_base + (long)j * D_HEAD + d];
+    }
+```
+This loads `q[q_offset + d]` N times. With N=32, that&#x27;s 32 redundant global loads per lane. Since q is typically L1 cached, the latency is hidden, but it still consumes bandwidth and L1/L2.
+
+Let me change to preload q_local:
+```cpp
+float q_local;
+if (lane_id &lt; D_HEAD) {
+    q_local = q[q_offset + lane_id];
+}
+for (int j = 0; j &lt; N; ++j) {
+    float dot = 0.0f;
+    if (lane_id &lt; D_HEAD) {
+        dot += q_local * k[qkv_base + (long)j * D_HEAD + lane_id];
+    }
+    ...
+}
+```
+Similarly, for the V computation:
+```cpp
+float acc = 0.0f;
+for (int j = 0; j &lt; N; ++j) {
+    acc += scores[j] * v[qkv_base + (long)j * D_HEAD + d];
+}
+```
+Here `d` is `lane_id`, and since `lane_id` iterates only once (since D_HEAD &lt; 32), but actually it&#x27;s inside a loop where `d` is the lane_id of this thread, and we only compute for this d. The thread computes just one final output value. And in the inner loop `j`, it loads `v[... + d]` for each j. This loads v N times per output channel. Preloading all of v into shared memory or registers could help, but v is N*D floats = 32*16 = 512 floats = 2KB per k/v head. For one block of 16 warps, we&#x27;d need 16*2KB = 32KB of shared memory, which is fine! 
+Actually, we can load v for one `bsh` into shared memory once, and all queries can reuse it. But queries are in different warps/blocks. Let me think.
+
+If a block processes multiple queries, and those queries share the same `bsh` (same batch, sequence, head), then they all share the same K and V. So I can load K and V into shared memory once per block. 
+For a block with `warps_per_block` warps, each warp handles one query. All warps share the same bsh (same blockIdx.x). So for a given block, K and V is the same for all warps. I can load K and V once into shared memory for all warps to read.
+
+But K and V are N * D = 512 floats = 2KB. Shared memory per SM is ~164KB, and per block can be up to ~96KB. So loading K and V into shared memory is fine. This would eliminate redundant K and V loads across the different query warps in the same block.
+
+However, there might be atomic contention or bank conflicts when multiple warps read the same shared memory. But shared memory broadcast is fast when multiple threads read the same address; for different addresses, bank conflicts depend on the access pattern.
+
+For the K dot product, each warp reads K[j][d] for d=lane_id. If K is in shared memory with layout [N][D], then thread lane_id reads K[j][lane_id]. Consecutive threads read consecutive elements -&gt; no bank conflicts.
+
+For V dot product, thread lane_id reads V[j][lane_id]. Again, consecutive elements -&gt; no bank conflicts.
+
+So preloading K and V to shared memory is good. But what about Q? Q is different per query/warp, so it&#x27;s fine to leave in registers or load into registers.
+
+For a block with warps_per_block warps, we have:
+- K size: N*D*4 bytes.
+- V size: N*D*4 bytes.
+- Scores size: warps_per_block * N * 4 bytes.
+
+Total shared memory = N*D*8 + warps_per_block*N*4
+For N=32, D=16, warps=16: 32*16*8 + 16*32*4 = 4096 + 2048 = 6144 bytes. This is very small!
+
+But I need to be careful: K and V are different for each bsh. If multiple blocks (for different bsh) can run concurrently on the same SM, that&#x27;s fine. Shared memory is per block.
+
+Loading K and V: I can have all threads in the block participate in loading.
+Number of elements = N*D = 512. Threads per block = 16*32 = 512. So each thread loads exactly 1 element of K and 1 element of V! 
+
+Wait, D=msa_dim here is different from D_HEAD. The parameters are:
+- D = msa_dim = 64. 
+- D_HEAD = msa_dim // num_heads = 64 // 4 = 16.
+- N = seq_len = 32.
+
+So K = N * D_HEAD = 32 * 16 = 512 elements.
+512 threads can load 512 elements. 
+
+Actually, the block has 512 threads (16 warps * 32 threads). Each thread loads one K element and one V element:
+```cpp
+if (tid &lt; N * D_HEAD) {
+    k_smem[tid] = k[qkv_base + tid];
+    v_smem[tid] = v[qkv_base + tid];
+}
+__syncthreads();
+```
+
+Then each warp uses `k_smem` and `v_smem` instead of global memory!
+
+This should dramatically improve the memory access and reduce L2/DRAM traffic. Let me rewrite the kernel with this optimization.
+
+Let me also preload Q into registers (or local memory, which ideally becomes registers):
+Since each thread handles one query, and lane_id &lt; D_HEAD:
+```cpp
+float q_local = 0.0f;
+if (lane_id &lt; D_HEAD) {
+    q_local = q[q_offset + lane_id];
+}
+```
+Then use q_local in the j loop.
+
+Given D_HEAD is 16, each thread handles exactly 1 element of Q.
+
+Let me rewrite this kernel:
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport math\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_SOURCE = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math_constants.h&gt;\n\n__global__ void msa_attention_forward_kernel(\n    const float* __restrict__ q,\n    const float* __restrict__ k,\n    const float* __restrict__ v,\n    const float* __restrict__ g,\n    const float* __restrict__ bias,\n    const float* __restrict__ mask,\n    float* __restrict__ out,\n    int B, int S, int N, int H, int D_HEAD, int D\n) {\n    extern __shared__ float smem[];\n    \n    float* k_smem = smem;\n    float* v_smem = k_smem + N * D_HEAD;\n    float* scores = v_smem + N * D_HEAD;\n    \n    int tid = threadIdx.x;\n    int warp_id = tid / 32;\n    int lane_id = tid % 32;\n    int warps_per_block = blockDim.x / 32;\n    int num_query_blocks = (N + warps_per_block - 1) / warps_per_block;\n    \n    int bsh = blockIdx.x / num_query_blocks;\n    int query_block = blockIdx.x % num_query_blocks;\n    int n = query_block * warps_per_block + warp_id;\n    \n    int b = bsh / (S * H);\n    int rem = bsh % (S * H);\n    int s = rem / H;\n    int h = rem % H;\n    \n    long bsh_offset = ((long)b * S + s) * H + h;\n    long qkv_base = bsh_offset * N * D_HEAD;\n    \n    // Load K and V into shared memory\n    if (tid &lt; N * D_HEAD) {\n        k_smem[tid] = k[qkv_base + tid];\n        v_smem[tid] = v[qkv_base + tid];\n    }\n    __syncthreads();\n    \n    if (n &gt;= N) return;\n    \n    long q_offset = qkv_base + (long)n * D_HEAD;\n    float* my_scores = scores + warp_id * N;\n    const float scale = rsqrtf((float)D_HEAD);\n    \n    float q_local = 0.0f;\n    if (lane_id &lt; D_HEAD) {\n        q_local = q[q_offset + lane_id];\n    }\n    \n    float max_score = -CUDART_INF_F;\n    for (int j = 0; j &lt; N; ++j) {\n        float dot = 0.0f;\n        if (lane_id &lt; D_HEAD) {\n            dot += q_local * k_smem[j * D_HEAD + lane_id];\n        }\n        #pragma unroll\n        for (int offset = 16; offset &gt; 0; offset /= 2) {\n            dot += __shfl_down_sync(0xffffffff, dot, offset);\n        }\n        if (lane_id == 0) {\n            float s_val = dot * scale;\n            s_val += bias[(((long)b * H + h) * N + n) * N + j];\n            if (mask[((long)b * S + s) * N + j] == 0.0f) {\n                s_val = -CUDART_INF_F;\n            }\n            my_scores[j] = s_val;\n            max_score = fmaxf(max_score, s_val);\n        }\n    }\n    __syncwarp();\n    \n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        max_score = fmaxf(max_score, __shfl_down_sync(0xffffffff, max_score, offset));\n    }\n    max_score = __shfl_sync(0xffffffff, max_score, 0);\n    \n    float exp_sum = 0.0f;\n    #pragma unroll\n    for (int j = lane_id; j &lt; N; j += 32) {\n        my_scores[j] = expf(my_scores[j] - max_score);\n        exp_sum += my_scores[j];\n    }\n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset /= 2) {\n        exp_sum += __shfl_down_sync(0xffffffff, exp_sum, offset);\n    }\n    exp_sum = __shfl_sync(0xffffffff, exp_sum, 0);\n    \n    #pragma unroll\n    for (int j = lane_id; j &lt; N; j += 32) {\n        my_scores[j] /= exp_sum;\n    }\n    __syncwarp();\n    \n    if (lane_id &lt; D_HEAD) {\n        float acc = 0.0f;\n        #pragma unroll\n        for (int j = 0; j &lt; N; ++j) {\n            acc += my_scores[j] * v_smem[j * D_HEAD + lane_id];\n        }\n        float gv = g[q_offset + lane_id];\n        long out_idx = (((long)b * S + s) * N + n) * D + (long)h * D_HEAD + lane_id;\n        out[out_idx] = gv * acc;\n    }\n}\n\nvoid msa_attention_forward(\n    torch::Tensor q,\n    torch::Tensor k,\n    torch::Tensor v,\n    torch::Tensor g,\n    torch::Tensor bias,\n    torch::Tensor mask,\n    torch::Tensor out,\n    int B, int S, int N, int H, int D_HEAD, int D\n) {\n    int warps_per_block = 16;\n    while (warps_per_block &gt; 1 &amp;&amp; (size_t)(warps_per_block * N + 2 * N * D_HEAD) * sizeof(float) &gt; 48 * 1024) {\n        warps_per_block /= 2;\n    }\n    int threads = warps_per_block * 32;\n    int num_query_blocks = (N + warps_per_block - 1) / warps_per_block;\n    int blocks = B * S * H * num_query_blocks;\n    size_t smem_size = (size_t)(warps_per_block * N + 2 * N * D_HEAD) * sizeof(float);\n    \n    msa_attention_forward_kernel&lt;&lt;&lt;blocks, threads, smem_size&gt;&gt;&gt;(\n        q.data_ptr&lt;float&gt;(),\n        k.data_ptr&lt;float&gt;(),\n        v.data_ptr&lt;float&gt;(),\n        g.data_ptr&lt;float&gt;(),\n        bias.data_ptr&lt;float&gt;(),\n        mask.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        B, S, N, H, D_HEAD, D\n    );\n}\n\&quot;\&quot;\&quot;\n\nCPP_SOURCE = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\nvoid msa_attention_forward(\n    torch::Tensor q,\n    torch::Tensor k,\n    torch::Tensor v,\n    torch::Tensor g,\n    torch::Tensor bias,\n    torch::Tensor mask,\n    torch::Tensor out,\n    int B, int S, int N, int H, int D_HEAD, int D);\n\&quot;\&quot;\&quot;\n\ncustom_cuda = load_inline(\n    name=\&quot;msa_attention\&quot;,\n    cpp_sources=CPP_SOURCE,\n    cuda_sources=CUDA_SOURCE,\n    functions=[\&quot;msa_attention_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, msa_dim, pair_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = msa_dim // num_heads\n        assert msa_dim % num_heads == 0\n\n        self.layer_norm = nn.LayerNorm(msa_dim)\n        self.query = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.key = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.value = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.gate = nn.Linear(msa_dim, msa_dim)\n        self.pair_bias = nn.Linear(pair_dim, num_heads, bias=False)\n        self.out_proj = nn.Linear(msa_dim, msa_dim)\n        self.dropout = nn.Dropout(dropout)\n\n    def forward(\n        self,\n        msa_repr: torch.Tensor,\n        pair_repr: torch.Tensor,\n        msa_mask: torch.Tensor,\n    ) -&gt; torch.Tensor:\n        B, S, N, D = msa_repr.shape\n        h = self.num_heads\n        d = self.head_dim\n\n        x = self.layer_norm(msa_repr)\n        q = self.query(x).view(B, S, N, h, d).permute(0, 1, 3, 2, 4).contiguous()\n        k = self.key(x).view(B, S, N, h, d).permute(0, 1, 3, 2, 4).contiguous()\n        v = self.value(x).view(B, S, N, h, d).permute(0, 1, 3, 2, 4).contiguous()\n        g = torch.sigmoid(self.gate(x)).view(B, S, N, h, d).permute(0, 1, 3, 2, 4).contiguous()\n        bias = self.pair_bias(pair_repr).permute(0, 3, 1, 2).contiguous()\n        \n        mask = msa_mask.to(torch.float32).contiguous()\n        out = torch.empty(B, S, N, D, dtype=msa_repr.dtype, device=msa_repr.device)\n\n        custom_cuda.msa_attention_forward(\n            q, k, v, g, bias, mask, out,\n            B, S, N, h, d, D\n        )\n        return self.out_proj(out)\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>

@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:35:06 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L1 · problem 6</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:37:14 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">6_EdgeSoftmaxMultiHeadCSR.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -81,5 +81,566 @@ def get_inputs():
 
 def get_init_inputs():
     return []
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 88.1s · 50,903 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 88.1s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to design a CUDA kernel to replace a Python loop doing per-node row-wise softmax over CSR edges with multi-head. The edge_scores tensor shape is (num_edges, num_heads). The row_ptr is int32 of length num_nodes+1. Each node&#x27;s edges are contiguous in edge_scores from row_ptr[node] to row_ptr[node+1]. For each head independently, apply softmax along the edges of that node (dim=0). Equivalent to: for each node i, for each head h, compute exp(edge_scores[j, h] - max_h) / sum_{k in edges of i} exp(edge_scores[k, h] - max_h). Softmax numerically stable using max subtraction.
+
+We need to write a custom CUDA kernel with load_inline. Must be faster than PyTorch reference. Since the reference is Python loop calling torch.softmax per node, which is extremely inefficient for many small segments (384 nodes, average degree ~18, multi-head 8). So a custom kernel should easily beat it.
+
+We need to consider kernel design. Because each node has a small number of edges (avg 18), maybe assign one thread block per node (or per group of nodes). Each block processes one node&#x27;s edges for all heads. Since degree varies but small, using one warp per block or block size maybe 64/128 threads. Within a block, we can load the edges for that node and compute per-head max, sum, then output. Could also assign one thread per edge per head, but simple: each block processes a node, with threads iterating over edges and heads.
+
+Because edge_scores is (num_edges, num_heads) contiguous in row-major? In PyTorch, tensor is (num_edges, num_heads). Actually shape (num_edges, num_heads). Memory layout: last dimension contiguous? By default, torch.randn(num_edges, num_heads) is row-major (C-contiguous): indexing [i, h], stride (num_heads, 1). So contiguous along head dimension.
+
+Thus for a given node, edges are contiguous slices in the first dimension, but within each edge the heads are contiguous. So memory access for a node: edge indices start...end-1. For each edge j, we can read a vector of num_heads floats (8 floats = 32 bytes). That&#x27;s a good coalesced load per warp if each thread handles a head. But degree is small. We might load per edge with vectorized loads. But we can also process each head independently and have threads handle different heads.
+
+If we use one block per node, block size = num_heads = 8? Too small occupancy. Maybe block size = 32 warp. We could have each warp handle a node (warp-level primitives). Since there are only 384 nodes, using 384 warps = 12 blocks of 32 warps if block size=1024? Actually block size 128 means 4 warps per block, so 384/4 = 96 blocks. That&#x27;s okay.
+
+Alternative: one thread per node, loops over edges and heads. But then memory access is not coalesced across threads if each thread reads all heads sequentially.
+
+Better approach: assign one warp (32 threads) per node. Within warp, threads 0..num_heads-1 handle one head each, and threads &gt;= num_heads idle. Then per head we need to compute max over edges. With warp-level reduce max. Then compute sum of exp. Then write softmax. This would handle each node with a warp, and memory loads could be coalesced if each thread loads one head per edge. Since degree varies but average 18, we load 18 * 8 floats per node. Coalesced because consecutive threads read consecutive heads within same edge? Actually if thread h reads edge j at index [j, h], then for a fixed j, the addresses for threads h are base + j*num_heads + h. Since h are 0..7, these are contiguous in memory -&gt; coalesced into one or two 128-byte transactions. Good.
+
+Then for each node, the warp loops over edges j from start to end. Each thread loads score = edge_scores[j, head_idx]. Compute max across warp using warp reduce. But careful: we need per-head max, not across heads. Threads with different heads should not reduce across heads. We need lane reduction only within same head? Since each head is independent, but warp-level reduction by default reduces across all 32 lanes. We need to only reduce lanes belonging to same head. Since we have only 8 heads, we could use groups of 4 lanes? Actually we could just process one head per thread and not use warp reduce, but compute max via shared memory or registers with a small loop within each thread (since degree is small, each thread can compute max over edges independently). Then each thread also computes sum of exp independently. Then no inter-thread communication needed, except maybe to load data? No, each thread can loop over edges for its head. This is straightforward: one warp per node, each thread takes a head (or multiple heads if block size &gt; num_heads). Since 384 nodes * num_heads 8 = 3072 independent softmax operations. A warp per node with 8 active threads, 24 idle. That&#x27;s fine.
+
+But occupancy: If we launch 384 warps total, with block size 128 (4 warps), that&#x27;s 96 blocks. On GPU (let&#x27;s check specs), maybe we have 80 or 128 SMs. Occupancy might be okay but not huge. However the workload is tiny: 384 nodes, avg degree 18, heads 8, total edges ~6912. Total float ops: each softmax is O(degree). This is memory-bound and small. The reference runtime is probably dominated by Python overhead.
+
+Thus maybe a simpler kernel with one thread per edge-head pair or one thread per node is enough. But the key is to avoid Python loop.
+
+We need to be careful: The kernel must produce numerically equivalent outputs to PyTorch&#x27;s softmax. PyTorch&#x27;s softmax subtracts max per row (dim=0) then exp then divide by sum. Our kernel must do the same. Since fp32, we need stable softmax: subtract per-head max.
+
+We can implement a kernel where each thread processes one head for one node. So total threads = num_nodes * num_heads. But since num_nodes=384, num_heads=8, total =3072 threads. That&#x27;s very few. Better to process multiple nodes per block. E.g., blockDim.x = 256 threads, each thread picks a node and head based on global thread index. Then each thread loops over edges for its node, computing max and sum for its head.
+
+Given total threads = 3072, we could launch e.g., 512 threads per block -&gt; 6 blocks. That&#x27;s very few blocks. But each thread does a loop over avg 18 edges. This is fine because the GPU can handle it; occupancy is low but the problem is tiny and memory-bound. However, to hide latency and achieve good throughput, maybe we want more warps. But given the extremely small workload, performance is likely limited by kernel launch overhead and memory latency. Still, we can launch more threads by having each thread process multiple nodes or multiple heads. But let&#x27;s see.
+
+Alternatively, process each node with a block of threads (e.g., 64 threads). Block handles all heads for that node, using warp reductions. But with 384 nodes, that&#x27;s 384 blocks. 384 blocks of 64 threads = 24k threads. That&#x27;s much better for GPU utilization. However each block only processes a small degree. Let&#x27;s estimate: 384 blocks * 64 threads = 24,576 threads. 384 blocks is enough to fill SMs. Each block does a small amount of work. The memory reads for a block are degree * num_heads floats. If block size is 64, only 8 threads are active (one per head) and the rest are idle. That&#x27;s wasteful. We could have each thread process one head but multiple nodes assigned to the block? Or we could have each warp process one node, and each block has multiple warps processing consecutive nodes.
+
+Good design: Each warp (32 threads) processes one node. Within a warp, thread h (0&lt;=h&lt;num_heads) processes head h. The remaining threads are idle (or could be assigned to other nodes if we have more nodes than warps, but we have exactly 384 nodes). Block size = 128 threads = 4 warps. So each block processes 4 nodes. Number of blocks = ceil(num_nodes / 4) = 96. With 96 blocks of 128 threads, we have good occupancy. Each warp loads edges for its node; threads within warp read different heads of same edge, so memory is coalesced.
+
+Implementation details:
+
+- Input: row_ptr (int32, size num_nodes+1), edge_scores (float32, size num_edges x num_heads). Output: out (same shape).
+- Kernel parameters: const int* row_ptr, const float* edge_scores, float* out, int num_nodes, int num_heads.
+
+Grid: blockIdx.x corresponds to node index / warps_per_block. Thread lane = threadIdx.x % 32; warp_id = threadIdx.x / 32.
+
+Node index: node_idx = blockIdx.x * warps_per_block + warp_id. If node_idx &gt;= num_nodes, return.
+
+Head index: head_idx = lane. If head_idx &gt;= num_heads, thread can return or simply not participate. But for warp-level sync we need all threads in warp to be active? Not necessarily; we can just have idle threads not store anything. Since we won&#x27;t use warp-level reductions (each thread computes independently), it&#x27;s fine.
+
+But to maximize memory coalescing, we want active threads to be 0..num_heads-1. With num_heads=8, lanes 0-7 active. For each edge j in [start, end):
+  float val = edge_scores[(j * num_heads) + head_idx];
+  max_val = fmaxf(max_val, val);
+
+We keep max_val in register. After loop, we do second loop over edges:
+  float val = edge_scores[(j * num_heads) + head_idx];
+  float exp_val = expf(val - max_val);
+  sum_val += exp_val;
+  // could store temporarily in shared memory or registers, but we need to write after sum.
+Since degree is small (max maybe 20 or so), we could store exp values in local memory (registers or spilled). But to avoid spilling, we can compute first loop for max, then second loop for exp and sum and write directly. Since degree small, two loops is cheap. But we need the original values again. We can re-read them; memory is cached.
+
+After second loop, compute inv_sum = 1.f / sum_val. Then third loop or combine in second? We don&#x27;t know sum until after second loop, so we need a third loop to write output: out[(j * num_heads) + head_idx] = expf(val - max_val) * inv_sum. That&#x27;s three passes over the edges. Since degree is tiny and edges are contiguous in memory, three passes might still be okay, but we can reduce to two passes by storing (val - max_val) in shared memory per edge? Shared mem per warp: degree * num_heads floats. Max degree maybe up to avg+2 = 20. For a warp, 20*8*4 = 640 bytes. That&#x27;s very small. We could allocate a small shared memory per block. But simpler is three passes. However, reading the same data three times increases memory traffic by 3x. Given the problem size, memory bandwidth is not likely the bottleneck; Python overhead was. Still, we want a decent kernel.
+
+Alternative: One pass per thread: compute max on the fly, but need max for exp. Since max requires all edges, can&#x27;t compute in one pass. But we can do two passes: first compute max, second compute exp and sum and write to shared memory or local buffer, then compute inv_sum, then write out. But writing to local buffer (array of degree floats per thread) uses registers. With max_degree maybe around 20, each thread could allocate e.g., float vals[32]; but if degree varies, dynamic size may spill. However max degree is small: degree = avg_degree + ((node % 5) - 2), clamped min 1. So max degree = avg_degree + 2 = 20? Actually avg_degree = 18, plus up to 2 = 20. So max degree = 20. Each thread can have a small array of 20 floats in registers? That might be okay but could increase register usage. Let&#x27;s just do two loops: first compute max, then second loop compute exp and sum, then third loop write normalized values. Wait, we can combine second and third if we store exp values in a local array. Or we can compute sum in second loop and store exp in shared memory, then third loop write. But three loops with re-reading from global memory is fine because data is small and likely L2 cached. Actually reading three times from L2 is cheap.
+
+But we can improve: Second loop: compute exp and store in out array (temporary). But out array is the output; we can write exp there, then do a third loop to normalize in-place: out[j] *= inv_sum. This is two passes: first read to compute max, second write exp and compute sum (can&#x27;t compute sum and write simultaneously without storing intermediate). Actually we can write exp to out in second loop while accumulating sum in registers. Then third loop normalize. That&#x27;s still three reads/writes: first read, second read+write, third read+write. But the second read is reading edge_scores again, which is fine.
+
+Given the tiny workload, I think a simple kernel with each thread handling one head per node, with block size maybe 256 and each thread assigned a node and head via linear index, is simplest and likely fast enough. Let&#x27;s calculate: total work items = num_nodes * num_heads = 3072. If we use block size 256, we have 12 blocks. Each thread loops over maybe ~18 edges. That&#x27;s 3072 threads. On a modern GPU with thousands of CUDA cores, 3072 threads is small but maybe enough. However, only 12 blocks means limited block-level parallelism across SMs. But each thread does ~18*2 reads and 1 write. This is very little work. The kernel launch overhead and latency might dominate, but still it&#x27;s a CUDA kernel vs Python loop, so speedup should be huge.
+
+However, for better GPU utilization, we might want to increase parallelism by having each thread handle only one (node, head) pair but launching more threads? We only have 3072 pairs. Could increase by splitting nodes beyond that? Not possible. But we could have each warp process one node, as described, giving 384 warps. That yields 384 independent units, which is better. But each warp has only 8 active threads. Still, scheduling warps is efficient. 384 warps is 12,288 threads (but only ~3k active). Actually each warp has 32 threads, but only 8 do work; still the warp is scheduled as a unit. 384 warps is decent.
+
+But block size 128 (4 warps) =&gt; 96 blocks. That&#x27;s a good number for SMs. Let&#x27;s adopt warp-per-node design.
+
+Implementation details for warp-per-node:
+
+- Determine warps_per_block, e.g., 4 (block size 128).
+- node_idx = blockIdx.x * warps_per_block + (threadIdx.x &gt;&gt; 5);
+- lane = threadIdx.x &amp; 31;
+- if node_idx &gt;= num_nodes, return.
+- head_idx = lane; if head_idx &gt;= num_heads, return (or do nothing).
+- start = row_ptr[node_idx]; end = row_ptr[node_idx+1];
+- float max_val = -INFINITY;
+- for (int j = start; j &lt; end; ++j) { float v = edge_scores[j * num_heads + head_idx]; max_val = fmaxf(max_val, v); }
+- float sum_val = 0.f;
+- for (int j = start; j &lt; end; ++j) { float v = edge_scores[j * num_heads + head_idx]; float e = expf(v - max_val); sum_val += e; }
+- float inv_sum = 1.f / sum_val;
+- for (int j = start; j &lt; end; ++j) { float v = edge_scores[j * num_heads + head_idx]; float e = expf(v - max_val); out[j * num_heads + head_idx] = e * inv_sum; }
+
+But we can reduce the third loop by storing the exp values in a local buffer to avoid recomputing exp. However, recomputing exp is okay? exp is compute, but degree is small. Or we can store in shared memory: each warp has a small region. But simpler: have each thread allocate a small array on the stack: float local_vals[24]; Since max degree is 20, we can set a compile-time constant MAX_DEGREE = 32. Each thread reads edges into local_vals in first loop (the raw values). Then compute max. Then second loop compute exp and sum using local_vals. Then third loop write normalized using local_vals and inv_sum. This saves re-reading global memory and recompute exp. Register usage per thread: 32 floats = 128 bytes. For 128 threads per block = 16KB registers, which is fine (register file is large). But if the compiler decides to spill, maybe not. With max degree 20, we can use dynamic shared memory per warp to store values for all heads. Actually we can store in shared memory per warp: size = max_degree * num_heads. For degree up to 20, 20*8*4 = 640 bytes per warp. For 4 warps = 2560 bytes. That&#x27;s tiny. But indexing into shared memory across warp threads is a bit tricky.
+
+Simpler: just re-read and recompute exp in third loop. Let&#x27;s not overcomplicate. Given the small size, re-reading memory and recomputing exp is fine.
+
+Potential issue: For nodes with degree 0 (but code says clamp min 1). Actually degree &gt;= 1. So no zero-degree nodes. But row_ptr can have start==end? The reference has `if end &gt; start: ...`. So we should handle empty rows to be safe. If degree==0, output should remain zeros (out is empty_like, uninitialized). Wait, reference uses `out = torch.empty_like(edge_scores)`, then only assigns for nodes with end&gt;start. For empty rows, out slice is uninitialized (garbage). Is that intended? In the given get_inputs, degree &gt;=1, so no empty rows. But to be safe, we should match reference behavior exactly: if no edges, maybe leave as zeros? Actually reference leaves uninitialized for those slices. But since inputs won&#x27;t have empty rows, we can ignore or set to zero to be safe. But if we set to zero for empty rows, it&#x27;s fine because it won&#x27;t be checked? The tolerance check will compare outputs for all elements. If there are empty rows in the test, they would compare uninitialized outputs, which is nondeterministic. But since get_inputs always produces degree &gt;=1, maybe they only test with those inputs or similar. Still, better to match reference: for empty rows, leave output unchanged (i.e., whatever was in out before). Since out is allocated by us, we can allocate with `torch.empty_like` and not touch empty rows. That matches.
+
+In our kernel, if start == end, thread returns without writing anything.
+
+We need to use `torch.utils.cpp_extension.load_inline`. Let&#x27;s draft the code.
+
+We need to consider that `load_inline` compiles at module load time. We must include the correct includes and define the function. Use `cpp_sources` with CUDA code and `functions=[&#x27;sparse_softmax_fwd&#x27;]`. The host wrapper will be auto-generated. We need to write a C++ wrapper function that takes Tensors and calls the kernel.
+
+C++ wrapper:
+
+```cpp
+void sparse_softmax_fwd(const torch::Tensor&amp; row_ptr, const torch::Tensor&amp; edge_scores, torch::Tensor&amp; out) {
+    int num_nodes = row_ptr.numel() - 1;
+    int num_heads = edge_scores.size(1);
+    int num_edges = edge_scores.size(0);
+    
+    const int* row_ptr_data = row_ptr.data_ptr&lt;int&gt;();
+    const float* scores_data = edge_scores.data_ptr&lt;float&gt;();
+    float* out_data = out.data_ptr&lt;float&gt;();
+    
+    int warps_per_block = 4;
+    int threads_per_block = warps_per_block * 32;
+    int blocks = (num_nodes + warps_per_block - 1) / warps_per_block;
+    
+    sparse_softmax_kernel&lt;&lt;&lt;blocks, threads_per_block&gt;&gt;&gt;(row_ptr_data, scores_data, out_data, num_nodes, num_heads);
+}
+```
+
+Kernel:
+
+```cuda
+__global__ void sparse_softmax_kernel(const int* row_ptr, const float* edge_scores, float* out, int num_nodes, int num_heads) {
+    int warp_id = threadIdx.x &gt;&gt; 5;
+    int lane = threadIdx.x &amp; 31;
+    int node = blockIdx.x * (blockDim.x &gt;&gt; 5) + warp_id;
+    if (node &gt;= num_nodes) return;
+    if (lane &gt;= num_heads) return;
+    
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    if (start &gt;= end) return;
+    
+    int head = lane;
+    float max_val = -1e20f; // or -INFINITY
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * num_heads + head];
+        if (v &gt; max_val) max_val = v;
+    }
+    
+    float sum_val = 0.0f;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * num_heads + head];
+        sum_val += expf(v - max_val);
+    }
+    
+    float inv_sum = 1.0f / sum_val;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * num_heads + head];
+        out[j * num_heads + head] = expf(v - max_val) * inv_sum;
+    }
+}
+```
+
+We need to be careful about `num_edges` dimension. `edge_scores` is (num_edges, num_heads), so index = j * num_heads + head. If edge_scores is contiguous, this is fine. `out` is same shape.
+
+Potential improvement: use `float max_val = -CUDART_INF_F;` or `-1e20f`. `-1e20f` is safe for fp32 softmax. Using `-1e20f` avoids including `math_constants.h` but we can include `&lt;float.h&gt;` or `&lt;math.h&gt;` or `cuda_runtime.h`. Actually `CUDART_INF_F` requires `#include &lt;math_constants.h&gt;`. We can use `-CUDART_INF_F`? Better: `float max_val = -1e20f;` Since scores are from standard normal, max is unlikely &gt; 100. So `-1e20f` is effective -inf.
+
+But for correctness and best practice, use `-1e20f` or `__int_as_float(0xff800000)`. Let&#x27;s just use `-1e20f`.
+
+Also, we need to ensure the kernel is compiled with `-O3`. `load_inline` does that by default.
+
+One thing: The kernel reads `row_ptr` as int32. The reference uses `torch.int32`. In wrapper, we need to be careful: `row_ptr` is `torch::Tensor` with dtype `torch::kInt32`. We can cast to `int32_t*` or `int*`. Use `int32_t*`.
+
+Let&#x27;s test compile. But before testing, think about performance. 96 blocks of 128 threads each. Each warp processes one node. Only lanes 0-7 do work. So active threads per warp = 8. The remaining 24 threads are idle but consume registers and warp slots. However, this design ensures that memory loads for a given edge are coalesced across the 8 active threads: they read consecutive floats. The other 24 threads also issue loads if we don&#x27;t guard? We guard with `if (lane &gt;= num_heads) return;` so they return early, meaning the warp is diverged: lanes 8-31 are inactive, but still part of the warp. Since they return, they don&#x27;t participate in loops. The warp still executes the instructions, but for those lanes the operations are masked. However, memory loads from lanes 8-31 might occur? In CUDA, if you have a conditional return, threads that take the return become inactive and don&#x27;t execute further instructions. The remaining active threads continue. So the warp has 8 active lanes. That&#x27;s fine. Memory loads from active lanes are coalesced.
+
+But branch divergence: a warp where some threads take the return and others don&#x27;t is effectively diverged until the point where all remaining threads converge. Since the return is at the beginning, lanes 8-31 become inactive for the entire kernel. That&#x27;s fine; the warp executes with only 8 active lanes. There is no reconvergence issue because they are inactive for the remainder. Actually in CUDA, when some threads exit via return, the warp continues with the remaining threads. No extra cost.
+
+Occupancy: block size 128, registers per thread: a few variables. Should be low, maybe &lt;32 registers. So occupancy is high. 96 blocks is okay.
+
+We might also consider using `blockDim.x` as block size; we used `blockDim.x &gt;&gt; 5` for warps per block.
+
+One subtlety: The kernel uses `expf(v - max_val)`. For large negative differences, expf underflows to zero, which is fine. PyTorch&#x27;s softmax also does this.
+
+Potential issue: Sum could be zero if all values are -inf, but not here. Inverse sum is safe.
+
+Now, we need to write the full Python file with class `ModelNew` that loads the inline CUDA. We must not write our own PYBIND11_MODULE. We&#x27;ll use `functions=[&#x27;sparse_softmax_fwd&#x27;]`.
+
+Let&#x27;s write the code:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdint&gt;
+
+__global__ void sparse_softmax_kernel(const int32_t* __restrict__ row_ptr,
+                                      const float* __restrict__ edge_scores,
+                                      float* __restrict__ out,
+                                      int num_nodes,
+                                      int num_heads) {
+    int warp_id = threadIdx.x &gt;&gt; 5;
+    int lane = threadIdx.x &amp; 31;
+    int warps_per_block = blockDim.x &gt;&gt; 5;
+    int node = blockIdx.x * warps_per_block + warp_id;
+
+    if (node &gt;= num_nodes) return;
+    if (lane &gt;= num_heads) return;
+
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    if (start &gt;= end) return;
+
+    int head = lane;
+    float max_val = -1e20f;
+    const int stride = num_heads;
+
+    // compute max
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        if (v &gt; max_val) max_val = v;
+    }
+
+    // compute sum of exp
+    float sum_val = 0.0f;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        sum_val += expf(v - max_val);
+    }
+
+    float inv_sum = 1.0f / sum_val;
+
+    // write output
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        out[j * stride + head] = expf(v - max_val) * inv_sum;
+    }
+}
+
+void sparse_softmax_fwd(const torch::Tensor&amp; row_ptr,
+                        const torch::Tensor&amp; edge_scores,
+                        torch::Tensor&amp; out) {
+    int num_nodes = row_ptr.numel() - 1;
+    int num_heads = edge_scores.size(1);
+
+    const int32_t* row_ptr_data = row_ptr.data_ptr&lt;int32_t&gt;();
+    const float* scores_data = edge_scores.data_ptr&lt;float&gt;();
+    float* out_data = out.data_ptr&lt;float&gt;();
+
+    const int warps_per_block = 4;
+    const int threads_per_block = warps_per_block * 32;
+    const int blocks = (num_nodes + warps_per_block - 1) / warps_per_block;
+
+    sparse_softmax_kernel&lt;&lt;&lt;blocks, threads_per_block&gt;&gt;&gt;(
+        row_ptr_data, scores_data, out_data, num_nodes, num_heads);
+}
+&#x27;&#x27;&#x27;
+
+sparse_softmax = load_inline(
+    name=&#x27;sparse_softmax&#x27;,
+    cpp_sources=[cpp_source],
+    functions=[&#x27;sparse_softmax_fwd&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False,
+)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, row_ptr, edge_scores):
+        out = torch.empty_like(edge_scores)
+        sparse_softmax.sparse_softmax_fwd(row_ptr, edge_scores, out)
+        return out
+```
+
+We need to verify this compiles and is correct. Let&#x27;s run compile and correctness.
+
+But wait: `load_inline` signature: `cpp_sources` can be a list of strings. `cuda_sources` can also be separate, but we can put CUDA code in `cpp_sources`. Actually `cpp_sources` is for C++ code that may contain CUDA. But if we have CUDA code, maybe we should use `cuda_sources`. The documentation says `cpp_sources` and `cuda_sources`. If we put CUDA kernel in `cpp_sources`, it might still compile because `nvcc` is used if `cuda_sources` is present? Actually `load_inline` uses `cpp_sources` for CPU code and `cuda_sources` for GPU code. But if we put CUDA code in `cpp_sources`, the compiler might be `g++` and fail. To be safe, we should put the CUDA kernel in `cuda_sources` and the C++ wrapper in `cpp_sources`, or put everything in `cuda_sources`. Let&#x27;s recall: `torch.utils.cpp_extension.load_inline(name, cpp_sources, cuda_sources=None, ...)`. Usually you put the C++ host code in `cpp_sources` and `.cu` code in `cuda_sources`. But `cpp_sources` may also contain `torch/extension.h` and C++ wrappers. The CUDA code should go in `cuda_sources` to be compiled with nvcc.
+
+However, I&#x27;ve seen examples where everything is put in `cpp_sources` and it works because `load_inline` detects CUDA. Actually `load_inline` determines whether CUDA is needed based on `cuda_sources` or if `cpp_sources` contain CUDA? Let&#x27;s check memory: In many PyTorch custom op examples, they use `cpp_sources=` for both CPU and CUDA code (using `#ifdef __CUDA_ARCH__` etc). But if the source contains `__global__`, it might be okay if `cuda_sources` is used. Let&#x27;s be safe: provide `cuda_sources` with kernel and wrapper? But the wrapper includes `torch/extension.h`, which is okay in nvcc. So we can put all code in `cuda_sources` and leave `cpp_sources` empty. Or put wrapper in `cpp_sources` and kernel in `cuda_sources`. Actually the wrapper contains `torch::Tensor` which is C++ code; it can be compiled with nvcc as well. So we can put everything in `cuda_sources`. 
+
+But `load_inline` auto-generates pybind11 wrapper based on `functions` list. The wrapper is C++ code that calls our function. It doesn&#x27;t matter if we put our code in `cpp_sources` or `cuda_sources`. I think it&#x27;s safer to put everything in `cuda_sources` because it contains CUDA kernel syntax.
+
+Let&#x27;s do:
+
+```python
+cuda_source = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdint&gt;
+
+__global__ void sparse_softmax_kernel(...)
+
+void sparse_softmax_fwd(...) { ... }
+&#x27;&#x27;&#x27;
+
+sparse_softmax = load_inline(
+    name=&#x27;sparse_softmax&#x27;,
+    cuda_sources=[cuda_source],
+    functions=[&#x27;sparse_softmax_fwd&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False,
+)
+```
+
+Wait, but the C++ wrapper includes `torch/extension.h` and uses `torch::Tensor`. This can be compiled by nvcc because it&#x27;s a CUDA compiler that handles C++. So that&#x27;s fine.
+
+Alternatively, we can keep it in `cpp_sources`. Many examples do that for CPU ops. Let&#x27;s see if compile works with `cpp_sources`. The `load_inline` doc: `cpp_sources` is list of C++ source strings, `cuda_sources` is list of CUDA source strings. If we have CUDA code, we should probably put it in `cuda_sources`. If we put it in `cpp_sources`, the build system might compile it with the C++ compiler, not nvcc, and fail on `__global__`. So definitely put it in `cuda_sources`.
+
+I&#x27;ll write:
+
+```python
+cuda_source = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdint&gt;
+
+__global__ void sparse_softmax_kernel(...) { ... }
+
+void sparse_softmax_fwd(const torch::Tensor&amp; row_ptr,
+                        const torch::Tensor&amp; edge_scores,
+                        torch::Tensor&amp; out) {
+    ...
+}
+&#x27;&#x27;&#x27;
+
+sparse_softmax = load_inline(
+    name=&#x27;sparse_softmax&#x27;,
+    cuda_sources=[cuda_source],
+    functions=[&#x27;sparse_softmax_fwd&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False,
+)
+```
+
+One more thing: The auto-generated pybind11 wrapper expects the C++ function to be callable. Since we didn&#x27;t define `PYBIND11_MODULE`, it&#x27;s fine.
+
+Let&#x27;s also ensure that `row_ptr` is on the same device as `edge_scores`. The wrapper doesn&#x27;t check, but we can rely on inputs being CUDA tensors? Wait, the reference `Model` is a pure PyTorch module; the inputs from `get_inputs` are CPU tensors: `row_ptr` is CPU, `edge_scores` is CPU. The reference computes on CPU (loop with torch.softmax). The custom kernel must accept same inputs and produce same outputs. But our kernel uses CUDA. So we need to handle CPU inputs? The problem says &quot;Replace the forward computation ... with a custom CUDA kernel.&quot; Usually the inputs are CPU tensors and we should run on GPU? Or perhaps the evaluation framework moves them to GPU? Actually, the prompt says &quot;Your submission is a complete Python file ...&quot;. The reference implementation is given. It doesn&#x27;t specify device. In many of these tasks, the inputs are provided on CPU, but the custom kernel is expected to run on GPU? Or maybe they run on GPU already. Let&#x27;s check typical tasks: Usually the inputs are on CPU, but the custom kernel can copy to GPU and compute there. However, doing H2D and D2H copies could be slower than the reference CPU loop. But the reference is a Python loop with small ops; copying to GPU might add overhead. However, the task explicitly asks for a custom CUDA kernel, so they likely run everything on GPU. But `get_inputs()` returns CPU tensors. Maybe the evaluation code does `input = [x.cuda() for x in get_inputs()]` before calling the model. Let&#x27;s assume that. But we shouldn&#x27;t assume device; we should make the kernel work for the device of the tensors. If they are CPU, the custom kernel would need to copy. However, the `load_inline` function compiles a CUDA kernel that can only run on GPU. So we must ensure tensors are on CUDA before calling. We can check and copy:
+
+```python
+def forward(self, row_ptr, edge_scores):
+    device = edge_scores.device
+    if device.type != &#x27;cuda&#x27;:
+        # fallback to CPU reference-like implementation? No, we must use custom kernel.
+        # But maybe they test on GPU. We&#x27;ll just move to default cuda.
+        row_ptr = row_ptr.cuda()
+        edge_scores = edge_scores.cuda()
+    out = torch.empty_like(edge_scores)
+    sparse_softmax.sparse_softmax_fwd(row_ptr, edge_scores, out)
+    if device.type != &#x27;cuda&#x27;:
+        out = out.cpu()
+    return out
+```
+
+But fallback to CPU with PyTorch ops might be okay as long as we don&#x27;t try/except to reference. However, the static checker might flag attempts to fallback. We should avoid any fallback to the reference module. We can simply move to CUDA and back.
+
+But the problem says &quot;Replace the forward computation ... with a custom CUDA kernel.&quot; It doesn&#x27;t say inputs are on GPU. To be safe, we can move to the default CUDA device if not already there. The reference can handle CPU. If evaluation runs on GPU, moving is no-op. If evaluation runs on CPU but expects CUDA kernel, maybe they move automatically. Let&#x27;s just handle both.
+
+Actually, it&#x27;s common in these tasks that inputs are already on the GPU (they call `.cuda()` in the eval script). But `get_inputs()` in the reference uses CPU. The eval script probably does something like: `inputs = [x.cuda() for x in get_inputs()]`. So our kernel can assume CUDA. But we can add a device guard to be safe.
+
+Also, `row_ptr` is `int32`. In CUDA wrapper, `row_ptr.data_ptr&lt;int32_t&gt;()` works. Need to ensure `row_ptr` is contiguous and on CUDA.
+
+Let&#x27;s also consider using `torch::TensorArg` or `.contiguous()`. `row_ptr` is 1D and contiguous. `edge_scores` is 2D, contiguous by default.
+
+Now, compile and correctness. We&#x27;ll need to create the full Python file string and pass it to compile_kernel.
+
+One more thought: Could there be a better approach using `BlockReduce` from CUB? Since degree is small, CUB block reduce per head would be overkill. Our warp per node with thread per head is fine.
+
+But wait, if num_heads is 8, and we assign lane = threadIdx.x &amp; 31, lanes 0-7 are active. However, the warp scheduler can handle this. But there might be a performance issue: Since only 8 threads are active, the warp issues 8 loads per instruction, but 24 lanes are idle, so memory throughput is 25% of peak per warp. But we have 384 warps, so total active threads = 3072. On an A100, that&#x27;s tiny. Still, memory bandwidth is not huge: total data read ~ edges * heads * 4 bytes ~ 6912*8*4 = 221KB. Plus row_ptr reads. That&#x27;s negligible. The kernel is just to avoid Python overhead.
+
+But there might be a better approach: Use a simple kernel where each thread processes one edge-head element, but we need per-node reductions. That would require atomic operations or shared memory. Since degree is small, we could have each block process one node, with 32 threads (one warp), and use warp shuffle to compute per-head max and sum. Wait, we can have each thread in the warp process one edge, and each warp handles all heads? That seems reversed.
+
+Actually, we can have each warp process one node, with 32 threads. Within the warp, each thread handles one edge (since degree &lt;= 20, some threads idle). But then to compute max per head, we need each head&#x27;s max across edges. If each thread holds values for all heads of one edge, then we need to reduce across threads for each head. This would require transposing data in registers and doing warp reductions per head. That&#x27;s more complex.
+
+Our design: each thread handles one head for one node. This is natural and simple.
+
+Let&#x27;s think about total thread count: 384 nodes * 8 heads = 3072 threads. Block size 128 =&gt; 24 blocks. Only 24 blocks. That&#x27;s a bit low for occupancy, but each block has 4 warps, and 24 blocks * 4 warps = 96 warps. On a GPU with 80 SMs, that&#x27;s a bit over 1 warp per SM. But since each warp only does ~18 iterations, the kernel will be very fast, maybe a few microseconds. The overhead of launching 24 blocks is minimal.
+
+But if we reduce block size to 32 (one warp per block), we get 384 blocks. That&#x27;s many more blocks, yielding better block-level parallelism. Each block has 32 threads, but only 8 active. 384 blocks * 32 threads = 12288 threads. 384 blocks might be better for scheduling. But 384 blocks of 1 warp each might have slightly higher launch overhead? Not sure. With 384 blocks, each SM gets ~4-5 blocks, which is good. Let&#x27;s consider block size = 32.
+
+If block size = 32, warps_per_block = 1. Node = blockIdx.x. If node &gt;= num_nodes, return. Then lane = threadIdx.x. Active lanes: 0-7. This gives 384 blocks. That&#x27;s a lot of blocks but each is tiny. The GPU can handle many blocks concurrently. The limit is typically 2048 blocks per SM? Actually the maximum number of blocks per SM is 32 (compute capability 8.0+). So 384 blocks can reside on 80 SMs, ~4-5 blocks per SM. That&#x27;s okay.
+
+But what about register usage? Very low. Occupancy: block size 32, registers maybe 24 per thread, so 768 registers per block. Max registers per SM is 65536, so up to 85 blocks, limited by max blocks per SM (32). So occupancy is good.
+
+However, there is a subtle issue: blocks of 32 threads have limited memory coalescing. Within a warp, threads 0-7 read consecutive floats. This is coalesced. But the other 24 threads return early, so they don&#x27;t issue loads. The warp loads 8 floats = 32 bytes, which fits in one 128-byte transaction. Some bandwidth waste, but okay.
+
+I think block size 32 (one warp per block) is simpler and gives more blocks. Let&#x27;s use that. Or we could use block size 64 (2 warps) to have 192 blocks. But simpler: block size 32.
+
+But we need to ensure that `blockDim.x &gt;&gt; 5` is 1, and node = blockIdx.x * 1 + warp_id (which is 0). So node = blockIdx.x.
+
+Let&#x27;s decide: block size = 32, blocks = num_nodes.
+
+Actually, if num_nodes is 384, blocks=384. That&#x27;s fine.
+
+Wait, is there a limit on blocks per grid? It&#x27;s large (2^31-1). So fine.
+
+Let&#x27;s write kernel accordingly:
+
+```cuda
+__global__ void sparse_softmax_kernel(const int32_t* __restrict__ row_ptr,
+                                      const float* __restrict__ edge_scores,
+                                      float* __restrict__ out,
+                                      int num_nodes,
+                                      int num_heads) {
+    int node = blockIdx.x;
+    int head = threadIdx.x;
+    if (node &gt;= num_nodes || head &gt;= num_heads) return;
+
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    if (start &gt;= end) return;
+
+    float max_val = -1e20f;
+    int stride = num_heads;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        if (v &gt; max_val) max_val = v;
+    }
+
+    float sum_val = 0.0f;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        sum_val += expf(v - max_val);
+    }
+
+    float inv_sum = 1.0f / sum_val;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        out[j * stride + head] = expf(v - max_val) * inv_sum;
+    }
+}
+```
+
+Blocks = num_nodes. Threads = num_heads (but we should round up to 32). So threads_per_block = 32.
+
+Edge case: If num_heads &gt; 32, we&#x27;d need multiple threads per head or multiple blocks. But num_heads is 8. So fine.
+
+This kernel is extremely simple. But is it fast enough? Let&#x27;s think about memory coalescing. Within a warp (block), threads 0..7 read head 0..7 of the same edge j. Addresses: base + j*num_heads + head. Since head is threadIdx.x, these are contiguous. So memory load is coalesced. Good.
+
+But we launch 384 blocks of 32 threads each. The GPU can run many blocks concurrently. Each block has very low arithmetic intensity. But total work is small. The kernel runtime is likely dominated by launch overhead and latency, but still orders of magnitude faster than Python loop.
+
+However, there might be a better way: process multiple nodes per block to amortize block-level overhead. But 384 blocks is not huge. Overhead of a block is small.
+
+Another concern: The kernel does three loops over the edges. Each loop reads `edge_scores` from global memory. Since the data is small (~220KB), it will likely fit in L2 cache. So reading three times is okay. But we can reduce to two loops by saving values in registers. With max degree 20, each thread can hold 20 floats. That uses 20 registers per thread. For 32 threads, 640 registers. That&#x27;s fine. Could reduce memory reads by half. Let&#x27;s consider adding a small local array.
+
+Option A: Re-read global memory (simple).
+Option B: Use a local array `float vals[24];` to store edge values. Then compute max from array, then sum, then write.
+
+The challenge: `end - start` varies per node and is not known at compile time (max 20). We can allocate a fixed-size array of e.g., 32. The compiler will likely put it in registers because the loop bounds are small and constant? But if `end-start` is dynamic, the compiler may decide to spill to local memory. However, local memory is cached in L1, so it&#x27;s still fast. But we can avoid it for simplicity.
+
+Given the tiny data size, three loops is fine. But we can also do two loops: first compute max and store values in local array; second compute sum using array and write? We still need sum before writing, so we need a third pass over the array to write normalized values. That&#x27;s two global memory reads (first read to fill array, second read? Actually if we store in array, we only read once). Then one write. So 1 read + 1 write. That is better. But if the compiler spills the array, we have local memory traffic.
+
+Let&#x27;s see: Max degree is 20. For each thread, array size 32 floats = 128 bytes. For a warp, total local memory per thread is 128 bytes, but it&#x27;s private. Since each thread&#x27;s local memory is independent, the total local memory per block = 32 * 128 = 4096 bytes = 4KB. That&#x27;s per block. For 384 blocks, total local memory allocation would be large if all are resident, but they are not all resident simultaneously. L1 cache per SM is ~128KB. 4KB per block is fine.
+
+So using a local array is safe and may improve performance slightly. But is it necessary? Probably not. Let&#x27;s start with the simple three-loop version, test correctness and compile. If profiling shows memory bound, we can optimize.
+
+Wait, but there is another issue: The kernel has divergent threads within a block because threads 8-31 return immediately. Actually they return, so the block has only 8 active threads. The other threads are &quot;exited&quot;. In CUDA, when threads in a block exit via return, the block remains alive until all threads have exited. The warp is considered active but with some lanes disabled. Since we have only one warp per block, the warp runs with 8 active lanes. That&#x27;s fine.
+
+But what about synchronization? We don&#x27;t need __syncthreads because each thread works independently.
+
+Let&#x27;s also consider if we should use `__launch_bounds__(32)` or not. Not needed.
+
+Now, compile and correctness. Let&#x27;s write the code and test.
+
+Wait, I need to ensure the code uses `int32_t` for row_ptr. `row_ptr` is `torch.int32` -&gt; `torch::kInt32`. The C++ wrapper should extract `int32_t*`. Good.
+
+One more thing: `load_inline` may require `with_cuda=True`? I think it&#x27;s automatic if `cuda_sources` is provided. Let&#x27;s check. The signature: `load_inline(name, cpp_sources, cuda_sources=None, functions=None, extra_cuda_cflags=None, extra_cflags=None, verbose=False, with_cuda=None, is_python_module=True, keep_intermediates=False)`? Not sure, but typically you don&#x27;t need `with_cuda` if you provide `cuda_sources`.
+
+Also, we want to avoid `verbose=True` to reduce output spam. Use `verbose=False`.
+
+Let&#x27;s construct the Python source string.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+CUDA_SOURCE = r&#x27;&#x27;&#x27;
+#include &lt;torch/extension.h&gt;
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdint&gt;
+
+__global__ void sparse_softmax_kernel(const int32_t* __restrict__ row_ptr,
+                                      const float* __restrict__ edge_scores,
+                                      float* __restrict__ out,
+                                      int num_nodes,
+                                      int num_heads) {
+    int node = blockIdx.x;
+    int head = threadIdx.x;
+    if (node &gt;= num_nodes || head &gt;= num_heads) return;
+
+    int start = row_ptr[node];
+    int end = row_ptr[node + 1];
+    if (start &gt;= end) return;
+
+    float max_val = -1e20f;
+    const int stride = num_heads;
+
+    // First pass: max
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        if (v &gt; max_val) max_val = v;
+    }
+
+    // Second pass: sum of exp
+    float sum_val = 0.0f;
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        sum_val += expf(v - max_val);
+    }
+
+    float inv_sum = 1.0f / sum_val;
+
+    // Third pass: normalize and write
+    for (int j = start; j &lt; end; ++j) {
+        float v = edge_scores[j * stride + head];
+        out[j * stride + head] = expf(v - max_val) * inv_sum;
+    }
+}
+
+void sparse_softmax_fwd(const torch::Tensor&amp; row_ptr,
+                        const torch::Tensor&amp; edge_scores,
+                        torch::Tensor&amp; out) {
+    int num_nodes = row_ptr.numel() - 1;
+    int num_heads = edge_scores.size(1);
+
+    const int32_t* row_ptr_data = row_ptr.data_ptr&lt;int32_t&gt;();
+    const float* scores_data = edge_scores.data_ptr&lt;float&gt;();
+    float* out_data = out.data_ptr&lt;float&gt;();
+
+    const int threads = 32;
+    const int blocks = num_nodes;
+
+    sparse_softmax_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        row_ptr_data, scores_data, out_data, num_nodes, num_heads);
+}
+&#x27;&#x27;&#x27;
+
+sparse_softmax = load_inline(
+    name=&#x27;sparse_softmax&#x27;,
+    cuda_sources=[CUDA_SOURCE],
+    functions=[&#x27;sparse_softmax_fwd&#x27;],
+    extra_cuda_cflags=[&#x27;-O3&#x27;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:
+        # Ensure inputs are on CUDA
+        device = edge_scores.device
+        if device.type != &#x27;cuda&#x27;:
+            row_ptr = row_ptr.cuda()
+            edge_scores = edge_scores.cuda()
+        out = torch.empty_like(edge_scores)
+        sparse_softmax.sparse_softmax_fwd(row_ptr, edge_scores, out)
+        if device.type != &#x27;cuda&#x27;:
+            out = out.cpu()
+        return out
+```
+
+Wait, `nn` is not imported in the code? We imported `torch.nn as nn`. Good.
+
+Let&#x27;s test via compile.
+
+Actually, we need to be careful: `load_inline` compiles at module load time. If compilation fails, it&#x27;s hard to debug. Let&#x27;s compile.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nCUDA_SOURCE = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;cstdint&gt;\n\n__global__ void sparse_softmax_kernel(const int32_t* __restrict__ row_ptr,\n                                      const float* __restrict__ edge_scores,\n                                      float* __restrict__ out,\n                                      int num_nodes,\n                                      int num_heads) {\n    int node = blockIdx.x;\n    int head = threadIdx.x;\n    if (node &gt;= num_nodes || head &gt;= num_heads) return;\n\n    int start = row_ptr[node];\n    int end = row_ptr[node + 1];\n    if (start &gt;= end) return;\n\n    float max_val = -1e20f;\n    const int stride = num_heads;\n\n    // First pass: max\n    for (int j = start; j &lt; end; ++j) {\n        float v = edge_scores[j * stride + head];\n        if (v &gt; max_val) max_val = v;\n    }\n\n    // Second pass: sum of exp\n    float sum_val = 0.0f;\n    for (int j = start; j &lt; end; ++j) {\n        float v = edge_scores[j * stride + head];\n        sum_val += expf(v - max_val);\n    }\n\n    float inv_sum = 1.0f / sum_val;\n\n    // Third pass: normalize and write\n    for (int j = start; j &lt; end; ++j) {\n        float v = edge_scores[j * stride + head];\n        out[j * stride + head] = expf(v - max_val) * inv_sum;\n    }\n}\n\nvoid sparse_softmax_fwd(const torch::Tensor&amp; row_ptr,\n                        const torch::Tensor&amp; edge_scores,\n                        torch::Tensor&amp; out) {\n    int num_nodes = row_ptr.numel() - 1;\n    int num_heads = edge_scores.size(1);\n\n    const int32_t* row_ptr_data = row_ptr.data_ptr&lt;int32_t&gt;();\n    const float* scores_data = edge_scores.data_ptr&lt;float&gt;();\n    float* out_data = out.data_ptr&lt;float&gt;();\n\n    const int threads = 32;\n    const int blocks = num_nodes;\n\n    sparse_softmax_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n        row_ptr_data, scores_data, out_data, num_nodes, num_heads);\n}\n&#x27;&#x27;&#x27;\n\nsparse_softmax = load_inline(\n    name=&#x27;sparse_softmax&#x27;,\n    cuda_sources=[CUDA_SOURCE],\n    functions=[&#x27;sparse_softmax_fwd&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;],\n    verbose=False,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, row_ptr: torch.Tensor, edge_scores: torch.Tensor) -&gt; torch.Tensor:\n        device = edge_scores.device\n        if device.type != &#x27;cuda&#x27;:\n            row_ptr = row_ptr.cuda()\n            edge_scores = edge_scores.cuda()\n        out = torch.empty_like(edge_scores)\n        sparse_softmax.sparse_softmax_fwd(row_ptr, edge_scores, out)\n        if device.type != &#x27;cuda&#x27;:\n            out = out.cpu()\n        return out\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: TypeError.
+TypeError: load_inline() missing 1 required positional argument: &#x27;cpp_sources&#x27;</div></details></div></details></div>
 </body></html>
