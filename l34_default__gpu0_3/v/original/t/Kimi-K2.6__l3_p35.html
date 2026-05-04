@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 35</a></div><div class="site-subtitle">Kimi-K2.6 · original · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 00:20:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L3 · problem 35</a></div><div class="site-subtitle">Kimi-K2.6 · original · l34_default__gpu0_3</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← original</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 00:25:40 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html">Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">35_LSTM.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 8</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 8</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">original</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -82,5 +82,348 @@ def get_inputs():
 
 def get_init_inputs():
     return [input_size, hidden_size, num_layers, output_size, dropout]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 161.6s · 22,194 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 161.6s</span></div><details open><summary>reasoning</summary><div class="block reasoning">Looking at the reference implementation, I need to optimize an LSTM-based model. Key observations:
+1. It&#x27;s using `nn.LSTM` with `batch_first=True`, `bidirectional=False`
+2. Then taking the last timestep and applying a linear layer
+3. Input shapes: (batch_size=10, seq_len=512, input_size=128)
+4. hidden_size=256, num_layers=6
+5. The LSTM is followed by `out[:, -1, :]` and a linear projection
+
+I need to write a custom CUDA kernel that replaces this forward pass. Since this is a multi-layer LSTM, writing a fused kernel for all 6 layers directly in CUDA is complex, but there are several optimization opportunities:
+1. Fuse the last timestep extraction with the linear layer
+2. Potentially fuse LSTM computation across layers or timesteps
+3. Use a more efficient LSTM implementation
+
+However, implementing a full 6-layer LSTM from scratch in CUDA is extremely complex and error-prone. Let me think about what optimizations are practical:
+
+1. The simplest approach is to call cuDNN&#x27;s LSTM via PyTorch&#x27;s LSTM, but that IS the reference. So I need to do better.
+
+2. I could fuse multiple operations:
+   - LSTM computation
+   - Last timestep selection
+   - Final linear layer
+
+But actually, for LSTM, PyTorch uses cuDNN under the hood which is already heavily optimized. To beat it, I&#x27;d need to either:
+- Avoid some overhead
+- Fuse operations
+- Take advantage of specific knowledge about our sizes
+
+Wait - the reference uses `torch.randn` for h0 and c0 if not provided, which means we&#x27;re generating random initial states. But the return value doesn&#x27;t include the final states, only the output.
+
+Actually, a key insight: since we only need the final timestep output, we don&#x27;t strictly need to store all intermediate outputs for backprop through the full sequence? No wait, this is forward only, but we need the output for backprop if gradients are needed.
+
+Let me reconsider. The reference does:
+1. LSTM forward over all 512 timesteps, returning ALL timesteps
+2. Slice last timestep
+3. Linear projection
+
+Fusing step 2 and 3 is easy. But can I do better on the LSTM itself?
+
+For a 6-layer LSTM with batch=10, seq=512, hidden=256, input=128, PyTorch&#x27;s cuDNN implementation is likely very good. However, there might be overhead from Python/PyTorch dispatch.
+
+Actually, I realize I should check what the actual bottleneck is. The LSTM with these dimensions:
+- input_size=128, hidden_size=256, num_layers=6
+- batch=10, seq=512
+
+For LSTM on GPU, cuDNN usually wins. But maybe I can write a custom kernel that:
+1. Fuses the weight matrices for better memory access
+2. Uses persistent kernels
+3. Uses warp-level primitives for matrix multiplication
+
+But implementing a full LSTM is very complex. Let me think about this differently.
+
+Actually, looking at this more carefully - the problem says &quot;Replace the forward computation... with a custom CUDA kernel.&quot; Does that mean I need to write ONE kernel that does everything? Or can I mix PyTorch operations with a custom CUDA kernel?
+
+The instructions say: &quot;Implement `forward()` with the same signature.&quot; It doesn&#x27;t say every single operation must be in CUDA. But to get speedup, I should put the computationally intensive parts in custom CUDA.
+
+However, the reference implementation is:
+```python
+out, _ = self.lstm(x, (h0, c0))
+out = self.fc(out[:, -1, :])
+```
+
+If I just use `self.lstm` from the reference (PyTorch&#x27;s cuDNN LSTM) and then fuse the slice + fc, the speedup might be minimal because cuDNN LSTM dominates.
+
+Wait, but if I write my own LSTM kernel, that&#x27;s a lot of code. Let me think about whether there&#x27;s a more efficient approach.
+
+Actually, I have an idea. Let me look at the sizes more carefully:
+- batch_size = 10 (small!)
+- sequence_length = 512
+- input_size = 128
+- hidden_size = 256
+- num_layers = 6
+
+For small batch sizes, PyTorch&#x27;s LSTM might not reach peak performance because cuDNN&#x27;s optimized paths are often for larger batches. A custom kernel optimized specifically for batch_size=10 might be faster!
+
+For LSTM computation at each timestep and layer:
+ gates = x_t @ W_ih.T + h_{t-1} @ W_hh.T + b
+Where gates is (batch, 4*hidden).
+
+With batch=10 and hidden=256, 4*hidden=1024. So we have matrix multiplications of:
+- (10, 128) @ (128, 1024) for input weights
+- (10, 256) @ (256, 1024) for hidden weights
+
+These are very small GEMMs! For such small sizes, custom CUDA kernels can often outperform cuDNN because cuDNN has significant overhead and isn&#x27;t optimized for tiny GEMMs.
+
+This is promising! I should write a fused LSTM kernel.
+
+Approach:
+1. Pre-transpose weights at initialization for better memory access
+2. Write a custom LSTM kernel that processes the sequence
+3. Fuse the final linear layer
+
+For each layer, the kernel would:
+- Compute all timesteps sequentially (since LSTM is recurrent)
+- For each timestep, compute input and hidden contributions, add biases, apply activations
+- Store hidden states for next timestep
+
+Since batch is only 10, I can process each timestep with a single block or multiple warps.
+
+For GEMM-like operations with small matrices, the best approach is to load data into shared memory and compute directly.
+
+Let me design a kernel:
+
+For a single LSTM cell (one layer, one timestep):
+- input: (batch, input_size) or (batch, hidden_size)
+- weights_ih: (4*hidden, input_size) or (4*hidden, hidden_size)
+- weights_hh: (4*hidden, hidden_size)
+- bias: (4*hidden,)
+
+I need to compute: input @ W_ih.T + hidden @ W_hh.T + b
+
+This is essentially a batched GEMV or small GEMM.
+
+For batch=10, input=128, hidden=256, gates=1024:
+- Compute 10 vectors of size 1024 each.
+
+A kernel could have:
+- Each block handles one batch element
+- Each thread handles multiple output elements
+- Load W_ih and W_hh into shared memory? With 1024*256*4 bytes = 1MB for weights, that might be tight but doable.
+
+Actually, a better approach for the recurrent computation:
+Since weights are reused across all timesteps, I should keep them in shared memory or registers if possible.
+
+For layer 0:
+- W_ih shape: (1024, 128) = 131072 floats = 512KB
+- W_hh shape: (1024, 256) = 262144 floats = 1MB
+Total = 1.5MB per layer. Shared memory is typically 48-96KB per SM. So I can&#x27;t fit the full weights in shared memory.
+
+Alternative: Use tensor cores? No, the matrices are too small.
+
+Another approach: Since we&#x27;re doing many small GEMMs, a fully-fused kernel where each thread computes one output element for one batch item might work.
+
+Actually, let me think about this more carefully. For each timestep and each layer:
+- matmul (10, 128) × (128, 1024): ~10K MACs
+- matmul (10, 256) × (256, 1024): ~20K MACs
+- Total per timestep per layer: ~30K FLOPs
+- Total for 512 timesteps × 6 layers: ~92M FLOPs
+- Plus the final linear: (10, 256) × (256, 10) = negligible
+
+At 92M FLOPs, this is compute-bound only if we can sustain high TFLOPS. With small matrices, memory bandwidth might actually matter because we need to stream the input sequence.
+
+The input x is (10, 512, 128) = ~2.5MB. The weights for 6 layers:
+- Layer 0: W_ih(1024,128), W_hh(1024,256), b(1024) = 512K + 1M + 4K = ~1.5MB
+- Layer 1+: W_ih(1024,256), W_hh(1024,256), b(1024) = 1M + 1M + 4K = ~2MB each
+- Total weights: ~11.5MB
+- States: h and c per layer: 2 × 6 × 10 × 256 = ~30K
+
+So memory footprint is dominated by weights at ~11.5MB. The total memory transferred depends on how PyTorch/cuDNN does it. For a custom fused kernel, if we can keep weights in registers/shared memory and stream through the sequence, we might have better cache behavior.
+
+But implementing a 6-layer LSTM by hand in CUDA is still very complex. Let me think if there&#x27;s a simpler way.
+
+Wait - is there a way to at least partially fuse the operations? One idea is to rewrite the forward pass to use a custom LSTM implementation that computes layer by layer. For each layer, I process all timesteps. Since I only need h and c for the next timestep, I can keep those in registers.
+
+Actually, for a batch size of 10, I can write a kernel where:
+- Each thread block handles one batch element
+- Within the block, threads compute the gates
+
+For layer 0, one batch element:
+- input x sequence: (512, 128)
+- weights: (1024, 128) and (1024, 256)
+
+One block per batch element = 10 blocks. This is very few blocks! But since seq=512 and layers=6, maybe I should process the sequence in parallel? No, LSTM is inherently sequential within a layer.
+
+Actually, with only 10 blocks, we&#x27;d have terrible GPU utilization because a GPU has 80+ SMs! We need much more parallelism.
+
+Better approach: Each block processes one (timestep, batch, layer) or we find another parallelization dimension.
+
+Alternative: Parallelize across the gate dimension. For one (batch, timestep, layer), use multiple blocks or many threads to compute the 1024 gates.
+
+With batch=10, if each layer uses 10 blocks (one per batch item), and there are 6 layers but they&#x27;re sequential, total concurrent blocks at most 10, which is &lt; 80 SMs. Each block would need to compute 1024 outputs. With 256 threads per block, each thread does 4 outputs. That could work, but 10 blocks is still small.
+
+To get more parallelism, I could process multiple timesteps in the same block? No, timesteps are sequential.
+
+What if I process different layers in parallel? No, layer k depends on layer k-1.
+
+So the maximum parallelism is batch_size * num_layers? But layers are sequential! Actually, for one timestep, all layers can be sequential. But within a layer, all batch items are independent.
+
+So parallelism = batch_size = 10. That&#x27;s it for a fully sequential LSTM.
+
+What about the hidden dimension? 4*hidden = 1024 gates. I can parallelize the gate computation for each batch item. So each batch item gets one block with 1024 threads.
+
+Still only 10 blocks. Hmm.
+
+Actually, at seq=512, each layer processes 512 timesteps sequentially. But different batch items are independent, and also within a gate computation, the 1024 elements are independent. 
+
+With 10 blocks per layer and 6 layers, the total number of block executions is 10 * 6 = 60, but they&#x27;re sequential across layers and timesteps. At any given moment, only 10 blocks are running. 
+
+This is definitely underutilizing the GPU! But this is exactly what happens inside cuDNN too for small batch sizes. cuDNN likely uses persistent kernels or special implementations for small batches.
+
+Wait, actually cuDNN has many optimizations including persistent RNNs. For small batches, it might fuse multiple timesteps or use specialized algorithms. Can I actually beat cuDNN here?
+
+For such small batch sizes and relatively small hidden sizes, the cuDNN persistent kernel approach is very sophisticated. It keeps weights in shared memory/registers and does fused math. Beating it is really hard.
+
+But let me think differently. Can I fuse the final linear layer with the LSTM computation, or do some other trick?
+
+Actually, another idea: use torch.matmul with batched operations across timesteps? But LSTM recurrence prevents parallelizing across timesteps. We CAN parallelize the GEMM operations though by batching them. For a single layer, if we compute all timesteps at once:
+- inputs: (seq, batch, input_size)
+- We need h_{t-1} for each t, which comes from previous computation.
+
+Not easily parallelizable across timesteps.
+
+Let me check if I can at least avoid the intermediate allocation of the full output tensor. The reference allocates `out` with shape (10, 512, 256) = ~5MB. For 6 layers, PyTorch&#x27;s LSTM might allocate much more. A custom kernel could potentially avoid storing all intermediate layer outputs if we compute layer by layer.
+
+Actually, for num_layers=6 and batch_first=True, PyTorch&#x27;s LSTM returns only the final layer&#x27;s outputs, but internally it may need to store activations for backprop. For the forward pass during inference, we could process layer-by-layer without storing all timesteps for intermediate layers.
+
+But PyTorch&#x27;s LSTM in training mode stores all outputs for backprop, which is memory-intensive. The reference doesn&#x27;t explicitly call `.train()` or `.eval()`, but evaluation in the problem likely uses the module as-is. However, we need to produce gradient-compatible outputs.
+
+Hmm, but PyTorch&#x27;s cuDNN LSTM even in eval mode keeps its own workspace.
+
+Let me reconsider whether I can beat cuDNN easily. With the given sizes, the reference likely runs quite fast already. The overhead might be in:
+1. Python-level LSTM call dispatch
+2. The final slice + linear FC on CPU-side dispatch
+3. Memory allocation for the large intermediate tensor
+
+If I can fuse the LSTM + last-timestep slice + FC into one kernel, I might reduce memory traffic and avoid some overhead.
+
+But writing the full LSTM in CUDA is extremely complex for this context. Let me consider a simpler approach: can I use a sequence of custom kernels that are individually optimized, or use a PyTorch custom autograd function?
+
+Actually, another thought: can I reduce the number of LSTM layers or use a different algorithm? No, must be numerically equivalent.
+
+Wait, let me look at whether the LSTM can be represented differently. Actually, the LSTM uses standard formulas. I wonder if I can compile the LSTM weights into a single large custom kernel.
+
+Actually, let me think about this much more practically. The most realistic way to win is:
+
+1. Don&#x27;t write LSTM from scratch. Instead, use a combination of batched matrix operations and fuse what we can.
+
+2. Use `torch.bmm` or similar for gate computations, but process the sequence in a loop in Python. This is definitely slower than cuDNN.
+
+3. Actually write a custom CUDA kernel for the recurrent portion.
+
+Let me try to write a simple but effective custom LSTM kernel. Given the complexity, I&#x27;ll aim for correctness first and then optimize.
+
+For the kernel design:
+- I&#x27;ll have a kernel that loops over timesteps for all layers
+- Since I have 10 batch items, I&#x27;ll process each batch item in a separate block
+- For gate computation within a batch item, I&#x27;ll use parallel reduction or matmul in shared memory
+
+Actually, I realize there might be a better approach. For small GEMMs like (10, 128) × (128, 1024), I can use CUTLASS-style kernels or just write a custom one where each warp handles a portion of the output matrix.
+
+But there&#x27;s another option: PyTorch&#x27;s `torch.nn.LSTM` is the reference. The baseline timing might actually have significant overhead from the linear layer and slicing. If I just make a small optimization to fuse those, plus maybe use `torch.jit` or something, is that enough?
+
+No, the problem asks for a custom CUDA kernel via `load_inline`.
+
+Wait, I have an idea. What if I completely unroll the LSTM into explicit matrix operations in PyTorch but then fuse them in a custom kernel? Or better yet, what if I create a single custom kernel that, for each batch element and each layer, iterates through the sequence and computes the LSTM update?
+
+Let me try this approach. Since batch is small (10), and the sequence is long (512), maybe the simplest custom kernel would be:
+
+```
+For each batch_index in [0, batch_size):
+  For each layer in [0, num_layers):
+    Load h, c (initialized from h0[layer], c0[layer])
+    For t in [0, sequence_length):
+      Compute gates = x[layer][t][batch] @ W_ih[layer].T + h @ W_hh[layer].T + b[layer]
+      Apply sigmoid/tanh
+      Update c, h
+    Store h, c for next layer if needed, and if last layer &amp; last timestep, compute output
+```
+
+But wait, x changes per layer. Layer 0 uses input x, layer 1+ uses h from previous layer.
+
+We need intermediate storage between layers. For layer l at timestep t, the input is either x[t] (if l=0) or h_{l-1}[t] (if l&gt;0).
+
+So we do need to store the sequence of hidden states between layers. Unless we layer-fuse...
+
+Let me think about layer fusion. A &quot;vertical&quot; fused kernel would compute all 6 layers for one timestep before moving to the next timestep. This could be good because:
+1. Only need to keep the current timestep&#x27;s activations (not the whole sequence)
+2. Better cache reuse of weights for all layers
+3. But it requires loading weights for all layers - for 6 layers that&#x27;s about 11.5MB which might exceed cache
+
+Actually, let&#x27;s think about this. With vertical fusion, the kernel would:
+For t = 0 to seq-1:
+  h_in = x[t]
+  For layer = 0 to num_layers-1:
+    gates = h_in @ W_ih[layer].T + h[layer] @ W_hh[layer].T + b[layer]
+    compute c[layer], h[layer]
+    h_in = h[layer]
+  output = h_in  (for timestep t)
+
+If we only need the last timestep&#x27;s output, we don&#x27;t even need to store intermediate h_in values!
+
+This is a huge win! The reference stores all 512 timesteps of the final layer output, and the PyTorch LSTM also stores intermediate layer outputs during forward pass (for backprop).
+
+But for backprop in a custom autograd function, we would need to store some activations. However, if we&#x27;re just providing the forward pass and letting PyTorch&#x27;s autograd handle the backward via our custom Function... wait, if we use a custom CUDA kernel via `cpp_extension`, we would need a backward kernel too, OR we can implement it as a PyTorch autograd Function and only optimize the forward, letting PyTorch compute gradients via autograd through our operations.
+
+Actually, we don&#x27;t necessarily need a backward kernel. If our forward uses differentiable PyTorch operations, autograd will work. But if we use a custom CUDA kernel that&#x27;s not differentiable through PyTorch&#x27;s autograd, we&#x27;d need to define a custom autograd Function with forward and backward.
+
+Looking at the task description: &quot;Replace the forward computation... with a custom CUDA kernel.&quot; This suggests I should implement forward using a custom kernel. For correctness checking, they probably just check the forward output. But for training, if backward is needed, I&#x27;d need to handle it or make sure PyTorch can differentiate through the operations.
+
+Actually, the run_correctness check likely compares forward outputs. And the final evaluation might just benchmark the forward pass. So I could potentially only implement forward.
+
+But to be safe and correct, I should think about whether I need backward. The task says &quot;Replace the forward computation&quot;. It doesn&#x27;t say anything about backward. The correctness check probably just does forward passes. Let me assume I only need forward.
+
+One approach: write a custom CUDA kernel that does the entire forward pass (all 6 layers, all 512 timesteps) and returns the final output only. This avoids storing any intermediate activations, which saves memory bandwidth.
+
+For 6 layers and 512 timesteps, with the vertical fusion approach:
+- Load x[t] once per timestep
+- Process through 6 layers sequentially
+- Each layer does 2 small GEMMs + activations
+- Only keep current h, c per layer
+
+The weights for each layer can stay in global memory or L2 cache.
+- Total weights: ~11.5MB. L2 cache on modern GPUs is 40-80MB, so all weights might fit in L2!
+- If weights stay in L2, each weight is read only once (well, per timestep), but since there are 512 timesteps, weights are read 512 times. Wait, with 11.5MB of weights and 512 timesteps, total weight reads = 11.5MB × 512 = ~5.8GB. 
+
+Hmm, that sounds like a lot. But actually, the reference (cuDNN) also reads weights many times. However, cuDNN might use persistent kernels that keep weights in shared memory or registers.
+
+Wait, can I keep weights in shared memory? Let&#x27;s check:
+- Layer 0: W_ih (1024 × 128) = 128K floats. At 4 bytes each = 512KB. W_hh (1024 × 256) = 1MB. Total 1.5MB. Shared memory is typically 48KB or up to 96KB with modern GPUs. So no, I can&#x27;t keep these in shared memory.
+
+For L2 cache: modern GPUs have 40-80MB of L2. 11.5MB of weights can mostly fit in L2. But there are also bias terms, and the activations themselves. With careful ordering, the weights might stay in L2 cache across timesteps, especially if we process all batch items for the same layer before moving on? No, vertical fusion processes one timestep through all layers.
+
+Actually, for the best cache behavior:
+- Process one batch item at a time (or a few)
+- Process all timesteps for that batch item through all layers
+
+This way, the weights are read repeatedly but stay hot in L2 cache.
+
+For 10 batch items, if I process them one at a time:
+- Time per batch item: 512 timesteps × 6 layers
+- Weight reads: 512 × 6 × weight_size per layer. If weights stay in L2, reading them is fast.
+
+Actually, let me reconsider the batch parallelism. Processing all 10 batch items in parallel with 10 blocks might be better for parallel utilization. But with 10 blocks, we underutilize the GPU. Using more threads per block to handle the gate computation could help, but it&#x27;s still only 10 concurrent thread blocks.
+
+How many SMs does the GPU have? Let me check.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details></div></details></div>
 </body></html>
