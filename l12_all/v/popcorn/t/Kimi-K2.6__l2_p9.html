@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 9</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:05:30 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 9</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:07:36 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">9_MetropolisHastingsStep.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">0 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">0</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">1 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">1</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -77,5 +77,1224 @@ def get_inputs():
 
 def get_init_inputs():
     return [dim]
-</pre></details></div>
+</pre></details><details class="turn-collapse"><summary><b>turn 0</b> · 1 tool call(s) · 403.2s · 86,494 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 0</span><span>llm latency: 403.2s</span></div><details open><summary>reasoning</summary><div class="block reasoning">We need to produce a custom CUDA kernel for the forward pass of a simple Metropolis-Hastings step. The reference is:
+
+- `proposal = x + step_size * torch.randn_like(x)`
+- `log_alpha = self._log_prob(proposal) - self._log_prob(x)`
+- `log_u = torch.log(torch.rand(x.shape[0], device=x.device).clamp(min=1e-10))`
+- `accepted = log_u &lt; log_alpha`
+- `x_new = torch.where(accepted.unsqueeze(-1), proposal, x)`
+
+We need to accept same constructor args: `dim`, `step_size=0.1`, with tensors `mu` and `sigma` registered as buffers, but they are zero and one in the reference. We can use those in the kernel.
+
+We need to produce a CUDA kernel loaded via `torch.utils.cpp_extension.load_inline`. We must write a Python file defining `ModelNew`. At module load, compile CUDA source.
+
+The kernel will be called per batch, per element. The heavy part is generating random numbers (two per element? Actually one normal per dim for proposal, one uniform per batch for acceptance). The reference uses PyTorch&#x27;s `torch.randn_like` and `torch.rand`. If we generate random numbers within the kernel using curand, we might gain speed by fusing everything into a single kernel and avoiding extra memory allocations (proposal, log_alpha, log_u). Since the kernel can compute everything on the fly.
+
+But generating random numbers per thread with curand has overhead: each thread needs its own state. Usually we maintain a `curandState` per thread. Since there are batch_size=4096 and dim=64, that&#x27;s 262144 total elements. Using a block size of say 256 or 512, and each thread handling one element or one sample? Let&#x27;s think.
+
+Option A: each thread handles one batch element (i.e., one vector of dim). Then we need dim=64 iterations per thread. That&#x27;s 4096 threads total. With block size 256, that&#x27;s 16 blocks. This is small but maybe okay. Each thread would need to generate dim normal random numbers and compute sum of squares for proposal and x. Also generate one uniform random for acceptance. Then write output.
+
+Option B: each thread handles one element (B*dim threads). Then each thread generates one normal, writes proposal, and also participates in a reduction to compute log_alpha per batch. Reduction per batch would require atomic adds or shared memory. Given dim=64, reduction is small but could be done with warp shuffle. However the overhead of launching more threads (262k) is fine. But generating random numbers per thread with curand: we need a state per thread. 262k states is okay (state size ~48 bytes -&gt; ~12.5 MB). That&#x27;s fine. But we need to initialize states (seed) each launch or keep persistent states. Since model is called multiple times (benchmark), we could allocate a state tensor once and reuse it. That&#x27;s good.
+
+But we also need a uniform random per batch. Could be generated by the first thread of each batch, or we can generate it in a separate kernel. But fusing is possible: after reduction, the first thread in each batch generates uniform and decides acceptance, then writes to output. This requires some synchronization within each batch.
+
+Given dim=64, using one warp per batch (32 threads) would be natural. Then we can do warp-level reductions with shfl. 4096 batches -&gt; 4096 warps -&gt; 128 blocks of 32 threads (or 64 blocks of 64 threads = 2 warps per batch). Actually we can assign one warp (32 threads) per batch. Then each thread in the warp handles 2 elements (since dim=64). That&#x27;s efficient. Each warp generates 2 normals per thread (or 64 per batch). Compute squared diffs, sum within warp via shfl. Then thread 0 generates uniform, computes acceptance, and then all threads write proposal or original x based on acceptance flag.
+
+This should be very fast and avoid extra memory.
+
+Alternative: use block per batch with 64 threads (one per dim). Block-level reduction via shared memory. But 64 threads per block leads to 64 blocks total (4096/64 = 64). That&#x27;s low occupancy but maybe okay. However using warps is simpler.
+
+Better: use a 1D grid where each thread block has 128 threads, handling 4 batches (since 128/32 = 4 warps). Each warp handles one batch. So blockDim.x = 128, each block processes 4 batches. Number of blocks = ceil(B / 4) = 1024. That&#x27;s plenty.
+
+Within each warp, each thread processes dim/32 = 2 elements. Since dim=64 is fixed, we can unroll loops.
+
+We need to handle general dim? The reference constructor accepts dim. We can read dim in kernel but assume it&#x27;s not huge. We can write a kernel that works for any dim, each thread processing elements with stride 32.
+
+Let&#x27;s design the kernel signature:
+
+```cpp
+void metropolis_forward(
+    const float* x,
+    float* x_new,
+    float* accepted_float, // maybe bool but use float for compatibility
+    float* rand_states, // actually curandState* but we can use a custom struct?
+    int B,
+    int dim,
+    float step_size,
+    const float* mu,
+    const float* sigma
+);
+```
+
+But we need to pass curand states. `curandState` is a struct of 48 bytes. We need to allocate a `torch::Tensor` of type `torch::kByte` with size `B * dim * sizeof(curandState)` if we do per-element states, but if we do per-warp (batch) states, we need `B * sizeof(curandState)`. Wait: if each warp generates random numbers for all elements in its batch, we only need one state per warp (or per thread if each thread generates its own normals). If each thread generates its own normals, we need a state per thread. But if we use one state per batch (managed by thread 0 of warp), then thread 0 generates all 64 normals and distributes? That would be serial. Better each thread has its own state. So we need `B * dim` states if each thread handles one element. But in our warp-per-batch design, there are 32 threads per batch, each thread generating 2 normals. So we need a state per thread involved. That is `B * 32` states. But we can allocate `B * dim` states (one per element) for simplicity. That&#x27;s 4096*64=262k states. Each state 48 bytes -&gt; ~12.5 MB. That&#x27;s okay. But we can also allocate `B * ((dim+31)/32)*32` or just `B*dim`. Simpler: allocate a tensor of `torch::kUInt8` of shape `[B, dim, sizeof(curandState)]` and index per thread.
+
+However, when we launch with `blockDim.x=128` (4 warps), each warp corresponds to a batch. The threads in the warp will have lane id 0..31. We need to map each thread to specific elements in the batch. We can compute global thread index `tid = blockIdx.x * blockDim.x + threadIdx.x`. Then `batch_id = tid / 32`, `lane = tid % 32`. But blockDim.x may not be a multiple of 32? We set it to 128, which is. So each warp is fully aligned.
+
+However, CUDA doesn&#x27;t guarantee that warps are aligned to threadIdx.x? Actually for 1D blocks, warp boundaries are at `threadIdx.x` multiples of 32 (since threads are linear). So yes.
+
+But we need to ensure we don&#x27;t have partial warps handling different batches. With blockDim=128, each block has exactly 4 warps, each warp handles one batch.
+
+In the kernel, we need to load `mu` and `sigma`. Since they are buffers of shape [dim], but in reference they are zero and one. However, we should use them. We can pass pointers.
+
+The kernel steps per warp:
+
+For each batch `b` handled by this warp:
+
+1. Load `x_ptr = x + b * dim`.
+2. Each thread in warp handles elements `i = lane; i &lt; dim; i += 32`. Since dim=64, each thread will do 2 iterations (i=lane and i=lane+32? Actually lane 0..31, dim=64, so lane handles lane and lane+32). Good.
+3. For each element, load `xi = x_ptr[i]`, `mui = mu[i]`, `sigmai = sigma[i]`.
+4. Generate a normal random number using curand_normal. Use the state for this thread. Which state index? We can index state as `state + (b * dim) + i` if we allocate per element. But each thread accesses two states (one for each element). That&#x27;s fine. But we need to initialize each state. We can do this once by launching an init kernel or by initializing lazily with a seed. Since the kernel is called many times, we can allocate states and initialize them once in ModelNew.__init__.
+
+Wait: `ModelNew` is a nn.Module. We can allocate the state tensor in `__init__` (register_buffer maybe) and run an init kernel.
+
+Better: generate random numbers using the Philox algorithm (`curand_init` with seed and sequence) each time? That is heavy. So persistent states are better.
+
+Let&#x27;s allocate a buffer of `torch.empty(B, dim, 48, dtype=torch.uint8, device=x.device)`? Actually we cannot easily allocate a tensor of `curandState` because PyTorch doesn&#x27;t know that type. We can allocate a byte tensor of size `B * dim * sizeof(curandState)` and cast pointer inside kernel. Or we can allocate a `torch::Tensor` of `torch::kInt64`? Better to allocate byte tensor.
+
+But wait: the random number generation. Another approach: instead of curand, we could use the built-in `torch.randn` and `torch.rand` but fuse the rest. However the reference already does that. The advantage of a custom kernel is mainly fusing the operations and avoiding intermediate tensors. Using PyTorch random ops would require launching extra kernels and storing intermediate tensors, but still might be faster than naive curand? Actually PyTorch&#x27;s `torch.randn` is highly optimized with the Philox generator in TensorIterators. It might be faster than per-thread curand with persistent states due to better throughput. But we can still fuse: we can call `torch.randn_like(x)` inside our `forward`, then call a fused kernel that takes x, proposal, and does the rest (computing log_alpha, log_u, acceptance, x_new). But that still requires an extra allocation for proposal. We could generate `noise` and compute `proposal = x + step_size*noise` on the fly in the fused kernel if we pass `noise`. But generating noise via PyTorch returns a tensor. The fused kernel would read x, noise, compute proposal, compute log alpha, generate uniform per batch, decide acceptance, and write x_new and accepted. That might be fast. But then we still need to generate a uniform per batch, which `torch.rand(B)` can do.
+
+Let&#x27;s evaluate: The reference does:
+1. randn_like(x) -&gt; memory write
+2. proposal = x + step_size * noise -&gt; memory read x, read noise, write proposal
+3. _log_prob(proposal) -&gt; read proposal, mu, sigma, compute, reduce -&gt; write log_alpha
+4. _log_prob(x) -&gt; read x, mu, sigma, compute, reduce -&gt; write log_alpha (in-place subtract)
+5. rand(B) -&gt; memory write
+6. log(rand) -&gt; read, compute, write log_u
+7. compare -&gt; read log_u, log_alpha, write accepted
+8. where -&gt; read accepted, proposal, x, write x_new
+
+That&#x27;s many kernel launches and memory traffic.
+
+Our custom kernel can do everything in one pass, but if we use PyTorch&#x27;s generator for normals, we have a kernel launch for randn and a read of those values in our fused kernel. We can also generate noise inside our kernel, saving one memory write+read.
+
+Using PyTorch&#x27;s `torch.randn_like` probably uses a highly efficient element-wise kernel that writes random numbers. Doing the same in custom CUDA with curand may be competitive or slightly slower depending on implementation. However, since the custom kernel fuses the reduction and acceptance, the overall time could still be better even if rand generation is slightly less efficient.
+
+Alternatively, we can generate random numbers using the `at::Philox` engine from PyTorch&#x27;s random number generator. But that requires accessing the global RNG state, which is tricky from a custom extension (need to include ATen/CPUGeneratorImpl or CUDAGeneratorImpl). Actually there is `at::cuda::CUDAGeneratorImpl` and we can use `at::philox::Philox`? But that&#x27;s internal and may break. Simpler to use `curand`.
+
+Given that the problem size is small (4096*64=262144 floats ~ 1 MB), memory bandwidth might dominate. The reference is memory bound. Fusing into one kernel with no extra memory traffic will likely be much faster.
+
+Let&#x27;s aim for a fused kernel that:
+1. Generates normals on the fly with curand.
+2. Computes log_prob for proposal and x in one pass (accumulating sum).
+3. Generates uniform with curand.
+4. Acceptance and writes.
+
+Memory traffic: read x (1x), read mu, sigma (optional, but if they are zero/one we can skip but we should still load them). Write x_new (1x), write accepted (1x). That&#x27;s minimal.
+
+To generate normals, we need a curandState per thread. Let&#x27;s allocate a `torch::Tensor` of `torch::kUInt8` with shape `[B, dim, sizeof(curandState)]`. Actually each warp has 32 threads. If dim != multiple of 32, we may have some threads idle. But we can still allocate states per thread that participates. Simpler: allocate `B * dim` states, and each thread uses the state corresponding to the element it processes. However, in our warp-per-batch design, thread lane `l` handles elements `l` and `l+32`. It will use two states. That&#x27;s okay: `state_idx = b*dim + l` for the first element, and `b*dim + l + 32` for the second.
+
+Wait, if dim is not 64 but some other number, each thread may handle multiple elements via stride 32. It uses a state per element. That means each thread touches multiple states scattered by stride 32. That&#x27;s fine.
+
+But we need to initialize all states. We can write a simple init kernel or just initialize them in the forward pass lazily. Since `ModelNew` is a module, we can allocate the state buffer in `__init__` and run a `random_seed` init kernel.
+
+However, note that `load_inline` can only define functions and wrap them. If we want a persistent state buffer inside `ModelNew`, we can allocate it in Python:
+
+```python
+state_size = ??? 
+self.register_buffer(&#x27;rng_state&#x27;, torch.empty(batch_size, dim, 48, dtype=torch.uint8, device=&#x27;cuda&#x27;))
+```
+
+But `batch_size` is not known at init time. Wait, `ModelNew.__init__` receives `dim`, same as reference. The forward pass receives `x` of shape `(B, dim)`. B can vary per call? In the benchmark, `get_inputs()` returns a single tensor of shape `[batch_size, dim]`. B is fixed. But the model should handle any B.
+
+We can allocate `rng_state` lazily on first forward call, or allocate with a large capacity. Simpler: allocate on first forward call based on x.shape[0] and x.shape[1]. Or we can allocate one state per batch element per warp thread? Let&#x27;s think: we can avoid persistent state by using a simple hash/seed based RNG. For example, we could implement a lightweight LCG or Philox using global seed, batch id, thread id, and iteration counter. That would be much simpler: no persistent state buffer, just a seed passed each time. Since we don&#x27;t need cryptographic quality, a simple hash-based RNG would suffice if it produces numbers that look random enough. But we need curand? Not necessarily. We can write a simple xoshiro or Philox-like generator. However, quality may be lower, but for a benchmark Gaussian target it&#x27;s fine. But the problem doesn&#x27;t specify RNG quality, just numerical equivalence of the function. The random numbers just need to be drawn from a distribution. The acceptance/reject logic requires normals and uniforms. As long as we sample from the correct distribution, it&#x27;s fine. But we need to be careful: if we use a simple LCG, the distribution might be okay but the period is short. With 262k numbers per call, LCG period is huge (2^32 or 2^64) so it&#x27;s okay.
+
+Actually, we could use the built-in `curandState` but allocate locally in shared memory or registers? No.
+
+Wait, there is an even simpler approach: we can use the `torch.randn` and `torch.rand` functions inside our custom CUDA kernel? Not directly. But we can generate them in Python before calling the kernel and pass them in. But then we have allocations. However, we can use `torch.randn_like(x, out=some_buffer)` if we pre-allocate buffers in `__init__`. We can pre-allocate a buffer for noise. But again B is known. But `ModelNew` doesn&#x27;t know B at init. However we can allocate lazily.
+
+Pre-allocating buffers and using PyTorch&#x27;s native random generation may be faster than curand. Let&#x27;s consider launching 3 kernels:
+1. `torch.randn(B, dim, device=x.device)` -&gt; out_noise
+2. `torch.rand(B, device=x.device)` -&gt; out_unif
+3. Custom fused kernel that reads x, noise, unif, computes everything, writes x_new, accepted.
+
+Kernel 3 does:
+- per batch, per element: proposal = x + step * noise
+- accumulate sum_sq_proposal = sum(((proposal - mu)/sigma)^2)
+- accumulate sum_sq_x = sum(((x - mu)/sigma)^2)
+- compute log_alpha = -0.5*(sum_sq_proposal - sum_sq_x)
+- log_u = log(unif.clamp(min=1e-10))
+- accepted = log_u &lt; log_alpha
+- x_new = accepted ? proposal : x
+
+This fused kernel reads x, noise, mu, sigma, unif; writes x_new, accepted. That&#x27;s 2+1 reads plus 2 reads for mu/sigma (if not cached) and 2 writes. Plus the two random kernels. The random kernels are highly optimized. The fused kernel is bandwidth bound.
+
+But total memory traffic: random kernels write noise (B*dim) and unif (B). That&#x27;s extra memory bandwidth. Our custom kernel with curand would avoid those writes and reads. So custom RNG might be better.
+
+However, implementing an efficient custom RNG for normals is non-trivial. But curand provides `curand_normal` which uses Box-Muller or Ziggurat? Actually `curand_normal` uses the Box-Muller method? No, curand uses the Box-Muller for double and the Box-Muller? I think curand_normal uses the ratio method or Box-Muller; it&#x27;s not the fastest but okay.
+
+Given the workload is small, the overhead of kernel launches might matter. A single fused kernel is ideal.
+
+Let&#x27;s evaluate whether we can use `curandState` without a persistent buffer by having each thread create a state from a seed based on global coordinates and perhaps a step counter. For example:
+
+```cpp
+curandState state;
+curand_init(seed, global_tid, 0, &amp;state);
+float r = curand_normal(&amp;state);
+```
+
+`curand_init` is relatively expensive (it does a lot of scrambling). If we call it for every thread in every forward pass, it will be slow. Better to have persistent state.
+
+Alternative: use a lightweight PRNG that can be seeded quickly per thread per launch. For example, a simple `Philox4_32_10` from cuRAND? Actually `curandStatePhilox4_32_10_t` is smaller and initialization is cheap? No, `curand_init` for Philox is also not trivial. But we could use `curandStateXORWOW` which is the default and 48 bytes.
+
+Maybe we can maintain a persistent state buffer allocated lazily. Since B is 4096 and dim 64, states buffer is 12.5 MB. That&#x27;s okay. We can allocate it as a `torch::Tensor` of `torch::kUInt8`. In `ModelNew.__init__`, we can&#x27;t know B, but we can allocate on first forward based on B.
+
+But we can also allocate a state buffer large enough for max expected B (e.g., 4096) and reuse. Actually B is fixed at 4096 in the benchmark. We can allocate in `__init__` if we know B? The `get_init_inputs()` returns `[dim]`, so `ModelNew` is instantiated with only `dim`. So B is not known. We can allocate a placeholder and resize in `forward`.
+
+Simplify: use `torch.randn_like` and `torch.rand` in Python, then a custom kernel that fuses the math. This avoids persistent RNG state and is easier to implement correctly. Let&#x27;s see if that will be fast enough.
+
+Reference runtime: let&#x27;s estimate. The reference does:
+- randn_like: 262k floats.
+- add + mul: 262k floats.
+- _log_prob(proposal): 262k reads, subtract, div, square, sum -&gt; writes B floats.
+- _log_prob(x): same.
+- rand: B floats.
+- log + clamp: B.
+- compare: B.
+- where: B*dim.
+
+There are about 8 kernel launches. Memory traffic: reads/writes of x, proposal, noise, log_alpha, log_u, accepted, x_new. Let&#x27;s compute total bytes:
+
+Assume float32 (4 bytes).
+
+- randn_like: writes noise = 1 MB.
+- proposal = x + 0.1*noise: reads x (1 MB), reads noise (1 MB), writes proposal (1 MB) = 3 MB.
+- log_prob(proposal): reads proposal (1 MB), reads mu (256 B), reads sigma (256 B), writes log_alpha (16 KB) = ~1 MB.
+- log_prob(x): reads x (1 MB), reads mu, sigma, reads/writes log_alpha (in-place subtract? Actually it&#x27;s computed separately then subtracted. Reference does `self._log_prob(proposal) - self._log_prob(x)`; PyTorch likely computes two temporaries and subtracts. So it reads/writes ~2 MB + writes temp? Actually `_log_prob` returns a tensor of shape [B]. So two kernel launches each writing [B] floats. Then subtraction kernel reads both and writes log_alpha. That&#x27;s extra.
+- rand: writes unif (16 KB).
+- clamp + log: reads unif, writes log_u (16 KB).
+- compare: reads log_u, reads log_alpha, writes accepted (4 KB? bool is 1 byte but maybe bool).
+- where: reads accepted (broadcast), reads proposal, reads x, writes x_new (1 MB).
+
+Total memory traffic maybe ~10-15 MB. On a GPU with 900 GB/s bandwidth, that&#x27;s ~0.015 ms. But kernel launch overhead and thread sync overhead will dominate.
+
+Our custom kernel with pre-generated noise would combine steps into one kernel, reducing launch overhead. If we launch 3 kernels (randn, rand, fused), the fused kernel would have memory traffic: read x (1 MB), read noise (1 MB), read unif (16 KB), read mu/sigma (small), write x_new (1 MB), write accepted (4 KB). ~3 MB. randn writes 1 MB, rand writes 16 KB. Total ~4 MB. That&#x27;s much less traffic and fewer launches. This could be &gt;2x faster.
+
+But can we fuse further by generating random numbers in the kernel? That would eliminate two kernel launches and two memory passes. It might be even faster.
+
+However, generating random numbers with curand inside the kernel requires persistent state. We can implement persistent state as a buffer allocated on first call. Let&#x27;s do that. We can allocate a buffer of `torch.uint8` of shape `(B, dim, state_size)` for the normal states and maybe a separate one for uniforms? Actually we can have the first thread in each warp generate the uniform using its state. So we only need `B * dim` states.
+
+Wait, if we use a warp per batch and each thread generates its own normals, then we need `B * dim` states. But `dim` is 64, so that&#x27;s 262k states. We can store them as a byte tensor.
+
+But note: in `forward`, B may vary. We can allocate a state tensor with max(B, prev_B). Or we can allocate exactly for current B and reinitialize on change.
+
+Simplify: In `forward`, if `self.rng_state` is None or shape[0] &lt; B or shape[1] &lt; dim, allocate a new byte tensor of shape `(B, dim, sizeof(curandStateXORWOW))`. Then run an init kernel to seed states. Then run the main kernel.
+
+But `load_inline` only defines functions. We can have two CUDA functions: `init_rng_state` and `metropolis_kernel`. We&#x27;ll bind both via `functions=[&#x27;init_rng_state&#x27;, &#x27;metropolis_forward&#x27;]`.
+
+However, reinitializing RNG states on every forward call if B changes is okay, but if B is constant, we do it only once. We can store a flag.
+
+But wait: the reference `Model` does not have any persistent RNG state; each call generates independent random numbers based on PyTorch&#x27;s global RNG. Our custom kernel&#x27;s RNG states should produce independent sequences between calls. `curand_init` takes `seed`, `sequence`, `offset`. We can set `seed = 1234`, `sequence = global_tid`, and `offset = self.rng_offset` which increments each call. That&#x27;s correct: each call advances the state by the number of random numbers drawn. So we need to maintain an offset. Actually if we use persistent states, we just call `curand_normal(&amp;state)` each time, and the state updates automatically. No need for offset. We just need to initialize once. Great.
+
+So plan:
+- `ModelNew.__init__`: store dim, step_size, mu, sigma. Set `self.rng_state = None`.
+- `ModelNew.forward(x)`:
+  - B, dim = x.shape
+  - If self.rng_state is None or self.rng_state.shape[0] != B or self.rng_state.shape[1] != dim:
+    - Allocate `self.rng_state` as `torch.empty(B, dim, 48, dtype=torch.uint8, device=x.device)` (or maybe `torch.empty(B*dim, sizeof(curandState), dtype=torch.uint8, device=x.device)`)
+    - Call `init_rng_state(self.rng_state, B, dim, seed=1234)` (or use global random seed).
+  - Call `metropolis_forward(x, self.rng_state, self.mu, self.sigma, step_size, x_new, accepted, B, dim)`.
+  - Return x_new, accepted.
+
+Now implement the CUDA kernels.
+
+Let&#x27;s think about `curandState`. The size of `curandStateXORWOW_t` is 48 bytes. However, the exact size may vary with CUDA version. In host code, we can use `sizeof(curandState_t)` which is defined in `curand_kernel.h`. But in Python we need to know the size to allocate the byte tensor. We can just hardcode 48 (as it is standard). Or we can compute it via another inline function call. Or we can allocate as a float tensor? Actually `sizeof(curandState_t)` is 48. We&#x27;ll use 48.
+
+Alternatively, we can use `curandStatePhilox4_32_10_t` which is 64 bytes? Not sure. Let&#x27;s stick with `curandState_t`, size 48. We can verify with a static assert in CUDA code, but for Python allocation we need to know. Hardcode 48 and add a comment. If static_assert fails, compile will error. 48 is correct for XORWOW on all supported CUDA versions.
+
+Actually, to be safe, we can allocate the state buffer inside the kernel using dynamic shared memory? No, it needs to persist across calls.
+
+Another approach: we can avoid persistent states by using a simple counter-based RNG that derives its state from an integer sequence number. For example, the Threefry or Philox algorithm used in `torch.rand`. But implementing a proper float conversion and Box-Muller for normal distribution in a few lines is possible but adds complexity.
+
+Given the time, I&#x27;ll implement persistent `curandState_t`. Let&#x27;s write the init kernel:
+
+```cpp
+__global__ void init_rng_state_kernel(curandState_t* state, int B, int dim, unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * dim;
+    if (idx &lt; total) {
+        curand_init(seed, idx, 0, &amp;state[idx]);
+    }
+}
+```
+
+But wait: if we want `curandState_t` to be stored in a `uint8_t` buffer, we need to cast:
+
+```cpp
+curandState_t* state = reinterpret_cast&lt;curandState_t*&gt;(state_bytes);
+```
+
+We need `state_bytes` as `unsigned char*` or `uint8_t*`.
+
+Now the main kernel.
+
+Given dim=64, B=4096.
+
+Kernel design: block size 128, grid = ceil(B * 32 / 128) ??? Wait, if we assign one warp per batch, total threads = B * 32 = 131072. Block size 128, grid = 1024. That works.
+
+But what if dim is not 64? We want the kernel to be general. Each warp handles one batch. Threads in warp iterate over elements with stride 32.
+
+So:
+```cpp
+__global__ void metropolis_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ x_new,
+    bool* __restrict__ accepted,
+    const float* __restrict__ mu,
+    const float* __restrict__ sigma,
+    float step_size,
+    int B,
+    int dim,
+    unsigned char* __restrict__ rng_state_bytes
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid &gt;&gt; 5; // divide by 32
+    int lane = tid &amp; 31;
+    if (warp_id &gt;= B) return;
+
+    int b = warp_id;
+    const float* x_b = x + b * dim;
+    float* x_new_b = x_new + b * dim;
+
+    curandState_t* rng_states = reinterpret_cast&lt;curandState_t*&gt;(rng_state_bytes);
+    // each thread uses state corresponding to its global thread id? 
+    // But we allocated B*dim states. If we use tid as index, but there are B*32 threads, we need B*32 states, not B*dim.
+    // Hmm.
+}
+```
+
+If we allocate `B * dim` states, and there are `B * 32` threads, we cannot index by `tid` because `B*32` may be less than `B*dim` (if dim &gt; 32) or more (if dim &lt; 32). In our case dim=64 &gt; 32. So we can allocate `B * dim` states, but each thread uses two states: for elements `lane` and `lane+32`, etc. The state index can be `b * dim + lane + k*32`. That works as long as we allocate `B*dim` states. So inside the loop:
+
+```cpp
+for (int i = lane; i &lt; dim; i += 32) {
+    curandState_t local_state = rng_states[b * dim + i]; // copy state to local register?
+    // generate normal
+    float noise = curand_normal(&amp;local_state);
+    // then write back state
+    rng_states[b * dim + i] = local_state;
+}
+```
+
+But copying the state to local register (48 bytes) per element might be expensive. Instead, we can keep the state in local memory (which might spill to local memory anyway). But since each thread processes 2 elements, it&#x27;s okay.
+
+Wait, copying 48 bytes per element for 2 elements = 96 bytes per thread. That&#x27;s okay.
+
+But we can also keep a pointer to the state and update it in place:
+
+```cpp
+curandState_t* my_state = &amp;rng_states[b * dim + i];
+float noise = curand_normal(my_state);
+```
+
+That&#x27;s better: just pass pointer.
+
+But `curandState_t` is not trivially copyable? It is. But using pointer avoids a copy.
+
+So code:
+
+```cpp
+curandState_t* state_ptr = reinterpret_cast&lt;curandState_t*&gt;(rng_state_bytes);
+for (int i = lane; i &lt; dim; i += 32) {
+    curandState_t* s = state_ptr + b * dim + i;
+    float noise = curand_normal(s);
+    float xi = x_b[i];
+    float mui = mu[i];
+    float sigmai = sigma[i];
+    float prop = xi + step_size * noise;
+    float diff_p = (prop - mui) / sigmai;
+    float diff_x = (xi - mui) / sigmai;
+    sum_p += diff_p * diff_p;
+    sum_x += diff_x * diff_x;
+    // store proposal temporarily? We need it for writing later.
+    // We can compute proposal and store in x_new_b temporarily, or shared memory.
+    // If we write to x_new_b now, we later need to either keep it or overwrite.
+    // We can write proposal to x_new_b, then later if not accepted, overwrite with x.
+    // That requires x_new_b to be written before we know acceptance? But x_new is output only.
+    // We can store proposals in a temporary array per warp in shared memory, or just recompute.
+    // Recomputing is cheap: just x + step*noise. But we&#x27;d need to regenerate noise or store it.
+    // If we store noise or proposal in registers, we don&#x27;t have enough registers for many elements per thread.
+    // But each thread has only 2 elements. We can store the 2 proposals in registers:
+    // float prop0, prop1;
+    // Or we can write proposal to x_new_b, and later if rejected, write x back.
+    // However, we need to synchronize within warp before reading x_new_b? No, each thread writes its own elements.
+    // So we can write proposal to x_new_b[i] now. Then after computing acceptance, if rejected, each thread writes x_b[i] to x_new_b[i].
+    // That works and avoids extra registers/shared memory.
+}
+```
+
+Yes! That&#x27;s great. Each thread writes its proposal to `x_new_b[i]`. Then after warp-level reduction for log_alpha and uniform generation, each thread checks acceptance and overwrites with `x_b[i]` if not accepted. No synchronization needed because each thread only touches its own elements.
+
+But wait: what about the reduction? We need `sum_p` and `sum_x` across the warp. We can do warp shuffle reduction.
+
+Let&#x27;s write:
+
+```cpp
+float sum_p = 0.0f;
+float sum_x = 0.0f;
+
+for (int i = lane; i &lt; dim; i += 32) {
+    curandState_t* s = state_ptr + b * dim + i;
+    float noise = curand_normal(s);
+    float xi = x_b[i];
+    float mui = mu[i];
+    float sigmai = sigma[i];
+    float prop = xi + step_size * noise;
+    float diff_p = (prop - mui) * (1.0f / sigmai); // division
+    float diff_x = (xi - mui) * (1.0f / sigmai);
+    sum_p += diff_p * diff_p;
+    sum_x += diff_x * diff_x;
+    x_new_b[i] = prop;
+}
+
+// Warp reduce sum_p and sum_x
+#pragma unroll
+for (int offset = 16; offset &gt; 0; offset /= 2) {
+    sum_p += __shfl_down_sync(0xffffffff, sum_p, offset);
+    sum_x += __shfl_down_sync(0xffffffff, sum_x, offset);
+}
+
+// Now lane 0 has total sums
+float log_alpha = 0.0f;
+bool acc = false;
+if (lane == 0) {
+    log_alpha = -0.5f * (sum_p - sum_x);
+    // generate uniform
+    // we can generate uniform using the state of the first element of this batch? 
+    // Or a dedicated state. Let&#x27;s use the state of index b*dim (the first element).
+    curandState_t* s0 = state_ptr + b * dim; // or b*dim + lane? lane=0
+    float u = curand_uniform(s0);
+    if (u &lt; 1e-10f) u = 1e-10f;
+    float log_u = logf(u);
+    acc = log_u &lt; log_alpha;
+    accepted[b] = acc;
+}
+
+// Broadcast acc to whole warp
+acc = __shfl_sync(0xffffffff, acc, 0);
+// Or broadcast accepted_flag as int
+int acc_int = __shfl_sync(0xffffffff, acc ? 1 : 0, 0);
+
+if (!acc_int) {
+    for (int i = lane; i &lt; dim; i += 32) {
+        x_new_b[i] = x_b[i];
+    }
+}
+```
+
+But note: we used `state_ptr + b * dim` for uniform generation. That state already advanced because thread 0 used it for the first element&#x27;s normal. So the uniform is drawn from that state&#x27;s sequence, which is fine: it&#x27;s just the next random number. But we need to be careful: if dim &lt; 32, thread 0 might not have processed element `b*dim + 0`? Wait, in our loop `for (int i = lane; i &lt; dim; i += 32)`, lane 0 always processes element 0, 32, 64, ... So for dim &gt;= 1, element 0 is processed by lane 0. So state `b*dim` is advanced. That&#x27;s fine. For dim=0 (not possible), okay.
+
+But what if `mu` and `sigma` are not contiguous? In PyTorch they are contiguous buffers of shape [dim]. So passing pointer is fine.
+
+One issue: `accepted` is `bool*`. In CUDA, `bool` is 1 byte. Writing `accepted[b] = acc;` is fine. But binding to pybind and creating a torch bool tensor: we can use `torch.empty(B, dtype=torch.bool, device=x.device)` and pass its data pointer cast to `bool*`. That should work.
+
+But PyTorch&#x27;s `Tensor::data_ptr&lt;bool&gt;()` works. In our C++ host wrapper, we use `.data_ptr&lt;bool&gt;()`.
+
+Now, the shape of rng_state_bytes: we need `B * dim * sizeof(curandState_t)`. Let&#x27;s define it as `torch::Tensor` of `torch::kUInt8`. In C++ wrapper, we get `.data_ptr&lt;uint8_t&gt;()`.
+
+But PyTorch&#x27;s C++ API: we need to include `&lt;curand_kernel.h&gt;` and basic ATen headers.
+
+Host wrapper:
+
+```cpp
+void metropolis_forward(
+    torch::Tensor x,
+    torch::Tensor rng_state,
+    torch::Tensor mu,
+    torch::Tensor sigma,
+    float step_size,
+    torch::Tensor x_new,
+    torch::Tensor accepted,
+    int B,
+    int dim
+) {
+    // Actually B and dim can be inferred from x.
+    const int threads = 128;
+    int total_threads = B * 32;
+    int blocks = (total_threads + threads - 1) / threads;
+    
+    metropolis_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        x_new.data_ptr&lt;float&gt;(),
+        accepted.data_ptr&lt;bool&gt;(),
+        mu.data_ptr&lt;float&gt;(),
+        sigma.data_ptr&lt;float&gt;(),
+        step_size,
+        B,
+        dim,
+        rng_state.data_ptr&lt;uint8_t&gt;()
+    );
+}
+```
+
+Wait, the host wrapper should infer B and dim from x, but we can just pass them. However, if we include them in signature, they are redundant. We can just infer inside C++.
+
+But the pybind wrapper generated by `load_inline` will bind the function as declared. We can write:
+
+```cpp
+void metropolis_forward(torch::Tensor x, torch::Tensor rng_state, torch::Tensor mu, torch::Tensor sigma, float step_size, torch::Tensor x_new, torch::Tensor accepted) {
+    int B = x.size(0);
+    int dim = x.size(1);
+    const int threads = 128;
+    int total_threads = B * 32;
+    int blocks = (total_threads + threads - 1) / threads;
+    metropolis_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(...);
+}
+```
+
+That&#x27;s fine.
+
+Init kernel wrapper:
+
+```cpp
+void init_rng_state(torch::Tensor rng_state, unsigned long long seed) {
+    int total = rng_state.numel() / sizeof(curandState_t); // number of states
+    const int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    init_rng_state_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        reinterpret_cast&lt;curandState_t*&gt;(rng_state.data_ptr&lt;uint8_t&gt;()),
+        total,
+        seed
+    );
+}
+```
+
+But `init_rng_state_kernel` takes `B` and `dim`, but we can simplify to `total_states`. Let&#x27;s define:
+
+```cpp
+__global__ void init_rng_state_kernel(curandState_t* state, int n, unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        curand_init(seed, idx, 0, &amp;state[idx]);
+    }
+}
+```
+
+And host wrapper:
+
+```cpp
+void init_rng_state(torch::Tensor rng_state, unsigned long long seed) {
+    int n = rng_state.numel() / sizeof(curandState_t);
+    const int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    init_rng_state_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        reinterpret_cast&lt;curandState_t*&gt;(rng_state.data_ptr&lt;uint8_t&gt;()),
+        n,
+        seed
+    );
+}
+```
+
+Wait: `load_inline` requires `cpp_sources` and `cuda_sources`. Actually `load_inline` takes `cpp_sources` (host C++ code) and `cuda_sources` (device CUDA code). Or we can put everything in `cuda_sources`? The docs: `cpp_sources` is a string containing C++ source code; `cuda_sources` is a string containing CUDA source code. The CUDA code is compiled with nvcc. We can define kernels in `cuda_sources` and wrappers in `cpp_sources`, or we can put everything in `cpp_sources` if it includes `.cpp` and `.cu` mixed? Actually `load_inline` will compile `cpp_sources` with the C++ compiler and `cuda_sources` with nvcc, then link them. So we should put device code (kernels) in `cuda_sources` and host wrappers in `cpp_sources`. However, we need to include headers in both. And the host wrapper needs to call the kernel, which requires the kernel to be declared. Since they are in separate translation units? Actually `cpp_sources` and `cuda_sources` are compiled and linked together. The kernel declaration must be visible to the host code. We can forward declare the kernel in `cpp_sources` or put the kernel definition in `cpp_sources` with `__global__`? But the C++ compiler can&#x27;t compile `__global__`. So we put the kernel in `cuda_sources` and declare it as `void metropolis_kernel(...)` in `cpp_sources`. However, without `extern &quot;C&quot;` and without mangling issues, a forward declaration of a `__global__` function in C++ is just `void metropolis_kernel(...);`. That&#x27;s fine because nvcc compiles it with C++ linkage.
+
+But we need to include `&lt;torch/extension.h&gt;` in `cpp_sources` for Tensor types, and `&lt;curand_kernel.h&gt;` in `cuda_sources`. The host wrapper also needs to include `&lt;curand.h&gt;`? Actually `curandState_t` is defined in `&lt;curand_kernel.h&gt;`. The host code may need to know `sizeof(curandState_t)` to compute `n`. We can compute `n` as `rng_state.numel() / 48`. To avoid relying on host-side knowledge of the struct size, we can just pass `B` and `dim` to init and compute total states as `B * dim`. In the host wrapper, we can compute total number of states as `rng_state.size(0) * rng_state.size(1)`. We know the byte tensor shape is `[B, dim, 48]`. So `n = rng_state.size(0) * rng_state.size(1)`. That&#x27;s cleaner.
+
+Then in `cuda_sources`, we can define the kernel taking `curandState_t*` (cast from `unsigned char*`). The `cpp_sources` doesn&#x27;t need to know `curandState_t`.
+
+But `cpp_sources` includes `init_rng_state` host wrapper which calls `init_rng_state_kernel&lt;&lt;&lt;...&gt;&gt;&gt;()`. So `cpp_sources` can forward declare `init_rng_state_kernel`. However, we can also define `init_rng_state_kernel` in `cuda_sources` and call it from `cpp_sources` after forward declaration.
+
+Let&#x27;s draft the strings.
+
+`cuda_sources`:
+```cpp
+#include &lt;curand_kernel.h&gt;
+
+__global__ void init_rng_state_kernel(unsigned char* state_bytes, int n, unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        curandState_t* state = reinterpret_cast&lt;curandState_t*&gt;(state_bytes);
+        curand_init(seed, idx, 0, &amp;state[idx]);
+    }
+}
+
+__global__ void metropolis_forward_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ x_new,
+    bool* __restrict__ accepted,
+    const float* __restrict__ mu,
+    const float* __restrict__ sigma,
+    float step_size,
+    int B,
+    int dim,
+    unsigned char* __restrict__ rng_state_bytes
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid &gt;&gt; 5;
+    int lane = tid &amp; 31;
+    if (warp_id &gt;= B) return;
+
+    int b = warp_id;
+    const float* x_b = x + b * dim;
+    float* x_new_b = x_new + b * dim;
+    curandState_t* states = reinterpret_cast&lt;curandState_t*&gt;(rng_state_bytes);
+
+    float sum_p = 0.0f;
+    float sum_x = 0.0f;
+
+    for (int i = lane; i &lt; dim; i += 32) {
+        curandState_t* s = states + b * dim + i;
+        float noise = curand_normal(s);
+        float xi = x_b[i];
+        float mui = mu[i];
+        float sigmai = sigma[i];
+        float prop = xi + step_size * noise;
+        float diff_p = (prop - mui) / sigmai;
+        float diff_x = (xi - mui) / sigmai;
+        sum_p += diff_p * diff_p;
+        sum_x += diff_x * diff_x;
+        x_new_b[i] = prop;
+    }
+
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum_p += __shfl_down_sync(0xffffffff, sum_p, offset);
+        sum_x += __shfl_down_sync(0xffffffff, sum_x, offset);
+    }
+
+    bool acc = false;
+    if (lane == 0) {
+        float log_alpha = -0.5f * (sum_p - sum_x);
+        // Use the first element&#x27;s state for uniform
+        curandState_t* s0 = states + b * dim;
+        float u = curand_uniform(s0);
+        // clamp
+        if (u &lt; 1e-10f) u = 1e-10f;
+        float log_u = logf(u);
+        acc = log_u &lt; log_alpha;
+        accepted[b] = acc;
+    }
+
+    // broadcast acc to all lanes in warp
+    int acc_int = __shfl_sync(0xffffffff, acc ? 1 : 0, 0);
+    if (!acc_int) {
+        for (int i = lane; i &lt; dim; i += 32) {
+            x_new_b[i] = x_b[i];
+        }
+    }
+}
+```
+
+`cpp_sources`:
+```cpp
+#include &lt;torch/extension.h&gt;
+
+// Forward declarations
+void init_rng_state_kernel(unsigned char* state_bytes, int n, unsigned long long seed);
+void metropolis_forward_kernel(const float* x, float* x_new, bool* accepted,
+                               const float* mu, const float* sigma, float step_size,
+                               int B, int dim, unsigned char* rng_state_bytes);
+
+void init_rng_state(torch::Tensor rng_state, unsigned long long seed) {
+    // rng_state is uint8 tensor of shape [B, dim, 48]
+    int n = rng_state.size(0) * rng_state.size(1);
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    init_rng_state_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        rng_state.data_ptr&lt;unsigned char&gt;(),
+        n,
+        seed
+    );
+}
+
+void metropolis_forward(torch::Tensor x, torch::Tensor rng_state,
+                        torch::Tensor mu, torch::Tensor sigma,
+                        float step_size,
+                        torch::Tensor x_new, torch::Tensor accepted) {
+    int B = x.size(0);
+    int dim = x.size(1);
+    const int threads = 128;
+    int total_threads = B * 32;
+    int blocks = (total_threads + threads - 1) / threads;
+    metropolis_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        x_new.data_ptr&lt;float&gt;(),
+        accepted.data_ptr&lt;bool&gt;(),
+        mu.data_ptr&lt;float&gt;(),
+        sigma.data_ptr&lt;float&gt;(),
+        step_size,
+        B,
+        dim,
+        rng_state.data_ptr&lt;unsigned char&gt;()
+    );
+}
+```
+
+Wait: in `cpp_sources`, we need to forward declare `init_rng_state_kernel` and `metropolis_forward_kernel`. Since they are compiled by nvcc in `cuda_sources`, and have C++ linkage, a simple `void kernel(...);` in `cpp_sources` should link. However, `__global__` functions have special calling conventions. But calling them from host code with `&lt;&lt;&lt;&gt;&gt;&gt;` is fine. The forward declaration in C++ just needs to be `void init_rng_state_kernel(...);`. NVCC treats it as a host function for the purpose of the host side. Actually a `__global__` function can be forward declared without `__global__` in a `.cpp` file, and the linker resolves it. Yes, that&#x27;s standard.
+
+One issue: `unsigned char` vs `uint8_t`. In `cpp_sources`, `torch::Tensor::data_ptr&lt;unsigned char&gt;()` is fine because `torch::kUInt8` maps to `unsigned char` (actually `uint8_t`). In CUDA, we use `unsigned char*`.
+
+But `rng_state` is a `torch::Tensor` of `torch::kUInt8`. We need to create it in Python as `torch.empty(B, dim, 48, dtype=torch.uint8, device=x.device)`.
+
+Wait, but `load_inline` may not support C++ code that uses `.data_ptr&lt;bool&gt;()`. Actually bool tensors in PyTorch have type `torch::kBool`, and `data_ptr&lt;bool&gt;()` works. But note: `bool` in C++ is 1 byte, same as PyTorch bool. So it&#x27;s fine.
+
+Pybind11 bindings: `load_inline` will wrap `init_rng_state` and `metropolis_forward` based on `functions=[&#x27;init_rng_state&#x27;, &#x27;metropolis_forward&#x27;]`.
+
+But let&#x27;s think about correctness. The custom kernel uses `curand_normal` which returns a float from normal distribution mean 0 std 1. `curand_uniform` returns (0,1]. Actually `curand_uniform` returns (0,1], I think? Let&#x27;s check: curand_uniform returns (0.0, 1.0], i.e., it can return 1.0 but not 0.0? Actually I recall `curand_uniform` returns (0,1], or maybe [0,1). The CUDA documentation says: `curand_uniform` returns (0.0, 1.0]. It can return values arbitrarily close to 0 but not 0, and can return 1.0. If it cannot return 0, then `clamp(min=1e-10)` is not strictly needed but safe. However, does it ever return exactly 0? The documentation says &quot;uniform float greater than 0.0 and less than or equal to 1.0&quot;. So &gt;0. So `log(u)` is safe. But the reference clamps anyway. To be safe, we can keep the clamp. If we clamp, we match reference. Our code does `if (u &lt; 1e-10f) u = 1e-10f;`. Good.
+
+One subtlety: `curand_normal` draws from the normal distribution using the state. Since we have persistent states, the sequence of normals will be different from PyTorch&#x27;s `torch.randn_like`, which uses the global Philox generator. That&#x27;s fine: the function semantics only require that we propose and accept/reject based on random draws. The random draws themselves don&#x27;t need to match the reference exactly, because the output is stochastic. However, the evaluation does a correctness check against the reference. Wait! The problem says &quot;Produce numerically equivalent outputs at fp32 precision.&quot; But for a stochastic operation, how can they check correctness? They must either fix the seed or compare using the same random numbers. Let&#x27;s read carefully.
+
+The reference implementation:
+
+```python
+proposal = x + self.step_size * torch.randn_like(x)
+...
+log_u = torch.log(torch.rand(x.shape[0], device=x.device).clamp(min=1e-10))
+accepted = log_u &lt; log_alpha
+x_new = torch.where(accepted.unsqueeze(-1), proposal, x)
+```
+
+The evaluation likely runs the reference and our `ModelNew` on the same input, and checks outputs match. But because the outputs depend on random numbers, they must either:
+1. Fix the random seed before each forward call, or
+2. Override `torch.randn_like` and `torch.rand` to produce deterministic numbers, or
+3. Replace randomness with deterministic patterns for testing.
+
+Wait, the problem says &quot;Produce numerically equivalent outputs at fp32 precision.&quot; That implies that for a given input, the output must match. How can that happen if randomness is involved? The correctness harness must be controlling the RNG. It might patch torch&#x27;s RNG to be deterministic, or it might set `torch.manual_seed` before each run. But if we use our own curand RNG, we would produce different random numbers, causing mismatch.
+
+This is crucial. Let&#x27;s re-read the description: &quot;Replace the forward computation of the PyTorch model below with a custom CUDA kernel... Produce numerically equivalent outputs at fp32 precision.&quot;
+
+In many similar problems, the evaluation runs both models with the same input, but does not control internal randomness beyond PyTorch&#x27;s default. However, `torch.randn_like` uses the global CPU/CUDA generator state. If the harness simply calls `forward` on both models sequentially, the first call to `Model` will advance the RNG state. Then when `ModelNew` is called, the RNG state will be further advanced, but since we use our own RNG, the PyTorch RNG state remains where it was after Model. That would mean `Model` and `ModelNew` produce different random numbers, leading to different outputs.
+
+Unless the harness resets the seed or uses a fresh generator for each call. Or maybe they call each model separately with fresh inputs? But they compare outputs directly. They must ensure that the same random numbers are used for both. How could they do that?
+
+Possibility: The harness calls `torch.manual_seed(0)` before each forward pass. Then `Model` and `ModelNew` would both use the same seed, but `ModelNew` uses its own curand states initialized once with a fixed seed. In that case, the normals from `Model` are generated by PyTorch&#x27;s Philox with sequence offset 0 each time (if seed is reset). Our normals would be generated by curand with state that persists across calls, so the sequence would be different (it would continue from where it left off). But if `torch.manual_seed` is reset before each reference call, and our states are persistent, then on the first call we might match if our init seed is the same and we start from offset 0, but on subsequent calls we would diverge.
+
+Therefore, to ensure correctness, we need to use the same random numbers as the reference. That means we should not use our own RNG state. Instead, we must rely on PyTorch&#x27;s random number generation, or replicate it exactly.
+
+Wait, maybe the harness doesn&#x27;t fix the seed per call, but instead calls `forward` once per model with the same input, and checks if outputs match within tolerance? But if they are random, the probability of match is zero. So they must be controlling randomness.
+
+How do they control randomness? A common pattern in these tasks is that the evaluation script might do something like:
+
+```python
+with torch.random.fork_rng():
+    out_ref = model(x)
+with torch.random.fork_rng():
+    out_new = model_new(x)
+```
+
+If they fork the rng, both start from the same state. Then `Model` advances the PyTorch RNG by `B*dim` normals and `B` uniforms. `ModelNew`, if it uses PyTorch&#x27;s RNG (e.g., by calling `torch.randn_like` in Python before the kernel), would also advance it the same amount. Then outputs match. But if `ModelNew` uses its own RNG, the PyTorch RNG is not advanced, but more importantly the random numbers are different.
+
+But if they fork, they expect `ModelNew` to consume the same amount of randomness from the PyTorch generator as the reference. If we don&#x27;t, the next model call would still be fine because each call gets its own fork? But the numbers inside the call would be different. Actually if they fork the same global state into both calls, the PyTorch RNG state is the same at the start of each call. Then inside each call, the model gets random numbers from PyTorch. If `ModelNew` uses its own generator, it doesn&#x27;t use PyTorch&#x27;s, so PyTorch&#x27;s state remains at the start-of-fork position. The outputs would be different because the random numbers are different. So the check would fail.
+
+Therefore, we must use PyTorch&#x27;s random number generator.
+
+Alternatively, maybe they override `torch.randn_like` to return deterministic tensors. For example, they might monkeypatch `torch.randn_like` to ignore the RNG and return a precomputed constant, or to use a deterministic sequence. If they monkeypatch `torch.randn_like`, our custom kernel wouldn&#x27;t call that function, and we&#x27;d use our own RNG, leading to mismatch.
+
+So it&#x27;s safest to use the same PyTorch RNG as the reference. How can we do that from a custom kernel? We can call `at::randn` and `at::rand` from C++? No, those launch kernels, but if we call them from C++ inside our host wrapper, the random tensors would be generated using PyTorch&#x27;s global RNG. That&#x27;s acceptable. Then we can pass them to the fused kernel. But the goal is speed; launching rand kernels from C++ is same as launching from Python.
+
+But we can pre-allocate buffers in `__init__` or lazily, and use `torch.randn_out` and `torch.rand_out` to write into them, then launch our fused kernel. However, if the evaluation script monkeypatches `torch.randn` functions, it might affect both reference and new if we call them.
+
+If we call `torch.randn_like(x)` from Python inside `ModelNew.forward`, the monkeypatch would apply. Then we pass the noise to our C++ kernel. But we still need to handle the uniform per batch. Similarly, `torch.rand(B, device=x.device)`.
+
+So here&#x27;s a plan:
+
+1. In `ModelNew.forward(x)`, generate `noise = torch.randn_like(x)` and `u = torch.rand(x.shape[0], device=x.device)`.
+2. Generate `log_u = torch.log(u.clamp(min=1e-10))` ? Or we can do clamp+log in the fused kernel.
+3. Launch a single fused kernel that computes:
+   - proposal = x + step * noise
+   - log_prob(proposal) and log_prob(x)
+   - log_alpha = log_prob(proposal) - log_prob(x)
+   - accepted = log_u &lt; log_alpha
+   - x_new = accepted ? proposal : x
+
+But wait, if we do the `log_u` in Python, that&#x27;s an extra kernel. We can pass `u` to the kernel and compute log and clamp there.
+
+Actually, we can even pass the `noise` and `u` to the kernel and compute everything in one go. We don&#x27;t need to persist RNG states.
+
+We can also avoid allocating `proposal` and `log_alpha` by fusing the math in the kernel. We still allocate `noise` and `u` (and maybe `log_u`). If we compute `log(u)` in the kernel, we avoid `log_u` allocation.
+
+So `ModelNew.forward(x)` would:
+
+```python
+noise = torch.randn_like(x)
+u = torch.rand(x.shape[0], device=x.device)
+x_new = torch.empty_like(x)
+accepted = torch.empty(x.shape[0], dtype=torch.bool, device=x.device)
+cpp_extension.metropolis_forward(x, noise, u, self.mu, self.sigma, self.step_size, x_new, accepted)
+return x_new, accepted
+```
+
+But generating `noise` and `u` in Python still requires two kernel launches. The fused kernel is one more. Total 3 kernels. That&#x27;s still fewer than the reference&#x27;s ~8 kernels, and less memory traffic.
+
+However, if `torch.randn_like` and `torch.rand` allocate new tensors each time, there is memory overhead but PyTorch&#x27;s caching allocator handles it. Memory traffic for writing noise and u is still there. But the fused kernel reads them and never writes them, so total memory is read x (1MB), read noise (1MB), read u (16KB), read mu/sigma (negligible), write x_new (1MB), write accepted (4KB). Plus writing noise (1MB) and u (16KB). Plus reading u for clamp/log in the kernel (if we pass u). Total ~4MB writes and ~3MB reads. The reference does more.
+
+Can we do better by generating noise and u inside the kernel using PyTorch&#x27;s RNG state? That is possible but complex. There is `at::cuda::CUDAGeneratorImpl` but it&#x27;s internal and may break across versions. However, for PyTorch 2.x, there is a stable way: we can call `at::native::philox::unpack`? No.
+
+Alternatively, we can use `torch::Tensor` created by `at::randn` from C++ inside the host wrapper. That would also use PyTorch&#x27;s RNG and allocate the tensor. But then we still need to pass it to the kernel.
+
+Given that the main performance bottleneck is kernel launch overhead and memory bandwidth, avoiding the extra memory traffic from noise/u might not be critical compared to the overhead of `curand_init` or persistent state management. But if we use persistent `curandState`, we avoid those allocations entirely. But we have the correctness risk.
+
+Let&#x27;s think about how the harness might work. The harness is likely from the &quot;kitten&quot; benchmark suite or similar. In those, the reference model is deterministic or the harness seeds before each call. But more importantly, they often define a `Model` and a `ModelNew`, and then run a forward pass on both with the same input, and compare outputs using `torch.allclose`. For stochastic models, they typically set `torch.manual_seed(seed)` before each forward pass. If they do that, both `Model` and `ModelNew` get the same initial RNG state. But `Model` uses `torch.randn_like` and `torch.rand`, while `ModelNew` also needs to use the same RNG state to produce identical random numbers. If `ModelNew` uses its own `curandState` initialized with a fixed seed, the numbers will be different. So correctness would fail.
+
+But what if they do not set a seed, but they call each model once? Then the reference output is whatever it is; the new model output must match it. If they call reference first, advancing RNG, then new model, which uses its own RNG, the new model&#x27;s numbers won&#x27;t match. Unless they fork.
+
+Therefore, to guarantee correctness, we must use PyTorch&#x27;s RNG. The simplest way is to call `torch.randn_like` and `torch.rand` from Python (or C++) and fuse the rest.
+
+We could also fuse the generation of `noise` and `u` into a single custom kernel that uses the PyTorch RNG state. Is there a public API for that?
+
+In PyTorch C++ API, there is `at::Generator` and `at::cuda::CUDAGeneratorImpl`. We can get the default CUDA generator with `at::cuda::detail::getDefaultCUDAGenerator()`. Then we can use its `philox_seed` and `philox_offset`. However, this is internal and may change.
+
+But there is a more stable trick: we can call `torch.normal` or `torch.rand` inside the host wrapper to allocate the random tensors (using PyTorch&#x27;s RNG), and then pass their data pointers to the fused kernel. The fused kernel then performs the math. This is safe and correct.
+
+Yes, that&#x27;s the way to go.
+
+So our `ModelNew.forward(x)` will:
+
+1. `noise = torch.randn_like(x)`
+2. `u = torch.rand(x.shape[0], device=x.device)`
+3. `x_new = torch.empty_like(x)`
+4. `accepted = torch.empty(x.shape[0], dtype=torch.bool, device=x.device)`
+5. Call `cpp_extension.metropolis_forward(x, noise, u, self.mu, self.sigma, self.step_size, x_new, accepted)`
+
+Inside the CUDA kernel, we compute everything.
+
+But wait: we can also avoid allocating `noise` and `u` if we compute them in the kernel using a cheap deterministic RNG? No, because correctness requires matching PyTorch. We stick with PyTorch RNG.
+
+However, we can reduce memory traffic by not writing `noise` and `u` to separate tensors but generating them inside the kernel by calling another kernel? No, that would still allocate intermediate memory unless we fuse generation and math in a single kernel that uses PyTorch&#x27;s RNG state. Is there a way to do that?
+
+Actually, there is a public function in PyTorch&#x27;s C++ API: `at::Tensor at::randn(IntArrayRef size, TensorOptions options = {});` etc. These return tensors. But we want to generate random numbers directly into shared memory or registers without allocating a tensor. There&#x27;s no stable API for that.
+
+Alternatively, we can create `noise` and `u` as `torch.empty_like(x)` and `torch.empty(B)` and then use a custom kernel to generate random numbers using a simple LCG seeded from PyTorch&#x27;s current seed. But again, unless we replicate PyTorch&#x27;s RNG exactly, we won&#x27;t match.
+
+Given the constraints, the safest approach is to call PyTorch&#x27;s random functions. But is there any chance the harness does not compare exact numbers because they are random? Let&#x27;s re-read: &quot;Outputs must match the reference within tolerance: fp32 uses atol=rtol=1e-4; fp16/bf16 use atol=rtol=1e-2. Do not use try/except fallbacks...&quot; This implies exact numerical comparison. The tolerance is for floating point rounding differences, not for different random samples. So the outputs must be the same numbers.
+
+Conclusion: we must use PyTorch&#x27;s RNG.
+
+So we will generate `noise` and `u` via PyTorch calls.
+
+But we can still fuse all the math into a single kernel, avoiding intermediate allocations for `proposal`, `log_alpha`, `log_u`, `accepted`. That gives a decent speedup.
+
+Let&#x27;s design the fused kernel with inputs: x, noise, u, mu, sigma, step_size. Outputs: x_new, accepted.
+
+Since we pass noise and u, we can compute proposal = x + step*noise. Then accumulate sum_sq for proposal and x. Then compute log_alpha. Then compute log(u_clamped). Then accept. Then write x_new and accepted.
+
+We can also compute log_u in Python to avoid `logf` in the kernel? But logf is cheap. Let&#x27;s keep it in the kernel.
+
+Also note: `torch.log(torch.rand(...).clamp(min=1e-10))` in the reference clamps before log. We can do the same in the kernel.
+
+Kernel design: still warp-per-batch.
+
+```cpp
+__global__ void metropolis_forward_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ noise,
+    const float* __restrict__ u,
+    const float* __restrict__ mu,
+    const float* __restrict__ sigma,
+    float step_size,
+    int B,
+    int dim,
+    float* __restrict__ x_new,
+    bool* __restrict__ accepted
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid &gt;&gt; 5;
+    int lane = tid &amp; 31;
+    if (warp_id &gt;= B) return;
+
+    int b = warp_id;
+    const float* x_b = x + b * dim;
+    const float* noise_b = noise + b * dim;
+    float* x_new_b = x_new + b * dim;
+
+    float sum_p = 0.0f;
+    float sum_x = 0.0f;
+
+    for (int i = lane; i &lt; dim; i += 32) {
+        float xi = x_b[i];
+        float n = noise_b[i];
+        float prop = xi + step_size * n;
+        float mui = mu[i];
+        float sigmai = sigma[i];
+        float diff_p = (prop - mui) / sigmai;
+        float diff_x = (xi - mui) / sigmai;
+        sum_p += diff_p * diff_p;
+        sum_x += diff_x * diff_x;
+        x_new_b[i] = prop;
+    }
+
+    // warp reduce
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum_p += __shfl_down_sync(0xffffffff, sum_p, offset);
+        sum_x += __shfl_down_sync(0xffffffff, sum_x, offset);
+    }
+
+    bool acc = false;
+    if (lane == 0) {
+        float log_alpha = -0.5f * (sum_p - sum_x);
+        float ui = u[b];
+        if (ui &lt; 1e-10f) ui = 1e-10f;
+        float log_u = logf(ui);
+        acc = log_u &lt; log_alpha;
+        accepted[b] = acc;
+    }
+
+    int acc_int = __shfl_sync(0xffffffff, acc ? 1 : 0, 0);
+    if (!acc_int) {
+        for (int i = lane; i &lt; dim; i += 32) {
+            x_new_b[i] = x_b[i];
+        }
+    }
+}
+```
+
+Memory accesses: read x, noise, mu, sigma, u; write x_new, accepted. x_new is written twice (once with proposal, once with x if rejected). But since each thread writes its own elements, no conflict. However, writing x_new and then possibly rewriting it means we use more memory bandwidth. But we can avoid the first write by storing proposal in register and writing conditionally:
+
+```cpp
+float prop = ...;
+// store in register or local array? dim per thread is dim/32.
+// If dim=64, each thread handles 2 elements. We can store them in registers:
+float prop0, prop1;
+```
+
+But conditional writes are fine. The bandwidth of writing x_new twice is 2 MB. Not huge.
+
+Alternatively, we can use a small local array:
+
+```cpp
+float prop[2]; // if dim &lt;= 64 and blockDim=32
+```
+
+But dim is dynamic. However, the benchmark uses dim=64. To keep kernel general, we can either write to x_new twice or use a shared memory scratchpad. Shared memory per warp: 64 floats = 256 bytes. Per block (4 warps) = 1 KB. That&#x27;s tiny. We can allocate shared memory dynamically or fixed.
+
+Let&#x27;s use shared memory: each warp has a 64-float buffer (or `dim` floats). But `dim` is not known at compile time. We can allocate shared memory per block of size `blockDim.x / 32 * dim` floats. For blockDim=128 and dim=64, that&#x27;s 4*64=256 floats = 1 KB. That&#x27;s fine.
+
+But we can also just write to x_new twice. The overhead is minimal.
+
+Actually, a better approach: after computing acceptance, each thread writes `acc ? prop : x`. That&#x27;s one write per element. We just need to keep `prop` in register until then.
+
+Since each thread handles up to `ceil(dim/32)` elements, we can unroll the loop and store proposals in registers if the number is small. But `dim` can be arbitrary. We can do:
+
+```cpp
+for (int i = lane; i &lt; dim; i += 32) {
+    float xi = x_b[i];
+    float n = noise_b[i];
+    float prop = xi + step_size * n;
+    // accumulate
+    ...
+    // we know acceptance after reduction, but reduction is after loop.
+    // so we need to keep prop. If dim is large, we can&#x27;t keep all in registers.
+    // But we can write prop to x_new_b[i] now, and if rejected, overwrite later.
+}
+```
+
+Overwriting is simpler and uses fewer registers. Let&#x27;s stick with it.
+
+We also need to be careful about reading `mu` and `sigma` from global memory. They are of size dim. If we use `__restrict__`, compiler can optimize. They are accessed with stride 1 by lane? Actually lane `l` accesses `mu[l]` and `mu[l+32]`. That&#x27;s coalesced (adjacent threads read adjacent addresses). Good.
+
+Similarly, `x`, `noise`, `x_new` accesses are coalesced.
+
+What about `u`? Each warp reads `u[b]`. Different warps read different addresses. That&#x27;s fine.
+
+Let&#x27;s think about occupancy. Block size 128, registers per thread? If we use maybe 20 registers, occupancy is high. Shared memory 0. So occupancy limited by registers or block size. With 128 threads per block, max blocks per SM is floor(2048/128)=16. If registers per thread &lt; 128, occupancy is 100%. Should be fine.
+
+Now, host wrapper:
+
+```cpp
+#include &lt;torch/extension.h&gt;
+
+void metropolis_forward_kernel(const float* x, const float* noise, const float* u,
+                               const float* mu, const float* sigma, float step_size,
+                               int B, int dim, float* x_new, bool* accepted);
+
+void metropolis_forward(torch::Tensor x, torch::Tensor noise, torch::Tensor u,
+                        torch::Tensor mu, torch::Tensor sigma, float step_size,
+                        torch::Tensor x_new, torch::Tensor accepted) {
+    int B = x.size(0);
+    int dim = x.size(1);
+    const int threads = 128;
+    int total_threads = B * 32;
+    int blocks = (total_threads + threads - 1) / threads;
+    metropolis_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        noise.data_ptr&lt;float&gt;(),
+        u.data_ptr&lt;float&gt;(),
+        mu.data_ptr&lt;float&gt;(),
+        sigma.data_ptr&lt;float&gt;(),
+        step_size,
+        B,
+        dim,
+        x_new.data_ptr&lt;float&gt;(),
+        accepted.data_ptr&lt;bool&gt;()
+    );
+}
+```
+
+And `cuda_sources`:
+
+```cpp
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void metropolis_forward_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ noise,
+    const float* __restrict__ u,
+    const float* __restrict__ mu,
+    const float* __restrict__ sigma,
+    float step_size,
+    int B,
+    int dim,
+    float* __restrict__ x_new,
+    bool* __restrict__ accepted
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid &gt;&gt; 5;
+    int lane = tid &amp; 31;
+    if (warp_id &gt;= B) return;
+
+    int b = warp_id;
+    const float* x_b = x + b * dim;
+    const float* noise_b = noise + b * dim;
+    float* x_new_b = x_new + b * dim;
+
+    float sum_p = 0.0f;
+    float sum_x = 0.0f;
+
+    #pragma unroll 2
+    for (int i = lane; i &lt; dim; i += 32) {
+        float xi = x_b[i];
+        float n = noise_b[i];
+        float prop = xi + step_size * n;
+        float mui = mu[i];
+        float sigmai = sigma[i];
+        float diff_p = (prop - mui) / sigmai;
+        float diff_x = (xi - mui) / sigmai;
+        sum_p += diff_p * diff_p;
+        sum_x += diff_x * diff_x;
+        x_new_b[i] = prop;
+    }
+
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum_p += __shfl_down_sync(0xffffffff, sum_p, offset);
+        sum_x += __shfl_down_sync(0xffffffff, sum_x, offset);
+    }
+
+    bool acc = false;
+    if (lane == 0) {
+        float log_alpha = -0.5f * (sum_p - sum_x);
+        float ui = u[b];
+        if (ui &lt; 1e-10f) ui = 1e-10f;
+        float log_u = logf(ui);
+        acc = log_u &lt; log_alpha;
+        accepted[b] = acc;
+    }
+
+    int acc_int = __shfl_sync(0xffffffff, acc ? 1 : 0, 0);
+    if (!acc_int) {
+        for (int i = lane; i &lt; dim; i += 32) {
+            x_new_b[i] = x_b[i];
+        }
+    }
+}
+```
+
+Wait: `#pragma unroll 2` might not be appropriate if dim is unknown. `#pragma unroll` without argument usually unrolls fully if the trip count is constant, but here it&#x27;s not known at compile time. Actually `dim` is a runtime variable, so `#pragma unroll` will unroll the loop body but the trip count is variable; the pragma is ignored or partial. Let&#x27;s just not use unroll for the loop, or use `#pragma unroll 4` as a hint. For dim=64, each thread does 2 iterations. Unrolling might help but not necessary. Let&#x27;s just remove pragma to keep it simple, or add `#pragma unroll 4` which is fine.
+
+One concern: reading `mu[i]` and `sigma[i]` inside the loop. If `dim` is large, these are repeated reads. But they are cached in L1. That&#x27;s okay.
+
+Another concern: division by `sigmai`. If sigma is 1.0, the compiler may not optimize division to multiplication unless we use `__restrict__` and constant prop. But sigma is loaded from memory. Multiplication by `1.0f/sigmai` is same cost. We can precompute `inv_sigma = 1.0f / sigmai`. But division is fast enough.
+
+Now, the Python side:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = r&quot;&quot;&quot;
+#include &lt;torch/extension.h&gt;
+
+void metropolis_forward_kernel(const float* x, const float* noise, const float* u,
+                               const float* mu, const float* sigma, float step_size,
+                               int B, int dim, float* x_new, bool* accepted);
+
+void metropolis_forward(torch::Tensor x, torch::Tensor noise, torch::Tensor u,
+                        torch::Tensor mu, torch::Tensor sigma, float step_size,
+                        torch::Tensor x_new, torch::Tensor accepted) {
+    int B = x.size(0);
+    int dim = x.size(1);
+    const int threads = 128;
+    int total_threads = B * 32;
+    int blocks = (total_threads + threads - 1) / threads;
+    metropolis_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+        x.data_ptr&lt;float&gt;(),
+        noise.data_ptr&lt;float&gt;(),
+        u.data_ptr&lt;float&gt;(),
+        mu.data_ptr&lt;float&gt;(),
+        sigma.data_ptr&lt;float&gt;(),
+        step_size,
+        B,
+        dim,
+        x_new.data_ptr&lt;float&gt;(),
+        accepted.data_ptr&lt;bool&gt;()
+    );
+}
+&quot;&quot;&quot;
+
+cuda_source = r&quot;&quot;&quot;
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void metropolis_forward_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ noise,
+    const float* __restrict__ u,
+    const float* __restrict__ mu,
+    const float* __restrict__ sigma,
+    float step_size,
+    int B,
+    int dim,
+    float* __restrict__ x_new,
+    bool* __restrict__ accepted
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int warp_id = tid &gt;&gt; 5;
+    int lane = tid &amp; 31;
+    if (warp_id &gt;= B) return;
+
+    int b = warp_id;
+    const float* x_b = x + b * dim;
+    const float* noise_b = noise + b * dim;
+    float* x_new_b = x_new + b * dim;
+
+    float sum_p = 0.0f;
+    float sum_x = 0.0f;
+
+    for (int i = lane; i &lt; dim; i += 32) {
+        float xi = x_b[i];
+        float n = noise_b[i];
+        float prop = xi + step_size * n;
+        float mui = mu[i];
+        float sigmai = sigma[i];
+        float diff_p = (prop - mui) / sigmai;
+        float diff_x = (xi - mui) / sigmai;
+        sum_p += diff_p * diff_p;
+        sum_x += diff_x * diff_x;
+        x_new_b[i] = prop;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum_p += __shfl_down_sync(0xffffffff, sum_p, offset);
+        sum_x += __shfl_down_sync(0xffffffff, sum_x, offset);
+    }
+
+    bool acc = false;
+    if (lane == 0) {
+        float log_alpha = -0.5f * (sum_p - sum_x);
+        float ui = u[b];
+        if (ui &lt; 1e-10f) ui = 1e-10f;
+        float log_u = logf(ui);
+        acc = log_u &lt; log_alpha;
+        accepted[b] = acc;
+    }
+
+    int acc_int = __shfl_sync(0xffffffff, acc ? 1 : 0, 0);
+    if (acc_int == 0) {
+        for (int i = lane; i &lt; dim; i += 32) {
+            x_new_b[i] = x_b[i];
+        }
+    }
+}
+&quot;&quot;&quot;
+
+# Load extension
+metropolis_cuda = load_inline(
+    name=&quot;metropolis_cuda&quot;,
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=[&quot;metropolis_forward&quot;],
+    extra_cuda_cflags=[&quot;-O3&quot;],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim, step_size=0.1):
+        super().__init__()
+        self.dim = dim
+        self.step_size = step_size
+        self.register_buffer(&quot;mu&quot;, torch.zeros(dim))
+        self.register_buffer(&quot;sigma&quot;, torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -&gt; tuple:
+        B = x.shape[0]
+        noise = torch.randn_like(x)
+        u = torch.rand(B, device=x.device)
+        x_new = torch.empty_like(x)
+        accepted = torch.empty(B, dtype=torch.bool, device=x.device)
+        metropolis_cuda.metropolis_forward(
+            x, noise, u, self.mu, self.sigma, self.step_size, x_new, accepted
+        )
+        return x_new, accepted
+```
+
+Wait, there is an issue: in the reference, the `_log_prob` uses `self.mu` and `self.sigma`. The custom kernel does too.
+
+But there is a subtlety: `torch.where(accepted.unsqueeze(-1), proposal, x)` returns a tensor of the same dtype as inputs. `accepted` is bool. In our kernel, `accepted` is `bool*`. That&#x27;s fine.
+
+Another subtlety: the reference `_log_prob` does `-0.5 * (((x - self.mu) / self.sigma) ** 2).sum(dim=-1)`. This yields a float tensor of shape [B]. Our kernel computes `sum_p` and `sum_x` and then `log_alpha = -0.5f * (sum_p - sum_x)`. That&#x27;s equivalent. Good.
+
+One more: division by `sigmai`. If `sigma` contains zeros, it&#x27;s invalid, but reference also divides by sigma. In init, sigma is ones. So okay.
+
+Now, will this be faster? Let&#x27;s think. The reference has multiple kernel launches. We have 3 launches (randn, rand, fused). We avoid extra memory traffic for intermediate tensors. It should be faster.
+
+But maybe we can do even better: instead of launching `torch.rand(B)`, we could generate `u` inside the fused kernel by calling `curand`? But we decided not to because of RNG mismatch. However, maybe we can pass the same random state to the kernel? Or we can just generate `u` in Python and keep it. But what if we compute `log_u` in Python too? That adds a kernel launch. We&#x27;ll keep it in the fused kernel.
+
+Could we also avoid allocating `noise` by computing it inside the kernel using a deterministic hash of `b`, `i`, and an offset? That would not match PyTorch.
+
+One more optimization: Since `mu` and `sigma` are buffers, we could make sure they are on the correct device. `register_buffer` does that if we pass tensor. In `__init__`, `torch.zeros(dim)` is CPU tensor. But when the module is moved to CUDA (`.cuda()`), buffers move too. In the benchmark, they likely instantiate and then call `get_inputs()` which returns CUDA tensors. But they may call `model.to(x.device)`. Actually, the harness likely does something like:
+```python
+model = Model(dim)
+# later
+model.to(device)
+```
+Or passes the model to the evaluation function which moves it. Since `ModelNew` inherits `nn.Module`, buffers will be moved. So okay.
+
+But `self.mu` and `self.sigma` are CPU tensors initially. In our `forward`, we pass them to the CUDA kernel. If the model hasn&#x27;t been moved to CUDA, this would fail. The reference also uses `self.mu` and `self.sigma` on CPU? Actually, `x` is on CUDA. In the reference, `x - self.mu` will broadcast and move `self.mu` to CUDA implicitly. In our kernel, we need `self.mu` to be on the same device as `x`. If it&#x27;s on CPU, `data_ptr&lt;float&gt;()` is a CPU pointer, and we pass it to a CUDA kernel, causing a segfault. But if the harness moves the model to CUDA before calling forward, it&#x27;s fine. The reference `Model` would also fail if not moved? Actually, `x - self.mu` with x on CUDA and mu on CPU would try to copy mu to CUDA, which works but is slow. If the harness doesn&#x27;t move the model, our kernel will crash. However, typical harnesses move the model to the input device if needed. Let&#x27;s check the reference code: there is no `.to(device)` in the snippet. But `get_inputs()` returns a CUDA tensor. The harness likely moves the model to the device. Let&#x27;s assume so.
+
+Alternatively, we can explicitly ensure `mu` and `sigma` are on the same device as `x` in `forward`:
+
+```python
+mu = self.mu.to(x.device)
+sigma = self.sigma.to(x.device)
+```
+
+But that adds overhead. Since they are small, it&#x27;s okay but unnecessary if the model is moved. Let&#x27;s just keep as is and hope the harness moves the model. But to be safe, maybe we should handle device mismatch. However, moving a 64-element tensor each call is negligible.
+
+Actually, in the reference `Model`, `self.mu` and `self.sigma` are registered as buffers. In PyTorch, `nn.Module` doesn&#x27;t automatically move them to the input device. But the evaluation harness probably constructs the model and then does `model = model.to(device)`. I&#x27;ll assume that.
+
+Now, we need to test. Let&#x27;s write the kernel and compile it. I&#x27;ll create the Python source string and call `compile_kernel`.
+
+Wait, the `compile_kernel` function takes the full Python source of the ModelNew kernel file. So I need to format the code as a single string.
+
+Let&#x27;s draft the full Python code.
+
+One issue: `load_inline` compiles at module load time. If there is a compilation error, the module load fails. We want to make sure the CUDA code compiles.
+
+Potential issues:
+- `bool` in CUDA: `bool*` may not be supported in older PyTorch bindings? Actually `data_ptr&lt;bool&gt;()` is supported. But in CUDA, `bool` is 1 byte. Writing to `accepted[b] = acc;` is fine.
+- `__shfl_sync` requires sm_30 or higher. We&#x27;ll compile with default arch. The GPU specs will tell us the compute capability. We can add extra_cuda_cflags like `[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;]`. `-O3` is fine.
+- The `cpp_sources` forward declaration of the kernel: `void metropolis_forward_kernel(...);` without `__global__`. That&#x27;s fine.
+
+Let&#x27;s test compilation.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_source = r\&quot;\&quot;\&quot;\n#include &lt;torch/extension.h&gt;\n\nvoid metropolis_forward_kernel(const float* x, const float* noise, const float* u,\n                               const float* mu, const float* sigma, float step_size,\n                               int B, int dim, float* x_new, bool* accepted);\n\nvoid metropolis_forward(torch::Tensor x, torch::Tensor noise, torch::Tensor u,\n                        torch::Tensor mu, torch::Tensor sigma, float step_size,\n                        torch::Tensor x_new, torch::Tensor accepted) {\n    int B = x.size(0);\n    int dim = x.size(1);\n    const int threads = 128;\n    int total_threads = B * 32;\n    int blocks = (total_threads + threads - 1) / threads;\n    metropolis_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(\n        x.data_ptr&lt;float&gt;(),\n        noise.data_ptr&lt;float&gt;(),\n        u.data_ptr&lt;float&gt;(),\n        mu.data_ptr&lt;float&gt;(),\n        sigma.data_ptr&lt;float&gt;(),\n        step_size,\n        B,\n        dim,\n        x_new.data_ptr&lt;float&gt;(),\n        accepted.data_ptr&lt;bool&gt;()\n    );\n}\n\&quot;\&quot;\&quot;\n\ncuda_source = r\&quot;\&quot;\&quot;\n#include &lt;cuda_runtime.h&gt;\n\n__global__ void metropolis_forward_kernel(\n    const float* __restrict__ x,\n    const float* __restrict__ noise,\n    const float* __restrict__ u,\n    const float* __restrict__ mu,\n    const float* __restrict__ sigma,\n    float step_size,\n    int B,\n    int dim,\n    float* __restrict__ x_new,\n    bool* __restrict__ accepted\n) {\n    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n    int warp_id = tid &gt;&gt; 5;\n    int lane = tid &amp; 31;\n    if (warp_id &gt;= B) return;\n\n    int b = warp_id;\n    const float* x_b = x + b * dim;\n    const float* noise_b = noise + b * dim;\n    float* x_new_b = x_new + b * dim;\n\n    float sum_p = 0.0f;\n    float sum_x = 0.0f;\n\n    for (int i = lane; i &lt; dim; i += 32) {\n        float xi = x_b[i];\n        float n = noise_b[i];\n        float prop = xi + step_size * n;\n        float mui = mu[i];\n        float sigmai = sigma[i];\n        float diff_p = (prop - mui) / sigmai;\n        float diff_x = (xi - mui) / sigmai;\n        sum_p += diff_p * diff_p;\n        sum_x += diff_x * diff_x;\n        x_new_b[i] = prop;\n    }\n\n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {\n        sum_p += __shfl_down_sync(0xffffffff, sum_p, offset);\n        sum_x += __shfl_down_sync(0xffffffff, sum_x, offset);\n    }\n\n    bool acc = false;\n    if (lane == 0) {\n        float log_alpha = -0.5f * (sum_p - sum_x);\n        float ui = u[b];\n        if (ui &lt; 1e-10f) ui = 1e-10f;\n        float log_u = logf(ui);\n        acc = log_u &lt; log_alpha;\n        accepted[b] = acc;\n    }\n\n    int acc_int = __shfl_sync(0xffffffff, acc ? 1 : 0, 0);\n    if (acc_int == 0) {\n        for (int i = lane; i &lt; dim; i += 32) {\n            x_new_b[i] = x_b[i];\n        }\n    }\n}\n\&quot;\&quot;\&quot;\n\nmetropolis_cuda = load_inline(\n    name=\&quot;metropolis_cuda\&quot;,\n    cpp_sources=cpp_source,\n    cuda_sources=cuda_source,\n    functions=[\&quot;metropolis_forward\&quot;],\n    extra_cuda_cflags=[\&quot;-O3\&quot;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, dim, step_size=0.1):\n        super().__init__()\n        self.dim = dim\n        self.step_size = step_size\n        self.register_buffer(\&quot;mu\&quot;, torch.zeros(dim))\n        self.register_buffer(\&quot;sigma\&quot;, torch.ones(dim))\n\n    def forward(self, x: torch.Tensor) -&gt; tuple:\n        B = x.shape[0]\n        noise = torch.randn_like(x)\n        u = torch.rand(B, device=x.device)\n        x_new = torch.empty_like(x)\n        accepted = torch.empty(B, dtype=torch.bool, device=x.device)\n        metropolis_cuda.metropolis_forward(\n            x, noise, u, self.mu, self.sigma, self.step_size, x_new, accepted\n        )\n        return x_new, accepted\n&quot;
+}</div></details><details open><summary>result ← compile_kernel (fail)</summary><div class="block tool-out fail"><span class="role-tag">fail</span><b>compile_kernel</b>
+compile_kernel FAILED: RuntimeError.
+RuntimeError: Error building extension &#x27;metropolis_cuda&#x27;: [1/3] /opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=metropolis_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_9_cache/k_0ac5977ce61f/metropolis_cuda/main.cpp -o main.o 
+FAILED: [code=1] main.o 
+/opt/conda/bin/x86_64-conda-linux-gnu-c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=metropolis_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -fPIC -std=c++17 -c /scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_9_cache/k_0ac5977ce61f/metropolis_cuda/main.cpp -o main.o 
+/scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_9_cache/k_0ac5977ce61f/metropolis_cuda/main.cpp: In function &#x27;void metropolis_forward(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, float, at::Tensor, at::Tensor)&#x27;:
+/scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_9_cache/k_0ac5977ce61f/metropolis_cuda/main.cpp:17:32: error: expected primary-expression before &#x27;&lt;&#x27; token
+   17 |     metropolis_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |                                ^
+/scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_9_cache/k_0ac5977ce61f/metropolis_cuda/main.cpp:17:50: error: expected primary-expression before &#x27;&gt;&#x27; token
+   17 |     metropolis_forward_kernel&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(
+      |                                                  ^
+[2/3] /usr/local/cuda/bin/nvcc -MD -MF cuda.cuda.o.d -ccbin /opt/conda/bin/x86_64-conda-linux-gnu-cc -DTORCH_EXTENSION_NAME=metropolis_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /scratch/abaner/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /opt/conda/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_90,code=compute_90 -gencode=arch=compute_90,code=sm_90 --compiler-options &#x27;-fPIC&#x27; -O3 -std=c++17 -c /scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_9_cache/k_0ac5977ce61f/metropolis_cuda/cuda.cu -o cuda.cuda.o 
+nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;, the last value of this option was used
+ninja: build stopped: subcommand failed.
+</div></details></div></details></div>
 </body></html>
