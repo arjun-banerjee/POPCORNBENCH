@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 32</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:18:10 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 32</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:20:17 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">32_MSAColumnAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">5 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">5</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">6 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">7</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -2213,5 +2213,120 @@ profile_kernel PASSED: profiling complete.
   -&gt; 9577% stalls: global memory latency (waiting for DRAM/L2). + sectors/req=182.4 -&gt; uncoalesced global loads, restructure access pattern or use __ldg Try shared-memory tiling, prefetching, or reducing working set.
   -&gt; Global load coalescing=182.4x (ideal=1.0) -&gt; 182x wasted DRAM BW. Make per-warp accesses contiguous.
   -&gt; Low eligible warps + low BW% + low compute% = LATENCY-BOUND. Need more parallelism (larger grid, more ILP, prefetching).
-  -&gt; Compute-bound but NOT using tensor cores. If applicable, use FP16/BF16 with torch.matmul or WMMA intrinsics.</div></details></div></details></div>
+  -&gt; Compute-bound but NOT using tensor cores. If applicable, use FP16/BF16 with torch.matmul or WMMA intrinsics.</div></details></div></details><details class="turn-collapse"><summary><b>turn 5</b> · 2 tool call(s) · 21.8s · 8,493 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 5</span><span>llm latency: 21.8s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The profiling shows two main issues:
+1. There&#x27;s a lot of overhead from `.contiguous()`, `.clone()`, `.copy_` operations. I should avoid unnecessary transposes/contiguous calls.
+2. The kernel itself is latency-bound with lots of uncoalesced loads. The global load coalescing is very poor (182.4x wasted).
+
+The main problem in my kernel is that weights are accessed in a strided manner. When I compute Q, K, V, G:
+```
+int widx = k * D + h * d + dd;
+```
+This means each adjacent thread with different `s` is accessing the same weight memory, but adjacent load instructions from the same thread are strided by `D`. Since `D = 64`, this is not terrible (16 4-byte elements = 64 bytes), but still not great. The bigger problem is that `w_q[widx]` isn&#x27;t contiguous per thread - each thread loads `w_q[0], w_q[64], w_q[128]...` which means the loads from a single thread are strided by 64 floats (256 bytes), causing many cache lines to be fetched but only one float used per line.
+
+Wait, actually let me reconsider. Warp load instructions are issued per-warp. If all threads in a warp access the same address, that&#x27;s a broadcast and fine. But if they access different addresses, they need to be contiguous for coalescing.
+
+In my loop over `k`:
+```cuda
+for (int k = 0; k &lt; D; ++k) {
+    float xv = x_shared[k * S + s];
+    int widx = k * D + h * d + dd;
+    sum_q += xv * w_q[widx];
+}
+```
+
+For a fixed `k`, threads with same `s` but different `h,d` access different `widx`. The threads in a warp likely have different `h` and `dd`. So they access different weight addresses strided by `d` or `d*S`. This is not coalesced.
+
+Actually, the occupancy and parallelism issues are also severe: 70.7% occupancy with 1152 threads per block (block=1152) and 211 regs/thread. That&#x27;s 3 blocks per SM at most (128KB registers / 211*1152 ≈ 0.5 blocks, so limited by registers to 1 block). On H100 with 64 warps per SM and 1152 threads = 36 warps, that gives 70% occupancy. 
+
+Wait - the profile says &quot;block=1152&quot; but I set `threads=128`. Let me re-read... The profile says block=1152. That doesn&#x27;t match my kernel. Oh, wait - those might be from the `aten` operations (the contiguous copies, layer_norm, etc.). My kernel might not even be registered as a separate kernel in the profile because it&#x27;s a custom inline-loaded extension. Profile tools might have trouble identifying it.
+
+Hmm, this is concerning. Let me check the actual timing. &quot;GPU time: 230.59 μs&quot; is the total GPU time. Let me see if the reference is faster or slower. Since I don&#x27;t have the reference time from this tool, I can&#x27;t directly compare. But if the kernel is correct and the overhead of copies dominates, I need to optimize the data layout.
+
+Actually, wait - the fact that `contiguous`, `clone`, `copy_` are the top 3 taking ~25% each suggests my Python-side `.t().contiguous()` and `.float()` are expensive. 
+
+Key optimizations to try:
+1. **Avoid `.t().contiguous()`**: If I prepare the weights in the right layout ahead of time, or access them transposed in the kernel.
+2. **Avoid `.float()`**: If weights are already float (which they are for fp32), this is unnecessary.
+3. **Weight layout for coalescing**: Store weights so that for a given output dimension and head, the input dimension varies fastest (which it already does, since nn.Linear stores as (out, in)). But I need to think about what makes coalesced loads.
+
+Actually, looking at PyTorch `nn.Linear` weight shape: `(out_features, in_features)`. For `query.weight` shape is `(D, D)`. When I do `.t()`, it becomes `(D, D)` with layout transposed logically but contiguous() makes it actually transposed in memory.
+
+Wait, the default PyTorch linear weight is already `(D_out, D_in)`. So `query.weight` is `(D, D)` with rows as output features. In the kernel, for each input feature `k`, I want all output features. If I keep the weight as-is (shape D, D) and read `w_q[h*d + dd, k]`, then for a fixed `k`, adjacent threads with different `h` or `dd` access adjacent memory! That would be coalesced.
+
+So instead of transposing the weights in Python, I should pass them as-is and adjust indexing in the kernel:
+```cpp
+int widx = (h * d + dd) * D + k;  // row-major: (out_idx, in_idx)
+```
+
+This is much better for coalescing! Let&#x27;s fix this.
+
+Also, I should remove all the `.t().contiguous()` and `.float()` calls since they create unnecessary copies.
+
+Let me rewrite the kernel:
+1. Pass weights in original layout
+2. Fix indexing for coalesced loads
+3. Remove unnecessary copies/transposes
+
+Also, for the output projection: `out_proj.weight` is `(D, D)`. In the kernel I have:
+```cpp
+sum += val * w_out[d_in * D + d_out];
+```
+This is currently row-major where `d_in` is the row. For fixed `d_out`, threads with different `d_in` access strided memory. If I change to `w_out[d_out * D + d_in]`, that&#x27;s column-major for `d_in`. Wait no, I want for a fixed `d_out`, consecutive `d_in` accesses. But `d_in` is in the loop, each thread iterates `d_in`. The access pattern across threads within a warp matters. If all threads have the same `d_out` but different `s`, then `w_out[d_in * D + d_out]` - for a fixed `d_in` and `d_out`, all threads access the same address. That&#x27;s fine (broadcast). The issue is just that `d_in` is iterated in a loop. But since all threads access the same address for a given `d_in`, there&#x27;s no coalescing issue here - it&#x27;s actually broadcast, which is efficient.
+
+Wait, but in the output projection:
+```cpp
+for (int d_in = 0; d_in &lt; D; ++d_in) {
+    int h = d_in / d;
+    int dd = d_in % d;
+    float val = out_shared[(h * S + s) * d + dd];
+    sum += val * w_out[d_in * D + d_out];
+}
+```
+For a fixed `d_in`, all threads with different `s` and same `d_out` access the same `w_out[d_in * D + d_out]`. This is broadcast, which is coalesced. And `out_shared[(h * S + s) * d + dd]` has adjacent `s` -&gt; adjacent memory. So this is actually well-behaved!
+
+The main issue was in Q/K/V/G projection weights.
+
+Let me also think about the thread mapping to get better parallelism. Right now I use 1 block per `(b, n)` pair with 128 threads. The problem size is small: B=2, N=32, so 64 blocks total. On H100 with many SMs, this might be okay but could be underutilized. Let&#x27;s check the GPU specs.
+</div></details><details><summary>call → get_gpu_specs</summary><div class="block tool-args"><span class="role-tag">call</span><b>get_gpu_specs</b>
+{
+  &quot;kernel_code&quot;: &quot;&quot;
+}</div></details><details><summary>call → ert_roofline</summary><div class="block tool-args"><span class="role-tag">call</span><b>ert_roofline</b>
+{
+  &quot;kernel_code&quot;: &quot;&quot;
+}</div></details><details><summary>result ← get_gpu_specs (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>get_gpu_specs</b>
+GPU specs for NVIDIA H100 80GB HBM3:
+  total memory (runtime): 79.1 GB
+  spec entry: H100
+    GPU Architecture: Hopper
+    GPU Memory: 80GB
+    Memory Bandwidth: 3.35 TB/s
+    FP64 TFLOPS: 34
+    FP64 Tensor Core TFLOPS: 67
+    FP32 TFLOPS: 67
+    TF32 Tensor Core TFLOPS: 989 with sparsity
+    BFLOAT16 Tensore Core TFLOPS: 1979 with sparsity
+    FP16 Tensor Core TFLOPS: 1979 with sparsity
+    FP8 Tensor Core TFLOPS: 3958 with sparsity
+    INT8 Tensor Core TOPS: 3958 with sparsity
+    Register File Size: 64K 32-bit registers per SM
+    Maximum number of registers per thread: 255
+    Maximum number of thread blocks per SM: 32
+    Shared memory capacity per SM: 228 KB
+    Maximum shared memory per thread block: 227 KB</div></details><details><summary>result ← ert_roofline (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>ert_roofline</b>
+ert_roofline PASSED: empirical roofline benchmarks complete.
+=== Empirical Roofline Model ===
+Device: NVIDIA H100 80GB HBM3
+
+--- Measured Bandwidth ---
+  L1            13.6 GB/s  (working set: 32 KB)
+  L2           927.6 GB/s  (working set: 2048 KB)
+  DRAM        2577.3 GB/s  (working set: 262144 KB)
+
+--- Measured Compute Throughput ---
+  FP32                 51.85 TFLOPS
+  FP16 (tensor core)    758.77 TFLOPS
+
+Ridge point (FP32): 20.12 FLOPs/byte
+  Kernels with arithmetic intensity below the ridge point are
+  memory-bound; above it they are compute-bound.</div></details></div></details></div>
 </body></html>
