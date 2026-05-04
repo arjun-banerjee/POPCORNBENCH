@@ -6,15 +6,15 @@
 <link rel="stylesheet" href="../../../style.css">
 <meta http-equiv="refresh" content="60">
 </head><body>
-<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 32</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:32:59 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
+<header><div class="page-wrap"><div class="site-title"><a href="../../../../index.html" title="all sweeps">L2 · problem 32</a></div><div class="site-subtitle">Kimi-K2.6 · popcorn · l12_all</div><div class="header-links"><a href="../../../index.html">← all variants</a><a href="../index.html">← popcorn</a><a href="../models/Kimi-K2.6.html">← Kimi-K2.6</a><span class="meta">generated 2026-05-04 02:35:06 UTC</span></div></div></header><nav class="sitemap"><div class="page-wrap"><span class="group"><a href="../../../index.html">home</a></span><span class="group"><span class="grp-label">original:</span><a href="../../../v/original/index.html">overview</a><a href="../../../v/original/models/Kimi-K2.6.html">Kimi-K2.6</a></span><span class="group"><span class="grp-label">popcorn:</span><a href="../../../v/popcorn/index.html">overview</a><a href="../../../v/popcorn/models/Kimi-K2.6.html" class=current>Kimi-K2.6</a></span></div></nav><div class="page-wrap"><div class="tier-picker"><span class="tier-picker-label">tier:</span><span class="tier-tab disabled">single</span><span class="tier-tab disabled">default</span><span class="tier-tab current">all</span></div><div class="tldr">
 <div class="card-row">
   <span class="outcome-badge outcome-in_progress">in_progress</span>
   <span style="font-size:13px;">32_MSAColumnAttention.py</span>
 </div>
 <div class="tldr-grid">
   <div class="tldr-cell"><div class="l">model</div><div class="v">Kimi-K2.6</div></div>
-  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">10 / 15</div></div>
-  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">11</div></div>
+  <div class="tldr-cell"><div class="l">turns / max</div><div class="v">11 / 15</div></div>
+  <div class="tldr-cell"><div class="l">tool calls</div><div class="v">12</div></div>
   <div class="tldr-cell"><div class="l">backend</div><div class="v">cuda fp32</div></div>
   <div class="tldr-cell"><div class="l">variant</div><div class="v">popcorn</div></div>
   <div class="tldr-cell"><div class="l">runtime</div><div class="v">—</div></div>
@@ -3583,5 +3583,526 @@ nvcc warning : incompatible redefinition for option &#x27;compiler-bindir&#x27;,
 
 1 error detected in the compilation of &quot;/scratch/abaner/KernelBench/runs/l12_all/popcorn/Kimi-K2.6/level_2_problem_32_cache/k_5d9743b1f7a9/fused_attention_only/cuda.cu&quot;.
 ninja: build stopped: subcommand failed.
-</div></details></div></details></div>
+</div></details></div></details><details class="turn-collapse"><summary><b>turn 10</b> · 1 tool call(s) · 101.9s · 57,457 chars (click to expand)</summary><div class="turn"><div class="turn-head"><span class="turn-id">turn 10</span><span>llm latency: 101.9s</span></div><details open><summary>reasoning</summary><div class="block reasoning">The output pointer was named `out` in the kernel signature but I used `out_ptr` in the last line. Let me fix that. 
+
+Actually, my kernel signatures have `float* __restrict__ out` so I need to change `out_ptr` to `out`.
+
+But maybe truly fully fusing everything with fused ln/QKV and a thread layout matching the problem is better. The issue with my second kernel was mainly 162 sectors/req. This suggests loads/stores from q/k/v/g/out projections were not fully coalesced. Let me analyze.
+
+The tensors q, k, v, g have shape (B, N, S, D). In the kernel, one block handles one (b, n). Threads load from `q_ptr + idx` where `idx = tid; idx += nthreads`. The layout is (B, N, S, D). So `bn * S * D + idx` is linear across the inner (S, D) dims. If threads 0,1,... load consecutive memory, this should be coalesced. So why sectors/req=162? Hmm.
+
+Wait, S=8, D=64, so S*D=512. With 256 threads, first iteration loads idx 0..255, second 256..511. All contiguous within a half-warp. Should be fully coalesced.
+
+But the profile says 162 sectors/req. Maybe the mask loads for softmax: `mask[bn * S + j]` is broadcast per j across many threads. That&#x27;s not fully coalesced - but mask only has 8 elements. It shouldn&#x27;t cause that much waste.
+
+Wait, maybe the q, k, v, g tensors are generated by layer_norm, query, etc. These are views! No, in PyTorch einsum, they create new contiguous tensors. In my dispatch from the first kernel, we generated copies via `.contiguous()`. But in this second version, the PyTorch ops generate them. Maybe they are not in standard layout? No, nn.Linear output is contiguous.
+
+Wait, maybe the issue is in the first fused kernel where I had:
+`msa_repr[((b * S + s) * N + n) * D + d]`
+For a fixed (b,n), this accesses elements with stride N*D between s and s+1. Since N=32, D=64, N*D=2048 floats. If a warp loads `s=0` first then `s=1`, the addresses are far apart, so not coalesced globally! Ah yes! Because the original msa_repr is (B, S, N, D), so reading along D is contiguous, but reading different s in the same warp means each thread reads a different s (when they iterate with `idx += nthreads` with idx = s * D + d). Let me re-check.
+
+In my second kernel, the first load is:
+```c
+for (int idx = tid; idx &lt; S * D; idx += nthreads) {
+    int s = idx / D;
+    int d = idx % D;
+    x_smem[idx] = msa_repr[((b * S + s) * N + n) * D + d];
+}
+```
+
+Thread 0: s=0, d=0 → addr = ... + 0
+Thread 1: s=0, d=1 → addr = ... + 1
+...
+Thread 63: s=0, d=63 → addr = ... + 63
+
+Thread 64: s=1, d=0 → addr = ... + N*D*1 + 0 = ... + 2048
+
+Within the first 64 threads (which are in the same warp on H100), they access 0..63, so contiguous! Coalesced.
+Next warp (threads 64-127) accesses s=1,d=0..63 → contiguous!
+So actually these loads are coalesced within each warp.
+
+Then where does 162 sectors/req come from? Maybe from the weight loads? Or from `mask[((b * S + j) * N + n)]` where different j&#x27;s mean different addresses in the same warp? Yes! In the softmax loop:
+```c
+for (int j = 0; j &lt; S; ++j) {
+    if (msa_mask[((b * S + j) * N + n)] == 0.0f) ...
+}
+```
+
+All 256 threads in the block execute this for the SAME j within a thread, but different threads have different h and i. For a fixed h and i, all threads read the SAME mask element `j`. But different warps read different j. Within a warp, if a warp handles different (h,i), they all read the same mask[j]. This is a broadcast, which can be coalesced if caches handle it, but CaSE report might count it differently.
+
+However, 162 sectors/req suggests very poor coalescing. Maybe the issue is the `msa_mask` layout: (B, S, N). For (b,S=8,N=32), `msa_mask[((b * S + j) * N + n)]` = contiguous across n, but j is stride N. A warp reading different j values would have stride N floats = 32*4=128 bytes. Since cache line is 128 bytes, reading j in a warp would cross many cache lines. So the mask loads might be uncoalesced.
+
+Specifically, if a warp has threads with j=0,1,2,3,...,7 (if multiple threads in a warp handle consecutive (h,i) but each reads all j sequentially), actually it&#x27;s reversed: in my loop, each thread reads all j from 0 to 7, so all threads in a warp read j=0 at the same time — a broadcast. That should be good for a warp. But across warps, they might access different j values. Since each step j is loaded by all active threads, the address is the same for all threads in a warp, so it&#x27;s a broadcast. A broadcast within a warp should be a single sector per warp, or very few sectors. So mask shouldn&#x27;t cause 162 sectors/req.
+
+The glaring waste might come from Q, K, V, G loads in the second kernel, where the shapes were (B, N, S, D). My load loop accesses linearly:
+```c
+q_ptr = q + bn * S * D;
+for idx in tid..S*D step nthreads:
+    q_smem[idx] = q_ptr[idx];
+```
+This IS contiguous. So why 162?
+
+Wait, the kernels are using `float` tensors. However, some PyTorch outputs might be strided (e.g. from view/permute). In my second kernel, q, k, v, g come from `self.query(x)` where x is (B, N, S, D). nn.Linear on (B, N, S, D) would operate on the last dim. The output stride is contiguous: (N*S*D, S*D, D, 1). So q is contiguous.
+
+But in the first fused kernel, `msa_repr` is (B, S, N, D). The layout is (S*N*D, N*D, D, 1). So `((b * S + s) * N + n) * D + d` gives contiguous access for the inner D dimension.
+
+Hmm. Maybe the profile includes all kernels, not just the CUDA kernel. The `long_scoreboard` and sectors/req include PyTorch-generated kernels (layer_norm, linear, etc.). The PyTorch linear kernels might have poor coalescing if they use something like addmm which might have suboptimal strides.
+
+In the `profile_kernel` report, `Kernel Breakdown` shows many kernels, not just ours. And the largest time is `aten::contiguous` (11ms). Wait, why are contiguous taking 11ms? That seems huge. These are probably due to data copying between host and device or some weirdness. Actually the GPU time is shown as 75.62μs, while the listed `aten::contiguous` takes 11051μs... Wait, maybe that&#x27;s CPU time, not GPU time? The `profile_kernel` summary says `GPU time: 75.62μs`, which is the actual GPU execution. The `Kernel Breakdown` might list overhead or the top GPU kernels by time. If `aten::contiguous` shows 11051μs but the total GPU time is 75μs, that can&#x27;t be GPU time for one call. That must be aggregated across many calls or across the profile window? Or maybe the numbers are microseconds but there are many calls accumulating? But the report says calls=1. That&#x27;s weird.
+
+Wait, actually I think the Kernel Breakdown values might be nanoseconds or the tool might be showing something else. But GPU time 75.62μs is the key metric.
+
+Anyway, to get better performance, let me try to fuse everything together in a single kernel that reads msa_repr once, performs layer norm, QKV, attention, gate, output projection, and writes output. That minimizes memory traffic.
+
+In my second kernel, GPU time was 75μs. The total Python reference time would be something like... we can estimate: B=2, N=32, S=8, D=64, H=4.
+The operations are:
+- layer_norm on (2, 32, 8, 64)
+- 5 linears on (2, 32, 8, 64) -&gt; (2, 32, 8, 64) each
+- einsum for attention: Q@K^T on (2*32*4, 8, 16) -&gt; small
+- softmax over 8
+- attention*V
+- gate multiply
+- output linear
+- permute
+
+Reference time on H100 might be ~150-300μs. So 75μs might already be a speedup, but let&#x27;s try to make it much faster.
+
+To improve my fused kernel, I need to optimize the memory access pattern. In the fused kernel, `msa_repr` is (B, S, N, D). The block processes one (b, n). Threads iterate over S*D loading into smem. As we saw, for a warp, consecutive threads have consecutive d for the same s (since idx = s*D + d). So threads 0..D-1 have same s but different d: addresses are `base + d`. Since D=64, and warp size=32, first half-warp loads d=0..31 contiguously, second half-warp loads d=32..63 contiguously. Full coalescing! Good.
+
+Then, the mask is (B, S, N). When we load `msa_mask[((b * S + j) * N + n)]`, all threads with different (h,i) but same b and n read the SAME j at a time. So it&#x27;s a broadcast within a warp. Very good.
+
+Then, weights w_q, w_k, etc. are (D, D) transposed: w[d_in * D + d_out]. In the projection loop, each thread computes one output element (s, h, dd). It loops over d_in from 0 to D-1, reading w[d_in * D + out_dim] where out_dim is fixed per thread. So w access is strided by D between consecutive d_in. It&#x27;s not coalesced across threads: thread0 has out_dim=0, thread1 has out_dim=1. They read w[0], w[1] at d_in=0 — contiguous. At d_in=1, they read w[D+0], w[D+1] — also contiguous. Wait, w is stored as (d_in, d_out). Consecutive threads have consecutive out_dim, so for a given d_in, consecutive threads read consecutive memory: w[d_in * D + 0], w[d_in * D + 1], etc. That&#x27;s coalesced! Good.
+
+Then output projection w_out is the same.
+
+So the fused kernel memory access should be good. Why did the profiler show 162 sectors/req? Maybe because the profiler reported stats for the whole program, not just the custom kernel. It included PyTorch&#x27;s `aten::contiguous`, `clone`, etc. which are memory-bound and may have poor coalescing due to permutes.
+
+Since the GPU time is low (75μs), but the profile breakdown shows other operators taking 11ms — those must be CPU-side overhead from `.contiguous()` calls and weight transpositions! In my Python code, I do `w_q_t = self.query.weight.t().contiguous()` on every forward call! That&#x27;s a big overhead because it allocates new tensors and copies.
+Also `gamma = self.layer_norm.weight.contiguous()` etc. These `.contiguous()` calls on weight tensors are expensive because they create copies every forward pass. I should not call `.contiguous()` on weights every forward; instead, I should pre-process them in `__init__` or just remove `.contiguous()` because weight tensors from nn.Linear and nn.LayerNorm are already contiguous.
+
+Wait, nn.Linear weight has shape (out_features, in_features), and is contiguous in that shape. But I do `.t()` which creates a non-contiguous view. Then `.contiguous()` copies it. I should store transposed weights as buffers during init, or directly use the original weight layout in the kernel. I can pass the original weight (out, in) and adjust the indexing in the kernel.
+
+This is a huge CPU overhead that doesn&#x27;t show in the custom kernel time but increases total latency.
+
+So let me rewrite to avoid any `.contiguous()` calls in forward. Use the original PyTorch weight shapes and adapt the CUDA kernel.
+
+nn.Linear weight shape: (out_features=64, in_features=64), stored as [out, in]. So w_q from nn.Linear is (64, 64). I want matrix multiply x @ w.T, where x is (S, D) row vector, w.T is (D, D).
+In the kernel, for x[s, d_in] and w_q[out_dim, d_in], the dot product is sum_{d_in} x[d_in] * w_q[out_dim, d_in].
+So I can loop over d_in and use w_q[out_dim * D + d_in].
+
+Similarly for output projection: w_out is (out_features=64, in_features=64). The input to out_proj is (S, D). We compute input @ w_out.T. In the kernel, for output d_out: sum_{d_in} o_smem[s, d_in] * w_out[d_out, d_in].
+
+So I can pass the original weights directly.
+
+Also for layer_norm gamma and beta: they are shape (D,) and contiguous. No transpose needed.
+
+Also for msa_mask: it&#x27;s (B, S, N). In the kernel, for mask element for (b, s, n): `msa_mask[(b * S + s) * N + n]`. This is already contiguous.
+
+For msa_repr: it&#x27;s (B, S, N, D). Original. Good.
+
+For out: we write (B, S, N, D). Good.
+
+So I can avoid all copies in Python.
+
+Also, the `mask` access in the kernel: currently `msa_mask[((b * S + j) * N + n)]`. All threads in a block access the same (b, n) but different j (sequentially in loop). At iteration j=0, all threads read the same address. At j=1, all read another same address. This is broadcast, very good.
+
+So let&#x27;s write a fully fused kernel with original weight shapes, no copies in Python. I&#x27;ll keep the kernel similar to the second one but fix weight indexing, and maybe use fewer shared memory or more threads.
+
+Shared memory needed per block: S*D + 4*H*S*d_head + H*S*S + H*S*d_head =
+= 8*64 + 4*(4*8*16) + (4*8*8) + (4*8*16)
+= 512 + 2048 + 256 + 512 = 3328 floats = ~13KB. That&#x27;s tiny.
+
+Our block size should be at least 128 or 256 threads. Currently 256. With 144 blocks and 8 SMs, this is fine.
+
+But maybe we can increase parallelism by having each thread handle fewer work items, but since total work per (b,n) is small, we might be limited by SM occupancy. Let&#x27;s try block size 128 to allow more blocks per SM.
+
+Actually, with 256 threads and 144 blocks, we have 36,864 threads total. H100 has many SMs (132 SMs). So blocks per SM is roughly 1. Not great for hiding latency. But each block does enough work (3328 elements * several passes). Eligible warps/cycle is 0.33, which is low.
+
+To improve occupancy and hide latency, we could make the block process multiple (b,n) or have a much smaller block. But the shared memory is per block, so processing multiple (b,n) per block would need more smem. However, smem is only 13KB, so we could do 2 (b,n) per block with 26KB, or even 4 with 52KB. This would reduce the total block count, which may not help with parallelism.
+
+Alternatively, we can process more (b,n) per block to amortize overhead but also launch fewer blocks. Actually, the issue is that each block&#x27;s work is small and the grid is only 144 blocks. With 132 SMs, each SM gets ~1 block. If a block finishes quickly, the SM is idle. We need more blocks than SMs to keep them busy. Since we only have B*N=64 units of work, maybe we can split each (b,n) into multiple blocks. For example, each block handles a subset of S (like one s) or a subset of heads. That would increase grid size.
+
+Let&#x27;s think: if we split over S, each s is independent after the QKV computation? Actually, QKV requires all s to compute. But we can compute QKV in shared memory with one block per (b,n), then split attention over s to multiple blocks. But then we need a second kernel for output projection or use shared memory across blocks (impossible). Alternatively, we can have one block per (b,n,s) that handles a slice of Q, K, V in registers or global memory. But then K must be loaded by each block, which increases memory traffic.
+
+Given the problem scale (B=2, S=8, N=32, D=64), it&#x27;s quite small. Maybe the best approach is to fuse everything and simply reduce CPU overhead.
+
+Let me rewrite the Python to avoid any copies/allocations, and use the most direct dispatch. Also, we don&#x27;t need to convert mask to float every time if we pass the original mask.
+
+In the kernel, msa_mask is float. But MSA mask in the problem might be long or bool originally. It&#x27;s created as `torch.ones(batch_size, msa_depth, seq_len)` which defaults to float64. But `msa_mask` as described: `(B, S, N)`. In the problem `msa_mask: torch.Tensor`, dtype could vary. Let&#x27;s see the reference: `msa_mask = torch.ones(batch_size, msa_depth, seq_len)` → this is float by default? Actually `torch.ones` defaults to float32. The problem says `msa_mask: torch.Tensor`. In the reference, mask is used in `masked_fill(mask == 0, ...)`. It compares to 0 integer? In PyTorch, `mask == 0` works for any dtype. 
+
+To avoid conversion, I can just accept the mask as-is and read it as float in the kernel? No, if it&#x27;s not float, we should cast in Python once with `.float().contiguous()` or just use `.to(torch.float32)`.
+
+But let&#x27;s check: reference gets `torch.ones(...)` → float32. So no conversion needed. But to be safe, I&#x27;ll cast.
+
+Actually, looking at the original `get_inputs`: `msa_mask = torch.ones(batch_size, msa_depth, seq_len)`. This creates float32 tensor by default. Good.
+
+So I can pass it directly.
+
+Now, the biggest overhead in the previous profile was `aten::contiguous` at 11ms. That is coming from my `weight.t().contiguous()` calls. If I remove them, total time might drop by ~11ms, but GPU time only accounts for 75μs. So total time might be dominated by CPU overhead of launching kernels or copying weights. But the evaluation timing probably focuses on GPU time.
+
+Let me check: the evaluation timing typically measures GPU time of the forward pass, not CPU overhead of weight copies. However, some timing might include CPU-GPU sync. But the `profile_kernel` shows GPU time of 75.62μs, which is good.
+
+But the reference implementation might take, say, 200-300μs on GPU. So 75μs is already a win. But the first fully fused kernel (with everything in one kernel) was even simpler: it was one big kernel with no PyTorch intermediates. Its GPU time was 75μs. But we can optimize that kernel further with better block configuration and by avoiding weight copies in Python.
+
+Wait, in the first version (v3), GPU time was 230.59μs but after I fully fused to one kernel (fused_msa_attention), GPU time dropped to 75.62μs. That&#x27;s great! I suspect the reference time is around 180-250μs. So 75μs is a significant win. But can we do better?
+
+The profile says the kernel is compute-bound (FP32 util=10.8%) but low eligible warps (0.33). If we can use fewer registers, we can get more warps per SM. Or if we use more threads, maybe not.
+
+Actually, with 256 threads/block and 130 regs/thread, total registers per block = 33280. H100 has 64K registers per SM. So 1 block can fit (65536/33280=1.96) → 1 block per SM. If we reduce threads to 128, regs per block = 16640, so 3 blocks per SM (49920, &lt;65536). That would triple occupancy! Let&#x27;s try block size 128.
+
+Wait, currently block threads=256, regs/thread=130, so regs per block = 33280. With 65536 regs/SM, max blocks/SM = 1 (since 2 * 33280 = 66560 &gt; 65536). So exactly 1 block per SM. With 144 blocks and 132 SMs, 12 SMs get 2 blocks, others 1. Total occupancy very low.
+If I use 128 threads, regs per block = 16640. Max blocks/SM = 3 (3*16640 = 49920 &lt; 65536). So occupancy per SM can be 3 blocks, meaning 3 * 128 * 32 / 2048 warps per SM? On H100, max warps per SM = 64 warps (2048 threads). 3 blocks * 128 threads = 384 threads = 12 warps. Max is 64 warps = 2048 threads. So achieved occupancy would be 12/64 = 18.75%. Wait, that seems lower than before? Before with 1 block * 256 threads = 256 threads = 8 warps. So 8/64 = 12.5%. So 3 blocks * 128 = 12 warps = 18.75%, actually better than 12.5%. But the profiler says achieved occupancy was 43.5%? How? That doesn&#x27;t match. Maybe the compiler optimized register usage when I changed something.
+
+Hmm, the profile shows achieved occupancy 43.5%, which is decent. But eligible warps/cycle is only 0.33.
+
+Let&#x27;s just try with 128 threads. It might be better or worse. But there&#x27;s a simpler optimization: process 1 (b) per block, and have threads parallel over (n*s*d) or something. But the core issue is that each (b,n) work is small, leading to low parallelism.
+
+Maybe we can use tensor cores for the matmuls with mma? But D=64, S=8, H=4. Small dimensions. Tensor cores might not help for such small sizes due to overhead.
+
+Alternatively, we can do a fully fused kernel that doesn&#x27;t use the __shfl-based reduction (which uses many registers). Instead, we can precompute mean and inv_std more efficiently? But LayerNorm on D=64 is tiny.
+
+Actually, maybe the key overhead is that I&#x27;m doing `for (int s = 0; s &lt; S; ++s)` loops with `__syncthreads()` each time. That&#x27;s 8 synchronizations per block. That&#x27;s fine.
+
+Wait, there&#x27;s another strategy: process multiple (n) per block. Since N=32, each block could process 2 or 4 residue positions (n), reducing the number of blocks but increasing work per block. This doesn&#x27;t increase parallelism but increases arithmetic intensity. However, with 144 blocks already, maybe it&#x27;s okay.
+
+What if we instead launch more blocks by splitting over h and s? For example, each block handles one (b, n, h). Then the grid is 2*32*4 = 256 blocks. That increases grid size by 1.78x, which means more blocks per SM. But then shared memory for Q, K, V would be S*d_head = 8*16=128 floats per head. Attention matrix is S*S=64 floats. We can keep them in registers or smem. And the QKV projection needs to be done before or we can load from global memory. If we compute QKV in a previous kernel, that&#x27;s more overhead. But if we precompute QKV with PyTorch and then my custom kernel only does attention + gate + output projection, that might be suboptimal.
+
+Actually, let&#x27;s see what the reference does:
+1. permute
+2. layer_norm
+3. 4 linears (Q, K, V, G)
+4. einsum
+5. mask + softmax + dropout
+6. einsum
+7. gate mult
+8. out_proj
+9. permute
+
+That&#x27;s 9 major GPU operations, plus many views/permutes.
+
+My fully fused kernel replaces all with one kernel. The GPU time is 75μs. The reference likely takes ~200-300μs. So speedup is maybe 3-4x. That should be enough.
+
+But I want to optimize further to be safe. Let&#x27;s:
+1. Remove `.contiguous()` calls on weights in forward. Pass original weights with correct indexing.
+2. Use smaller block size (128) to allow more blocks per SM. Wait, let me check register usage. My kernel uses blockReduceSum, which uses shared[32]. That&#x27;s fine. The projection loops are simple.
+3. Potentially prefetch or use register blocking for the loop `for d=0..D-1`.
+
+Actually, the projection loops and output projection are the main compute. Each thread in projection does D MADs. With S*D=512 elements and 128 threads, each thread does ~4 elements, each requiring 64 MADs = 256 FLOPs. That&#x27;s tiny.
+
+To hide latency, I need more threads (warps) active on the SM. 128 threads/block gives 4 warps/block. With 3 blocks/SM, 12 warps. H100 needs ~16+ warps to hide FP32 latency? H100s can hide latency with fewer warps due to higher clock and deeper pipelines. Maybe 12 is enough.
+
+But perhaps 256 threads/block gives 8 warps/block, but only 1 block/SM. Total 8 warps/SM. Which is worse than 12. So 128 threads might be better!
+
+Also, I can potentially use `float4` loads to load x from global memory faster, but S*D=512, which is small. Not a big deal.
+
+OK, let me rewrite the kernel to:
+- Use original weight layout (out, in) so no transpose in Python.
+- Block size 128.
+- Keep everything else similar.
+
+Wait, one more issue: nn.Linear weight is (out_features, in_features). For `self.query`, weight is (64, 64) in (out, in) order. For `x @ w.T`, I can read `w[out_dim * D + d_in]`. Correct.
+
+For the output projection: `self.out_proj.weight` is also (64, 64) in (out, in). We compute `o @ w_out.T`. For output dim d_out, we need `sum_{d_in} o[d_in] * w_out[d_out, d_in]`. Wait, in Linear, `y = x @ W.T + b`. So `x` is (in,), `W` is (out, in). `y[d_out] = sum_{d_in} x[d_in] * W.T[d_out, d_in] = sum_{d_in} x[d_in] * W[d_out, d_in]`. So the indexing with `w_out[d_out * D + d_in]` works!
+
+Wait! I was confused. In nn.Linear, the forward is `y = x @ W.T + b`, where W is (out_features, in_features). So yes, `W[d_out, d_in]` is the weight for input d_in to output d_out. That&#x27;s exactly `w[d_out * in_features + d_in]`.
+
+So the kernel loops should be:
+```c
+for (int d_in = 0; d_in &lt; D; ++d_in) {
+    float xv = x_smem[s * D + d_in];
+    int widx = out_dim * D + d_in;  // W[out_dim, d_in]
+    sum_q += xv * w_q[widx];
+    ...
+}
+```
+
+This is a simple change.
+
+But wait, `x_smem[s * D + d_in]` access within the loop is strided by D between consecutive d_in? Actually, for a fixed s, x_smem[s*D + 0], x_smem[s*D + 1], ... are contiguous. So it&#x27;s sequential and caches well.
+
+Also, `w_q[widx]` is `w_q[out_dim * D + d_in]`. For a fixed thread (fixed out_dim), this is sequential in d_in. Good.
+
+Different threads have different out_dim. So for d_in=0, thread0 reads w_q[0*D+0], thread1 reads w_q[1*D+0]. These are strided by D, which is 64 floats = 256 bytes. A cache line is 128 bytes, so threads in a warp access every other cache line. This is NOT fully coalesced! With 32 threads, they&#x27;d access 32 different cache lines, causing 32 sectors. That&#x27;s bad!
+
+Oh! This is the source of the high sectors/req! In the projection loop, within a warp, consecutive threads have consecutive `out_dim`. They access `w_q[out_dim * D + d_in]` for the same `d_in`. So the addresses are spaced by D floats = 256 bytes. With 32 threads, that&#x27;s 32 sectors per request. That&#x27;s terrible coalescing!
+
+To fix this, we should transpose the weights (or equivalently, read them as `w_q[d_in * D + out_dim]`). This way, for a fixed `d_in`, consecutive threads access consecutive memory: `w_q[d_in*D + 0]`, `w_q[d_in*D + 1]`, etc. That IS coalesced!
+
+So we DO need the transposed weight layout for coalesced access! But in Python, we can pre-store transposed weights as persistent buffers in `__init__`, rather than calling `.t().contiguous()` on every forward.
+
+And we should do the same for all weight matrices. This way, CUDA gets coalesced loads and Python has zero overhead per forward.
+
+Similarly for the output projection. The output projection weight access in the original code was:
+```c
+for d_in:
+    sum += o_smem[...] * w_out[d_in * D + d_out]
+```
+Wait, in my second kernel, I used:
+```c
+sum += o_smem[(h * S + s) * d_head + dd_in] * w_out[d_in * D + dd_out];
+```
+Here `d_in` is the loop variable, and `dd_out` is the fixed output dim per thread. For fixed `d_in`, consecutive threads (different `dd_out`) access `w_out[d_in * D + 0]`, `w_out[d_in * D + 1]`, etc. That IS contiguous and coalesced! So for output projection, using transposed weights (i.e., passing `w_out.t()` from Python where `w_out` is in (out, in) layout) gives `w_out_t` in (in, out) layout, and the kernel accesses `w_out_t[d_in * D + d_out]`, which is coalesced.
+
+Wait, but for Q/K/V/G projections in the second kernel, I passed `w_q_t = self.query.weight.t().contiguous()`, so `w_q_t` is (in, out). Then in the kernel I accessed:
+```c
+int widx = d * D + out_dim;
+sum_q += xv * w_q[widx];
+```
+For fixed d, threads with different out_dim read `w_q[d*D+0]`, `w_q[d*D+1]`, etc. That&#x27;s contiguous! Coalesced! Good.
+
+So in my second kernel, weights WERE transposed. And yet the profiler showed 162 sectors/req. Why?
+
+Maybe the poor coalescing is in loading `msa_repr`? Let&#x27;s re-examine:
+```c
+x_smem[idx] = msa_repr[((b * S + s) * N + n) * D + d];
+```
+For consecutive threads, idx differs by 1. s and d are computed as:
+s = idx / D, d = idx % D.
+So for idx=0: s=0, d=0
+idx=1: s=0, d=1
+...
+idx=63: s=0, d=63
+idx=64: s=1, d=0
+
+Within the first warp (threads 0..31), all have s=0, d=0..31. Addresses: base + 0, 1, ..., 31. Contiguous! Great.
+Within the second warp (threads 32..63), s=0, d=32..63. Contiguous! Great.
+Third warp (64..95): s=1, d=0..31. Address = base + N*D + 0..31. Contiguous! Great.
+
+So the loads are coalesced within each warp. No problem there.
+
+What about stores to x_smem? Shared memory banks are 32 banks of 4 bytes. x_smem[idx] where idx is sequential. Threads in a warp write to different banks (idx mod 32). No bank conflict.
+
+So why 162? Perhaps the `__shfl_down_sync` operations or `blockReduceSum`? No, those don&#x27;t access global memory.
+
+Maybe it&#x27;s because the mask `msa_mask` is accessed in the softmax loop:
+```c
+if (msa_mask[((b * S + j) * N + n)] == 0.0f)
+```
+For a given j, ALL threads read the same address. This is a broadcast, which takes 1 sector per warp. Good.
+
+Hmm. Could it be the `__syncthreads()` or just the way the profiler aggregates? Or maybe some PyTorch ops (like the permute and output projection?) Wait, in the fully fused kernel, there are no PyTorch ops between the kernel launch and return. But there are torch ops BEFORE the kernel (layer_norm, linears). And the profile breakdown had `aten::contiguous` etc. Those have poor coalescing.
+
+Wait, but the profile hint said &quot;Global load coalescing: 162.41x wasted BW&quot; for the overall workload, not just my kernel. Since my kernel dominates the GPU time and the PyTorch ops have their own kernels, the profiler averages across all kernels. The `long_scoreboard` stalls might be in the PyTorch kernels (like layer_norm which loads non-contiguously from the permuted tensor x before being made contiguous). Let&#x27;s check: `x = msa_repr.permute(0,2,1,3).contiguous()`. If the permute output is not contiguous, then `.contiguous()` copies from a strided layout to contiguous. During this copy, consecutive threads read elements with large strides (N*D between s and s+1), causing poor coalescing. That&#x27;s exactly it! The `aten::contiguous` and `aten::copy_` show up in the profile as slow and with bad coalescing. These are from the PyTorch code BEFORE my kernel!
+
+To avoid this, I need to also avoid PyTorch&#x27;s `.contiguous()` and `.permute()` calls. But `layer_norm` in PyTorch requires a contiguous last dim, so `x = msa_repr.permute(...)` might be non-contiguous, but `layer_norm(x)` works on the last dim if it&#x27;s contiguous in that dimension? Actually nn.LayerNorm normalizes over the last dimension. It works regardless of strides as long as inputs are proper tensors, but internally it might call `.contiguous()`.
+
+In the fully fused kernel version, `msa_repr` is passed directly (no permute). So there are no PyTorch `.contiguous()` calls! But I saw `aten::contiguous` at 11ms. Where did it come from?
+
+Looking at the Python code in the fully fused version:
+```python
+w_q_t = self.query.weight.t().contiguous()
+...
+gamma = self.layer_norm.weight.contiguous()
+...
+msa_mask_f = msa_mask.float().contiguous()
+```
+These `.contiguous()` calls create copies at every forward pass! They happen on CPU/GPU depending on tensor location. If weights are on GPU, calling `.contiguous()` will launch a `copy_` kernel. That&#x27;s the 11ms overhead!
+
+So yes, we need to eliminate these copies. We can precompute transposed weights and store them as persistent buffers.
+
+Also, `msa_mask` might already be float32 from `torch.ones`, but to be safe, we can cast once.
+
+So here&#x27;s the plan:
+1. In `__init__`, after setting up the layers, create persistent transposed weight buffers: `self.register_buffer(&#x27;w_q_t&#x27;, self.query.weight.t().contiguous())`, etc.
+   But wait, if the original weights are updated during training, the buffers won&#x27;t update. However, in evaluation mode (which this benchmark is), weights don&#x27;t change. So it&#x27;s fine.
+2. Similarly store layer_norm gamma/beta as buffers (or just access `.weight` directly, it&#x27;s already contiguous).
+3. In `forward`, just pass pointers directly.
+4. Fully fuse the kernel (everything in one kernel).
+5. Maybe increase grid size by splitting the problem differently.
+
+Wait, if I store buffers in `__init__`, I need to be careful: `self.query.weight` is a Parameter, and `.t()` creates a view. `.contiguous()` copies to a new tensor. Then storing it as a buffer means it uses extra memory but eliminates the copy overhead.
+
+Alternatively, I can just pass `self.query.weight` to the kernel and use the non-transposed indexing pattern, accepting the uncoalesced weight loads. But as we calculated, weight loads are the ONLY uncoalesced part. However, weights are only 64*64 = 4096 floats = 16KB. They easily fit in L2 cache and are reused across all (b,n,s). So the uncoalesced weight loads might not be a big issue in practice because they are cached after the first read. In fact, each block reads the weights. With 144 blocks, each reads 16KB, total 2.25MB weight reads. On H100 with 2.5TB/s bandwidth, that&#x27;s ~1μs. Negligible.
+
+So I can avoid transposed buffers entirely and just use original weights! That would simplify the code. Wait, but for output projection, I also need to check coalescing. In my current kernel, I passed `w_out_t` which is transposed, so output projection uses coalesced loads. If I pass original `w_out`, I&#x27;d need:
+```c
+sum += o_smem[...] * w_out[d_out * D + d_in];
+```
+For fixed d_out and thread-specific d_in varying in a loop, this is sequential within a thread, not across threads. No coalescing issue because it&#x27;s loop-local. Wait, within a warp, each thread has a different d_out. They all execute the d_in loop simultaneously. At d_in=0, thread0 reads w_out[0*D+0], thread1 reads w_out[1*D+0]. These are strided by D. Uncoalesced! So output projection also needs transposed weights for coalesced access.
+
+Actually, no. Let&#x27;s think: within a warp, threads have consecutive d_out. They all read `w_out[d_out * D + d_in]` for the SAME d_in in the loop. The addresses are spaced by D floats = 256 bytes. With 32 threads, that&#x27;s 32 sectors. Bad.
+
+So we need transposed weights for both input projections and output projection.
+
+But storing transposed weights as buffers is a good trade-off. Let&#x27;s do that.
+
+Also, I should store the layer_norm weight and bias directly.
+
+Let&#x27;s update the kernel and Python code with persistent transposed weights.
+
+Also, there is a subtle bug: in the softmax loop, when `S=8`, I wrote `#pragma unroll` before the loop. NVCC should unroll it. Good.
+
+Let me also try using 128 threads per block. With fewer threads, more blocks per SM. Let&#x27;s see if it helps.
+
+Given the previous kernel was 75μs with 256 threads and 144 blocks. If I use 128 threads, I can fit 2 blocks per SM (regs=255 max per thread, but my kernel might use fewer). Or even 3. Let&#x27;s just try 128 and see.
+
+Also, another idea: since S=8 is very small, I can unroll all S-related loops explicitly or process the entire column with one warp. Actually, in the attention score computation, each thread computes one (h,i,j). There are 4*8*8 = 256 such elements. With 128 threads, each thread computes 2 elements. Good.
+
+In softmax, there are H*S = 32 rows. Each row needs max, sum, and write-back over 8 elements. With 128 threads, each thread can process 1 row if we had more rows, but there are only 32 rows. So we have 4 threads per row. Maybe we can parallelize the reduction within a row using warp shuffles. Since S=8 &lt; warpSize=32, a full warp can process one row in parallel.
+
+Let&#x27;s redesign softmax: For each (h, i), we have 8 elements. Use one warp (32 threads) to process each row. First 8 threads load elements, find max (shuffle), compute sum_exp (shuffle), then write back. But we only have H*S=32 rows. So we need 32 warps = 1024 threads to process all rows in parallel. That&#x27;s a lot.
+
+Alternatively, since S=8 is tiny, just have each thread process one row sequentially (as currently done). With 128 threads and 32 rows, we have 4 threads per row. The redundant threads in the row don&#x27;t help because the loop is tiny. So we can have thread idx process row h=idx/8, i=idx%8, but only for idx &lt; 32. Other threads (32..127) do nothing in that phase. That&#x27;s fine.
+
+Actually, I can assign multiple rows per thread because there are only 32 rows: if 128 threads, each thread handles 1 row with 4-fold redundancy? Wait, if I map thread idx to row = idx % 32, then 4 threads handle the same row, which is wasteful but harmless. Better to only use first 32 threads.
+
+Let me just keep the current design (each thread does sequential work) but with 128 threads. That should be fine.
+
+Actually, wait. I realize in the fully fused kernel, I was computing `mean_val` and `inv_std` using blockReduceSum. But there&#x27;s a potential synchronization issue: I use `__shared__ float mean_val;` inside the loop over s. Since I declare it inside the loop? No, I declared it as `__shared__ float mean_val;` before the loop? Wait, in my C++ code:
+
+```c
+for (int s = 0; s &lt; S; ++s) {
+    ...
+    __shared__ float mean_val;
+    if (tid == 0) mean_val = total_sum * (1.0f / D);
+    __syncthreads();
+    ...
+}
+```
+
+Declaring `__shared__` inside a loop is not valid CUDA syntax because `__shared__` variables have static lifetime and cannot be declared inside control flow that might be skipped or repeated (in terms of scope). Actually, CUDA allows `__shared__` inside loops but it might be implicitly hoisted. However, it can lead to compilation errors or unexpected behavior. Some compilers allow it by hoisting the declaration. To be safe, it should be declared outside the loop.
+
+Also, `blockReduceSum` uses `__shared__ float shared[32];`. That is also declared inside the function, which is fine because it&#x27;s at kernel scope (function-level __shared__ is allowed and hoisted to per-block shared memory).
+
+Wait, looking at my code: `__shared__ float shared[32];` is inside `blockReduceSum` function? Actually, if it&#x27;s inside `blockReduceSum`, it&#x27;s declared at function scope. `blockReduceSum` is called from the kernel. Inline functions with `__shared__` might not be allowed? Let me check: in CUDA, `__shared__` variables can be declared inside `__device__` functions? Yes, they are implicitly qualified as `static __shared__` and are placed in shared memory, but they might be instantiated once per block. It&#x27;s allowed but risky if the inline function is called multiple times in different control paths.
+
+To be safe, I can write the reduction explicitly inside the kernel.
+
+OK let me write a clean, fully fused kernel with:
+- Pre-transposed weights stored as buffers.
+- No contiguous/permute in Python.
+- Block size 128 maybe.
+- Clean `__shared__` declarations outside loops.
+- Correct indexing.
+
+Also, I should remove the `msa_mask.float().contiguous()` from forward and instead check if the mask can be passed as-is. Since `torch.ones` gives float, we can store it. But if the dtype is not float, the kernel reading float will be wrong. To be safe, I&#x27;ll cast in forward: `msa_mask.contiguous().float()` but that&#x27;s a copy! If we assume float input, skip it. For safety, I can do `msa_mask.float().contiguous()` but that&#x27;s overhead. In the get_inputs function, mask is float. But the `get_inputs` returns list [msa_repr, msa_mask]. The dtype is whatever torch.ones returns: float32. So we can pass directly.
+
+I will still call `msa_mask.contiguous()` if I want to ensure it, but `torch.ones` is already contiguous. Let&#x27;s skip it.
+
+Now, weights as buffers:
+```python
+def __init__(self, ...):
+    ...
+    # Pre-transpose weights for coalesced access in CUDA
+    self.register_buffer(&#x27;_w_q_t&#x27;, torch.empty(msa_dim, msa_dim, device=self.query.weight.device, dtype=self.query.weight.dtype))
+    self.register_buffer(&#x27;_w_k_t&#x27;, ...)
+    ...
+```
+But we need to copy after init. A simpler way:
+```python
+self._w_q_t = nn.Parameter(self.query.weight.t().contiguous(), requires_grad=False)
+```
+Actually, using `register_buffer` is better if we don&#x27;t want it in state_dict.
+```python
+self.register_buffer(&#x27;_w_q_t&#x27;, self.query.weight.detach().t().contiguous())
+```
+
+Wait, `self.query.weight` is already a Parameter. `.detach().t().contiguous()` creates a new tensor.
+
+But note: if the module might be moved to a different device (`.to(&#x27;cuda&#x27;)`), buffers are moved automatically. So `register_buffer` is good.
+
+However, since this is evaluation and weights won&#x27;t change, we can just compute them once in `__init__`.
+
+Let me also note that `self.query.weight` might be updated by optimizer if training. But this is inference. Fine.
+
+Also, I should handle if layer_norm bias is None. In PyTorch, LayerNorm has affine=True by default, so both weight and bias exist.
+
+OK, let me write the final code.
+
+Also, the kernel had this blockReduceSum issue. Let me rewrite the layer norm reduction using a small shared array and warp shuffles properly.
+
+Since D=64, we can do:
+- Each warp handles one row (S).
+- Within a warp, threads 0..31. D=64. Thread tid in warp handles d = tid, tid+32.
+- Use warp shuffle to sum within warp, then combine warp results in shared mem because 2 warps * 32 threads cover 64 elements.
+- Actually, with block size 128 = 4 warps, and S=8 rows. We can assign each warp to process 2 rows? Or each thread block handles S=8 rows with 4 warps, each warp handling 2 rows.
+
+This would be more efficient than the generic blockReduceSum, because D=64 is a multiple of 32. But generic should be fine. Let&#x27;s keep it generic for simplicity.
+
+But I&#x27;ll move the `__shared__` declarations outside loops.
+
+Wait, one more thing: `blockReduceSum` had:
+```c
+__shared__ float shared[32];
+```
+This is in the inline function. If this function is called multiple times per thread, it&#x27;s fine (the shared array is per block). But if it&#x27;s called conditionally, that&#x27;s okay too. It&#x27;s well-defined in CUDA.
+
+However, `__syncthreads()` inside `blockReduceSum` might cause issues if called within a loop and not all threads reach it. In my code, I call it inside the for `s` loop, and all threads call `blockReduceSum`, so all threads reach `__syncthreads()`. That&#x27;s fine.
+
+Let&#x27;s proceed.
+
+Wait, looking at my second kernel&#x27;s smem calculation:
+```python
+size_t smem_size = (S * D + 4 * H * S * (D / H) + H * S * S + H * S * (D / H) + 32) * sizeof(float);
+```
+That&#x27;s:
+x_smem: S*D
+q_smem: H*S*d_head
+k_smem: H*S*d_head
+v_smem: H*S*d_head
+g_smem: H*S*d_head
+a_smem: H*S*S
+o_smem: H*S*d_head
++32 for shared reduction
+
+Total: S*D + 5*H*S*d_head + H*S*S + 32
+
+With S=8, D=64, H=4, d_head=16:
+= 512 + 5*(4*8*16) + (4*64) + 32 = 512 + 2560 + 256 + 32 = 3360 floats = 13440 bytes.
+
+With block size 128 threads, and 130 regs/thread, and smem=13440, occupancy per SM is limited by smem: smem capacity per SM is 228KB. 228KB / 13.4KB = ~17 blocks. Regs per thread 130 means 128*130 = 16640 regs/block. Max blocks by regs = 65536/16640 = 3. So regs limit to 3 blocks. SMEM limit to 17. So 3 blocks per SM = 384 threads = 12 warps. Occupancy 12/64=18.75%. That&#x27;s okay.
+
+If I use block size 256, regs per block = 33280, max blocks by regs = 1. SMEM = 13440, so 1 block per SM. 256 threads = 8 warps. Occupancy 8/64=12.5%. So 128 threads is better for occupancy.
+
+Let&#x27;s try block size 128.
+
+Also, the output projection writes to `out` global memory with each thread writing contiguous elements: `out[((b * S + s) * N + n) * D + d]`. For a warp, consecutive threads have consecutive d for the same (b,s,n). So addresses are contiguous. Coalesced! Great.
+
+One more optimization: can we fuse the layer norm gamma/beta application with the QKV projection reads? Instead of writing back to x_smem after LN, we can keep it in registers if we process one s per thread. But shared memory is fine.
+
+Let me also evaluate if we can remove the `o_smem` buffer and reuse `q_smem` or `v_smem`. Since Q and K are no longer needed after attention scores, and V is needed until the weighted sum. After the weighted sum, we write to o_smem. We can actually reuse `q_smem` for the output of weighted sum+gate, since Q is no longer needed after step 4. So we can eliminate o_smem and write into q_smem. That saves H*S*d_head floats = 512 floats = 2KB. Not a huge deal, but nice.
+
+Let&#x27;s do that: after computing attention scores in a_smem, we still need q_smem? No, Q is only used for attention scores. After step 4, Q is done. We can reuse q_smem for the final gated output.
+
+But wait, Q is needed during step 4. After step 4 is done (all threads have written a_smem), Q is no longer needed. So in step 6, we can write to q_smem instead of o_smem. Then step 7 reads from q_smem.
+
+Similarly, we could reuse v_smem? No, V is needed in step 6.
+
+But we need to be careful: q_smem size is H*S*d_head, which matches the needed output size. So yes, let&#x27;s overwrite q_smem in step 6.
+
+Wait, but q_smem and a_smem are disjoint. After step 4, q_smem is dead. Step 5 uses a_smem. Step 6 can write to q_smem. Step 7 reads q_smem. Perfect.
+
+So smem = S*D (x) + H*S*d_head (q-&gt;reused as out) + H*S*d_head (k) + H*S*d_head (v) + H*S*d_head (g) + H*S*S (a)
+= 512 + 512 + 512 + 512 + 512 + 256 = 2816 floats = 11264 bytes.
+Even smaller!
+
+Actually, we could potentially reuse k_smem after step 4 as well, but not needed.
+
+OK let me write the final kernel with these optimizations:
+- Block size 128.
+- Reuse q_smem for gated output.
+- Weights passed as transposed buffers (precomputed in __init__).
+- No copies in forward.
+- Clean code.
+
+Wait, I should also handle `msa_mask`. In the reference, `msa_mask` is (B, S, N). But after I removed permute in Python, the mask I pass is the ORIGINAL `msa_mask` which is (B, MSA_DEPTH, SEQ_LEN) = (B, S, N) since S is msa_depth? Wait, let&#x27;s look at shapes:
+- `msa_repr` is (B, S, N, D) where S=msa_depth, N=seq_len.
+- `msa_mask` is (B, S, N).
+In the reference, `col_mask = msa_mask.permute(0, 2, 1)` to get (B, N, S). Then in attention, mask is applied over the S dimension.
+In my fused kernel, I removed the permute and work directly on (B, S, N, D) layout. But the attention is over the S dimension (msa depth). The mask needs to tell us for each position j in S whether to mask it out. For a given (b, n), we need mask for all s: msa_mask[b, :, n]. Since msa_mask is (B, S, N), the access is `msa_mask[(b * S + j) * N + n]`. Yes! Which is what I have.
+
+So I should pass the original `msa_mask` to the kernel. Good.
+
+But wait, in the reference, `col_mask` is (B, N, S). My kernel expects the original (B, S, N). So the indexing `((b * S + j) * N + n)` extracts the correct mask for position j at residue n.
+
+Perfect. No transformation needed.
+
+Let&#x27;s also make sure the output is written in (B, S, N, D) layout. The reference returns `out.permute(0, 2, 1, 3)` which is (B, S, N, D). So my kernel should output (B, S, N, D). And it does: `out[((b * S + s) * N + n) * D + d]`. Good.
+
+Let me code this up now. I&#x27;ll be very careful with the kernel.
+</div></details><details><summary>call → compile_kernel</summary><div class="block tool-args"><span class="role-tag">call</span><b>compile_kernel</b>
+{
+  &quot;kernel_code&quot;: &quot;\nimport torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\ncpp_src = r&#x27;&#x27;&#x27;\ntorch::Tensor fused_msa_forward(\n    torch::Tensor msa_repr,\n    torch::Tensor msa_mask,\n    torch::Tensor gamma,\n    torch::Tensor beta_ln,\n    torch::Tensor w_q_t,\n    torch::Tensor w_k_t,\n    torch::Tensor w_v_t,\n    torch::Tensor w_g_t,\n    torch::Tensor b_g,\n    torch::Tensor w_out_t,\n    torch::Tensor b_out,\n    int num_heads,\n    float eps\n);\n&#x27;&#x27;&#x27;\n\ncuda_src = r&#x27;&#x27;&#x27;\n#include &lt;torch/extension.h&gt;\n#include &lt;cuda_runtime.h&gt;\n#include &lt;math.h&gt;\n\n__device__ __forceinline__ float warpReduceSum(float val) {\n    #pragma unroll\n    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1)\n        val += __shfl_down_sync(0xFFFFFFFF, val, offset);\n    return val;\n}\n\n__device__ __forceinline__ float blockReduceSum(float val, float* shared) {\n    int lane = threadIdx.x &amp; 31;\n    int wid = threadIdx.x &gt;&gt; 5;\n    val = warpReduceSum(val);\n    if (lane == 0) shared[wid] = val;\n    __syncthreads();\n    val = (threadIdx.x &lt; (blockDim.x &gt;&gt; 5)) ? shared[lane] : 0.0f;\n    if (wid == 0) val = warpReduceSum(val);\n    return val;\n}\n\n__global__ void fused_msa_kernel(\n    const float* __restrict__ msa_repr,\n    const float* __restrict__ msa_mask,\n    const float* __restrict__ gamma,\n    const float* __restrict__ beta_ln,\n    const float* __restrict__ w_q_t,\n    const float* __restrict__ w_k_t,\n    const float* __restrict__ w_v_t,\n    const float* __restrict__ w_g_t,\n    const float* __restrict__ b_g,\n    const float* __restrict__ w_out_t,\n    const float* __restrict__ b_out,\n    float* __restrict__ out,\n    int B, int S, int N, int D, int H, float eps)\n{\n    const int d_head = D / H;\n    const int bn = blockIdx.x;\n    const int b = bn / N;\n    const int n = bn % N;\n    const int tid = threadIdx.x;\n    const int nthreads = blockDim.x;\n    const float NEG_INF = __int_as_float(0xFF800000);\n\n    // Shared memory layout:\n    // x: S*D\n    // q (reused as out after attn): H*S*d_head\n    // k: H*S*d_head\n    // v: H*S*d_head\n    // g: H*S*d_head\n    // attn: H*S*S\n    // reduce_buf: 32 floats\n    extern __shared__ float smem[];\n    float* x_smem = smem;\n    float* q_smem = x_smem + S * D;\n    float* k_smem = q_smem + H * S * d_head;\n    float* v_smem = k_smem + H * S * d_head;\n    float* g_smem = v_smem + H * S * d_head;\n    float* a_smem = g_smem + H * S * d_head;\n    float* reduce_buf = a_smem + H * S * S;\n\n    // Load x from (B, S, N, D)\n    for (int idx = tid; idx &lt; S * D; idx += nthreads) {\n        int s = idx / D;\n        int d = idx % D;\n        x_smem[idx] = msa_repr[((b * S + s) * N + n) * D + d];\n    }\n    __syncthreads();\n\n    // LayerNorm per s\n    for (int s = 0; s &lt; S; ++s) {\n        float local_sum = 0.0f;\n        for (int d = tid; d &lt; D; d += nthreads) {\n            local_sum += x_smem[s * D + d];\n        }\n        float total_sum = blockReduceSum(local_sum, reduce_buf);\n        __shared__ float mean_val;\n        if (tid == 0) mean_val = total_sum * (1.0f / D);\n        __syncthreads();\n\n        float local_sq = 0.0f;\n        for (int d = tid; d &lt; D; d += nthreads) {\n            float diff = x_smem[s * D + d] - mean_val;\n            local_sq += diff * diff;\n        }\n        float total_sq = blockReduceSum(local_sq, reduce_buf);\n        __shared__ float inv_std;\n        if (tid == 0) inv_std = rsqrtf(total_sq * (1.0f / D) + eps);\n        __syncthreads();\n\n        for (int d = tid; d &lt; D; d += nthreads) {\n            float val = (x_smem[s * D + d] - mean_val) * inv_std;\n            val = val * gamma[d] + beta_ln[d];\n            x_smem[s * D + d] = val;\n        }\n        __syncthreads();\n    }\n\n    // Q, K, V, G projections using transposed weights (D, D) layout [in, out]\n    const int total_qkvg = H * S * d_head;\n    for (int idx = tid; idx &lt; total_qkvg; idx += nthreads) {\n        int h = idx / (S * d_head);\n        int rem = idx % (S * d_head);\n        int s = rem / d_head;\n        int dd = rem % d_head;\n        int out_dim = h * d_head + dd;\n        float sum_q = 0.0f, sum_k = 0.0f, sum_v = 0.0f, sum_g = 0.0f;\n        for (int d_in = 0; d_in &lt; D; ++d_in) {\n            float xv = x_smem[s * D + d_in];\n            int widx = d_in * D + out_dim;\n            sum_q += xv * w_q_t[widx];\n            sum_k += xv * w_k_t[widx];\n            sum_v += xv * w_v_t[widx];\n            sum_g += xv * w_g_t[widx];\n        }\n        q_smem[idx] = sum_q;\n        k_smem[idx] = sum_k;\n        v_smem[idx] = sum_v;\n        float gv = sum_g + b_g[out_dim];\n        g_smem[idx] = 1.0f / (1.0f + expf(-gv));\n    }\n    __syncthreads();\n\n    // Attention scores Q @ K^T / sqrt(d)\n    const int total_attn = H * S * S;\n    for (int idx = tid; idx &lt; total_attn; idx += nthreads) {\n        int h = idx / (S * S);\n        int rem = idx % (S * S);\n        int i = rem / S;\n        int j = rem % S;\n        float sum = 0.0f;\n        for (int dd = 0; dd &lt; d_head; ++dd) {\n            sum += q_smem[(h * S + i) * d_head + dd] * k_smem[(h * S + j) * d_head + dd];\n        }\n        a_smem[idx] = sum * rsqrtf((float)d_head);\n    }\n    __syncthreads();\n\n    // Mask and softmax over S dim\n    for (int idx = tid; idx &lt; H * S; idx += nthreads) {\n        int h = idx / S;\n        int i = idx % S;\n        float max_val = NEG_INF;\n        #pragma unroll\n        for (int j = 0; j &lt; S; ++j) {\n            float val = a_smem[(h * S + i) * S + j];\n            if (msa_mask[((b * S + j) * N + n)] == 0.0f) val = NEG_INF;\n            if (val &gt; max_val) max_val = val;\n        }\n        float sum_exp = 0.0f;\n        #pragma unroll\n        for (int j = 0; j &lt; S; ++j) {\n            float val = a_smem[(h * S + i) * S + j];\n            if (msa_mask[((b * S + j) * N + n)] == 0.0f) val = NEG_INF;\n            sum_exp += expf(val - max_val);\n        }\n        float inv_sum = 1.0f / sum_exp;\n        #pragma unroll\n        for (int j = 0; j &lt; S; ++j) {\n            float val = a_smem[(h * S + i) * S + j];\n            if (msa_mask[((b * S + j) * N + n)] == 0.0f) val = NEG_INF;\n            a_smem[(h * S + i) * S + j] = expf(val - max_val) * inv_sum;\n        }\n    }\n    __syncthreads();\n\n    // Weighted sum with V, then gate multiply -&gt; reuse q_smem\n    for (int idx = tid; idx &lt; total_qkvg; idx += nthreads) {\n        int h = idx / (S * d_head);\n        int rem = idx % (S * d_head);\n        int i = rem / d_head;\n        int dd = rem % d_head;\n        float sum = 0.0f;\n        for (int j = 0; j &lt; S; ++j) {\n            sum += a_smem[(h * S + i) * S + j] * v_smem[(h * S + j) * d_head + dd];\n        }\n        q_smem[idx] = sum * g_smem[idx];\n    }\n    __syncthreads();\n\n    // Output projection (weights transposed: w_out_t shape (D, D) as [in, out])\n    for (int idx = tid; idx &lt; S * D; idx += nthreads) {\n        int s = idx / D;\n        int dd_out = idx % D;\n        float sum = 0.0f;\n        for (int d_in = 0; d_in &lt; D; ++d_in) {\n            int h = d_in / d_head;\n            int dd_in = d_in % d_head;\n            sum += q_smem[(h * S + s) * d_head + dd_in] * w_out_t[d_in * D + dd_out];\n        }\n        sum += b_out[dd_out];\n        out[((b * S + s) * N + n) * D + dd_out] = sum;\n    }\n}\n\ntorch::Tensor fused_msa_forward(\n    torch::Tensor msa_repr,\n    torch::Tensor msa_mask,\n    torch::Tensor gamma,\n    torch::Tensor beta_ln,\n    torch::Tensor w_q_t,\n    torch::Tensor w_k_t,\n    torch::Tensor w_v_t,\n    torch::Tensor w_g_t,\n    torch::Tensor b_g,\n    torch::Tensor w_out_t,\n    torch::Tensor b_out,\n    int num_heads,\n    float eps\n) {\n    int B = msa_repr.size(0);\n    int S = msa_repr.size(1);\n    int N = msa_repr.size(2);\n    int D = msa_repr.size(3);\n    int H = num_heads;\n    auto out = torch::empty_like(msa_repr);\n    int threads = 128;\n    int blocks = B * N;\n    size_t smem_size = (S * D + 5 * H * S * (D / H) + H * S * S + 32) * sizeof(float);\n    fused_msa_kernel&lt;&lt;&lt;blocks, threads, smem_size&gt;&gt;&gt;(\n        msa_repr.data_ptr&lt;float&gt;(),\n        msa_mask.data_ptr&lt;float&gt;(),\n        gamma.data_ptr&lt;float&gt;(),\n        beta_ln.data_ptr&lt;float&gt;(),\n        w_q_t.data_ptr&lt;float&gt;(),\n        w_k_t.data_ptr&lt;float&gt;(),\n        w_v_t.data_ptr&lt;float&gt;(),\n        w_g_t.data_ptr&lt;float&gt;(),\n        b_g.data_ptr&lt;float&gt;(),\n        w_out_t.data_ptr&lt;float&gt;(),\n        b_out.data_ptr&lt;float&gt;(),\n        out.data_ptr&lt;float&gt;(),\n        B, S, N, D, H, eps\n    );\n    return out;\n}\n&#x27;&#x27;&#x27;\n\n_fused_cuda = load_inline(\n    name=&#x27;fused_msa_v4&#x27;,\n    cpp_sources=cpp_src,\n    cuda_sources=cuda_src,\n    functions=[&#x27;fused_msa_forward&#x27;],\n    extra_cuda_cflags=[&#x27;-O3&#x27;, &#x27;--use_fast_math&#x27;],\n    verbose=False,\n)\n\n\nclass ModelNew(nn.Module):\n    def __init__(self, msa_dim, num_heads, dropout=0.0):\n        super().__init__()\n        self.num_heads = num_heads\n        self.head_dim = msa_dim // num_heads\n        assert msa_dim % num_heads == 0\n\n        self.layer_norm = nn.LayerNorm(msa_dim)\n        self.query = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.key = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.value = nn.Linear(msa_dim, msa_dim, bias=False)\n        self.gate = nn.Linear(msa_dim, msa_dim)\n        self.out_proj = nn.Linear(msa_dim, msa_dim)\n        self.dropout = nn.Dropout(dropout)\n\n        # Pre-transpose weights for coalesced access in the fused kernel\n        self.register_buffer(&#x27;_w_q_t&#x27;, self.query.weight.detach().t().contiguous())\n        self.register_buffer(&#x27;_w_k_t&#x27;, self.key.weight.detach().t().contiguous())\n        self.register_buffer(&#x27;_w_v_t&#x27;, self.value.weight.detach().t().contiguous())\n        self.register_buffer(&#x27;_w_g_t&#x27;, self.gate.weight.detach().t().contiguous())\n        self.register_buffer(&#x27;_b_g&#x27;, self.gate.bias.detach().contiguous() if self.gate.bias is not None else torch.zeros(msa_dim))\n        self.register_buffer(&#x27;_w_out_t&#x27;, self.out_proj.weight.detach().t().contiguous())\n        self.register_buffer(&#x27;_b_out&#x27;, self.out_proj.bias.detach().contiguous() if self.out_proj.bias is not None else torch.zeros(msa_dim))\n\n    def forward(self, msa_repr: torch.Tensor, msa_mask: torch.Tensor) -&gt; torch.Tensor:\n        # msa_repr: (B, S, N, D) i.e. (batch, msa_depth, seq_len, dim)\n        # msa_mask: (B, S, N)\n        gamma = self.layer_norm.weight\n        beta_ln = self.layer_norm.bias if self.layer_norm.bias is not None else torch.zeros(self.layer_norm.weight.size(0), device=msa_repr.device, dtype=msa_repr.dtype)\n\n        out = _fused_cuda.fused_msa_forward(\n            msa_repr,\n            msa_mask,\n            gamma,\n            beta_ln,\n            self._w_q_t,\n            self._w_k_t,\n            self._w_v_t,\n            self._w_g_t,\n            self._b_g,\n            self._w_out_t,\n            self._b_out,\n            self.num_heads,\n            self.layer_norm.eps\n        )\n        return out\n&quot;
+}</div></details><details><summary>result ← compile_kernel (ok)</summary><div class="block tool-out"><span class="role-tag">ok</span><b>compile_kernel</b>
+compile_kernel PASSED: kernel compiled without errors.</div></details></div></details></div>
 </body></html>
